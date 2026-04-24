@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+
+<html class="light" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Live Audit - CyberAudit</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    "colors": {
+                        "tertiary-fixed-dim": "#ffb595",
+                        "primary-container": "#0070eb",
+                        "on-tertiary-container": "#fffbff",
+                        "on-primary-fixed": "#001a41",
+                        "inverse-primary": "#adc6ff",
+                        "on-tertiary": "#ffffff",
+                        "surface-container-highest": "#e3e2e7",
+                        "surface-bright": "#faf9fe",
+                        "on-error-container": "#93000a",
+                        "background": "#faf9fe",
+                        "surface": "#faf9fe",
+                        "secondary-container": "#6664e4",
+                        "on-surface-variant": "#414755",
+                        "outline-variant": "#c1c6d7",
+                        "on-surface": "#1a1b1f",
+                        "inverse-on-surface": "#f1f0f5",
+                        "on-secondary-fixed": "#0c006a",
+                        "error-container": "#ffdad6",
+                        "inverse-surface": "#2f3034",
+                        "secondary-fixed-dim": "#c2c1ff",
+                        "on-primary-fixed-variant": "#004493",
+                        "secondary-fixed": "#e2dfff",
+                        "on-secondary": "#ffffff",
+                        "on-primary-container": "#fefcff",
+                        "secondary": "#4c4aca",
+                        "on-secondary-container": "#fffbff",
+                        "on-background": "#1a1b1f",
+                        "surface-dim": "#dad9df",
+                        "outline": "#717786",
+                        "on-error": "#ffffff",
+                        "surface-variant": "#e3e2e7",
+                        "error": "#ba1a1a",
+                        "surface-container-lowest": "#ffffff",
+                        "primary-fixed": "#d8e2ff",
+                        "primary": "#0058bc",
+                        "on-tertiary-fixed-variant": "#7c2e00",
+                        "tertiary": "#9e3d00",
+                        "surface-container": "#eeedf3",
+                        "primary-fixed-dim": "#adc6ff",
+                        "on-tertiary-fixed": "#351000",
+                        "tertiary-fixed": "#ffdbcc",
+                        "surface-tint": "#005bc1",
+                        "surface-container-low": "#f4f3f8",
+                        "tertiary-container": "#c64f00",
+                        "surface-container-high": "#e9e7ed",
+                        "on-secondary-fixed-variant": "#3631b4",
+                        "on-primary": "#ffffff"
+                    },
+                    "borderRadius": {
+                        "DEFAULT": "1rem",
+                        "lg": "2rem",
+                        "xl": "3rem",
+                        "full": "9999px"
+                    },
+                    "spacing": {
+                        "stack-sm": "12px",
+                        "margin-desktop": "64px",
+                        "gutter": "24px",
+                        "unit": "8px",
+                        "container-max": "1200px",
+                        "stack-lg": "48px",
+                        "margin-mobile": "20px",
+                        "stack-md": "24px"
+                    },
+                    "fontFamily": {
+                        "headline-md": ["Inter"],
+                        "display-lg": ["Inter"],
+                        "body-lg": ["Inter"],
+                        "label-sm": ["Inter"],
+                        "headline-xl": ["Inter"],
+                        "body-md": ["Inter"]
+                    },
+                    "fontSize": {
+                        "headline-md": ["24px", {"lineHeight": "1.3", "letterSpacing": "-0.01em", "fontWeight": "600"}],
+                        "display-lg": ["48px", {"lineHeight": "1.1", "letterSpacing": "-0.02em", "fontWeight": "700"}],
+                        "body-lg": ["17px", {"lineHeight": "1.5", "letterSpacing": "-0.01em", "fontWeight": "400"}],
+                        "label-sm": ["12px", {"lineHeight": "1.2", "letterSpacing": "0.02em", "fontWeight": "500"}],
+                        "headline-xl": ["34px", {"lineHeight": "1.2", "letterSpacing": "-0.01em", "fontWeight": "600"}],
+                        "body-md": ["15px", {"lineHeight": "1.5", "letterSpacing": "0", "fontWeight": "400"}]
+                    }
+                },
+            },
+        }
+    </script>
+<style>
+        .glass {
+            backdrop-filter: blur(30px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.05);
+            border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: rgba(0, 88, 188, 0.2);
+            border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: rgba(0, 88, 188, 0.4);
+        }
+        body {
+            background-image: radial-gradient(circle at 0% 0%, rgba(0, 88, 188, 0.05) 0%, transparent 50%),
+                              radial-gradient(circle at 100% 100%, rgba(76, 74, 202, 0.05) 0%, transparent 50%);
+        }
+    </style>
+</head>
+<body class="font-body-md text-on-background bg-background min-h-screen">
+<!-- TopNavBar -->
+<header class="fixed top-0 z-50 w-full glass bg-white/70 shadow-[0_4px_24px_rgba(0,0,0,0.04)]">
+<div class="flex justify-between items-center w-full px-8 h-16 max-w-[1200px] mx-auto">
+<div class="flex items-center gap-8">
+<span class="text-xl font-bold tracking-tight text-slate-900">AuditPro</span>
+<nav class="hidden md:flex items-center gap-6">
+<a class="text-slate-500 hover:text-slate-900 transition-all duration-300 font-label-sm" href="#">Security</a>
+<a class="text-slate-500 hover:text-slate-900 transition-all duration-300 font-label-sm" href="#">SEO</a>
+<a class="text-slate-500 hover:text-slate-900 transition-all duration-300 font-label-sm" href="#">Performance</a>
+</nav>
+</div>
+<div class="flex items-center gap-4">
+<div class="relative group">
+<span class="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-lg">search</span>
+<input class="pl-10 pr-4 py-2 bg-black/5 border-none rounded-full w-64 focus:ring-2 focus:ring-primary focus:bg-white/50 transition-all text-sm" placeholder="Search assets..." type="text"/>
+</div>
+<button class="p-2 text-slate-500 hover:bg-black/5 rounded-full transition-all active:scale-95">
+<span class="material-symbols-outlined">notifications</span>
+</button>
+<button class="p-2 text-slate-500 hover:bg-black/5 rounded-full transition-all active:scale-95">
+<span class="material-symbols-outlined">settings</span>
+</button>
+<div class="w-8 h-8 rounded-full overflow-hidden border border-white/20">
+<img class="w-full h-full object-cover" data-alt="Close up professional portrait of a tech security lead with a neutral modern office background" src="https://lh3.googleusercontent.com/aida-public/AB6AXuCm6BGLzyTU-hfH6v02_0CJTfj0rcr8jcxVBO4CxDAeK3ck_pS7Y0GddHpQsbu1RUX2d57tiXe1SkoQG7nFd3KplXfp9MCC3jn6Ecv_RcACyOjg88tSJKPlrRnYABwahI1bbfGWSXuwa4qHYENJbko_Ov7gHCWd5UTPWalUCAs8srm7NIot8wq7PX2WzMN9zQbghmbVtRT1cHf7ecOPspVkEm9UwR0DNf3CFzogseXY-8_m1lpte04ZT8G0j5okOSDY5yjgdZyiK20"/>
+</div>
+</div>
+</div>
+</header>
+<div class="pt-16 flex max-w-[1440px] mx-auto min-h-screen">
+<!-- SideNavBar (History) -->
+<aside class="w-72 sticky top-16 h-[calc(100vh-64px)] py-8 px-6 glass bg-white/40 border-r border-white/20 shadow-[10px_0_40px_rgba(0,0,0,0.02)] flex flex-col">
+<div class="mb-8">
+<h3 class="text-lg font-black text-blue-600 font-headline-md mb-1">CyberAudit</h3>
+<p class="text-slate-500 text-xs font-label-sm">Premium Enterprise Monitoring</p>
+</div>
+<div class="flex flex-col gap-6 flex-grow">
+<div>
+<span class="text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-4 block px-4">Navigation</span>
+<div class="space-y-2">
+<div class="flex items-center gap-3 px-4 py-3 bg-blue-600 text-white rounded-full shadow-[0_4px_12px_rgba(0,122,255,0.3)] transition-transform duration-200 cursor-pointer">
+<span class="material-symbols-outlined text-lg">dashboard</span>
+<span class="font-label-sm">Dashboard</span>
+</div>
+<div class="flex items-center gap-3 px-4 py-3 text-slate-600 hover:bg-white/40 rounded-full transition-all duration-200 cursor-pointer group">
+<span class="material-symbols-outlined text-lg group-hover:translate-x-1 transition-transform">history</span>
+<span class="font-label-sm">History</span>
+</div>
+</div>
+</div>
+<div>
+<span class="text-[10px] font-bold uppercase tracking-widest text-slate-400 mb-4 block px-4">Scan History</span>
+<div class="space-y-1 overflow-y-auto custom-scrollbar pr-2 max-h-[300px]">
+<div class="p-3 rounded-xl hover:bg-white/60 transition-all cursor-pointer group">
+<p class="text-sm font-medium text-slate-900">apple.com</p>
+<p class="text-[11px] text-slate-500">Last scan: 2h ago</p>
+</div>
+<div class="p-3 rounded-xl hover:bg-white/60 transition-all cursor-pointer">
+<p class="text-sm font-medium text-slate-900">google.com</p>
+<p class="text-[11px] text-slate-500">Last scan: 5h ago</p>
+</div>
+<div class="p-3 rounded-xl hover:bg-white/60 transition-all cursor-pointer">
+<p class="text-sm font-medium text-slate-900">stripe.com</p>
+<p class="text-[11px] text-slate-500">Last scan: 1d ago</p>
+</div>
+<div class="p-3 rounded-xl hover:bg-white/60 transition-all cursor-pointer">
+<p class="text-sm font-medium text-slate-900">figma.com</p>
+<p class="text-[11px] text-slate-500">Last scan: 3d ago</p>
+</div>
+</div>
+</div>
+</div>
+<button class="mt-auto w-full py-4 bg-primary text-white rounded-full font-label-sm font-bold shadow-lg shadow-primary/20 active:scale-95 transition-all">
+                New Scan
+            </button>
+</aside>
+<!-- Main Content -->
+<main class="flex-grow px-12 py-12 overflow-y-auto">
+<!-- Progress Bar Section -->
+<div class="mb-10">
+<div class="flex justify-between items-end mb-4">
+<div>
+<span class="inline-flex items-center px-3 py-1 rounded-full bg-blue-50 text-blue-600 text-[11px] font-bold uppercase tracking-wider mb-2">Live Analysis</span>
+<h1 class="font-headline-xl text-on-surface">enterprise-hq.io</h1>
+</div>
+<div class="text-right">
+<span class="font-headline-md text-primary">72%</span>
+<p class="text-xs text-slate-500 font-label-sm">Audited</p>
+</div>
+</div>
+<div class="h-3 w-full bg-slate-100 rounded-full overflow-hidden shadow-inner">
+<div class="h-full bg-primary w-[72%] rounded-full shadow-[0_0_20px_rgba(0,88,188,0.4)] transition-all duration-1000"></div>
+</div>
+</div>
+<!-- Tabbed Header -->
+<div class="flex items-center justify-between mb-8">
+<div class="flex p-1.5 glass bg-white/50 rounded-full gap-2">
+<button class="px-8 py-2.5 rounded-full bg-white text-primary shadow-sm font-label-sm font-semibold transition-all">Security</button>
+<button class="px-8 py-2.5 rounded-full text-slate-500 hover:text-slate-800 font-label-sm font-semibold transition-all">SEO</button>
+<button class="px-8 py-2.5 rounded-full text-slate-500 hover:text-slate-800 font-label-sm font-semibold transition-all">Performance</button>
+</div>
+<button class="flex items-center gap-2 px-6 py-3 bg-white border border-white/50 text-slate-700 rounded-full font-label-sm font-semibold shadow-sm hover:shadow-md active:scale-95 transition-all">
+<span class="material-symbols-outlined text-[20px]">bar_chart</span>
+                    View Full Summary
+                </button>
+</div>
+<!-- Audit Findings Scrollable Area -->
+<div class="space-y-6 max-h-[calc(100vh-350px)] overflow-y-auto pr-4 custom-scrollbar pb-10">
+<!-- Finding Card 1 -->
+<div class="glass bg-white/60 p-6 rounded-lg shadow-[0_8px_32px_rgba(0,0,0,0.03)] flex items-start gap-6 hover:shadow-[0_12px_40px_rgba(0,0,0,0.05)] transition-all group">
+<div class="w-14 h-14 rounded-2xl bg-red-50 flex items-center justify-center text-red-500 shadow-sm shrink-0">
+<span class="material-symbols-outlined text-3xl" style="font-variation-settings: 'FILL' 1;">error</span>
+</div>
+<div class="flex-grow">
+<div class="flex items-center gap-3 mb-2">
+<h3 class="font-headline-md text-lg text-slate-900">Missing Content Security Policy (CSP)</h3>
+<span class="px-3 py-1 rounded-full bg-red-100 text-red-600 text-[10px] font-bold uppercase">Critical</span>
+<span class="px-3 py-1 rounded-full bg-slate-100 text-slate-600 text-[10px] font-bold uppercase">Security</span>
+</div>
+<p class="text-slate-500 text-sm leading-relaxed max-w-2xl">A Content Security Policy (CSP) header is not detected. This makes the site vulnerable to cross-site scripting (XSS) and data injection attacks.</p>
+</div>
+<button class="px-5 py-2.5 glass bg-white/40 text-primary rounded-full font-label-sm font-bold flex items-center gap-2 hover:bg-primary hover:text-white transition-all">
+<span class="material-symbols-outlined text-sm">lock</span>
+                        View Fix
+                    </button>
+</div>
+<!-- Finding Card 2 -->
+<div class="glass bg-white/60 p-6 rounded-lg shadow-[0_8px_32px_rgba(0,0,0,0.03)] flex items-start gap-6 hover:shadow-[0_12px_40px_rgba(0,0,0,0.05)] transition-all">
+<div class="w-14 h-14 rounded-2xl bg-amber-50 flex items-center justify-center text-amber-500 shadow-sm shrink-0">
+<span class="material-symbols-outlined text-3xl" style="font-variation-settings: 'FILL' 1;">warning</span>
+</div>
+<div class="flex-grow">
+<div class="flex items-center gap-3 mb-2">
+<h3 class="font-headline-md text-lg text-slate-900">Unoptimized Image Formats</h3>
+<span class="px-3 py-1 rounded-full bg-amber-100 text-amber-600 text-[10px] font-bold uppercase">Medium Impact</span>
+<span class="px-3 py-1 rounded-full bg-slate-100 text-slate-600 text-[10px] font-bold uppercase">SEO</span>
+</div>
+<p class="text-slate-500 text-sm leading-relaxed max-w-2xl">Several images are being served in legacy formats (JPEG/PNG). Converting to WebP or AVIF could reduce page weight by 45%.</p>
+</div>
+<button class="px-5 py-2.5 glass bg-white/40 text-primary rounded-full font-label-sm font-bold flex items-center gap-2 hover:bg-primary hover:text-white transition-all">
+<span class="material-symbols-outlined text-sm">lock</span>
+                        View Fix
+                    </button>
+</div>
+<!-- Finding Card 3 -->
+<div class="glass bg-white/60 p-6 rounded-lg shadow-[0_8px_32px_rgba(0,0,0,0.03)] flex items-start gap-6 hover:shadow-[0_12px_40px_rgba(0,0,0,0.05)] transition-all">
+<div class="w-14 h-14 rounded-2xl bg-blue-50 flex items-center justify-center text-blue-500 shadow-sm shrink-0">
+<span class="material-symbols-outlined text-3xl" style="font-variation-settings: 'FILL' 1;">info</span>
+</div>
+<div class="flex-grow">
+<div class="flex items-center gap-3 mb-2">
+<h3 class="font-headline-md text-lg text-slate-900">Subresource Integrity (SRI) Warning</h3>
+<span class="px-3 py-1 rounded-full bg-blue-100 text-blue-600 text-[10px] font-bold uppercase">Low</span>
+<span class="px-3 py-1 rounded-full bg-slate-100 text-slate-600 text-[10px] font-bold uppercase">Security</span>
+</div>
+<p class="text-slate-500 text-sm leading-relaxed max-w-2xl">Third-party scripts from CDNs are loaded without SRI hashes. This could lead to code injection if the CDN is compromised.</p>
+</div>
+<button class="px-5 py-2.5 glass bg-white/40 text-primary rounded-full font-label-sm font-bold flex items-center gap-2 hover:bg-primary hover:text-white transition-all">
+<span class="material-symbols-outlined text-sm">lock</span>
+                        View Fix
+                    </button>
+</div>
+<!-- Finding Card 4 (New) -->
+<div class="glass bg-white/60 p-6 rounded-lg shadow-[0_8px_32px_rgba(0,0,0,0.03)] flex items-start gap-6 hover:shadow-[0_12px_40px_rgba(0,0,0,0.05)] transition-all">
+<div class="w-14 h-14 rounded-2xl bg-red-50 flex items-center justify-center text-red-500 shadow-sm shrink-0">
+<span class="material-symbols-outlined text-3xl" style="font-variation-settings: 'FILL' 1;">security</span>
+</div>
+<div class="flex-grow">
+<div class="flex items-center gap-3 mb-2">
+<h3 class="font-headline-md text-lg text-slate-900">SSL Certificate Expiration</h3>
+<span class="px-3 py-1 rounded-full bg-red-100 text-red-600 text-[10px] font-bold uppercase">High</span>
+<span class="px-3 py-1 rounded-full bg-slate-100 text-slate-600 text-[10px] font-bold uppercase">Compliance</span>
+</div>
+<p class="text-slate-500 text-sm leading-relaxed max-w-2xl">The current SSL certificate for enterprise-hq.io expires in 14 days. Auto-renewal has not been detected.</p>
+</div>
+<button class="px-5 py-2.5 glass bg-white/40 text-primary rounded-full font-label-sm font-bold flex items-center gap-2 hover:bg-primary hover:text-white transition-all">
+<span class="material-symbols-outlined text-sm">lock</span>
+                        View Fix
+                    </button>
+</div>
+</div>
+</main>
+<!-- Right Side Stats Panel (Contextual) -->
+<aside class="hidden lg:block w-80 sticky top-16 h-[calc(100vh-64px)] py-12 px-8 overflow-y-auto">
+<div class="space-y-8">
+<div class="glass bg-white/40 p-6 rounded-lg border border-white/40 shadow-sm">
+<h4 class="text-xs font-bold uppercase text-slate-400 tracking-widest mb-4">Risk Exposure</h4>
+<div class="flex items-center gap-4">
+<div class="relative w-20 h-20">
+<svg class="w-20 h-20 -rotate-90">
+<circle class="text-slate-100" cx="40" cy="40" fill="transparent" r="34" stroke="currentColor" stroke-width="8"></circle>
+<circle class="text-red-500" cx="40" cy="40" fill="transparent" r="34" stroke="currentColor" stroke-dasharray="213.6" stroke-dashoffset="64" stroke-width="8"></circle>
+</svg>
+<div class="absolute inset-0 flex items-center justify-center font-bold text-slate-900">72</div>
+</div>
+<div>
+<p class="text-sm font-semibold">Elevated Risk</p>
+<p class="text-[11px] text-slate-500">Score based on 12 critical findings</p>
+</div>
+</div>
+</div>
+<div class="glass bg-white/40 p-6 rounded-lg border border-white/40 shadow-sm">
+<h4 class="text-xs font-bold uppercase text-slate-400 tracking-widest mb-4">Real-time Feed</h4>
+<div class="space-y-4">
+<div class="flex gap-3">
+<div class="w-1.5 h-1.5 rounded-full bg-green-500 mt-1.5 shrink-0 animate-pulse"></div>
+<p class="text-xs text-slate-600"><span class="font-bold text-slate-900">DNS Records</span> checked successfully.</p>
+</div>
+<div class="flex gap-3">
+<div class="w-1.5 h-1.5 rounded-full bg-blue-500 mt-1.5 shrink-0"></div>
+<p class="text-xs text-slate-600"><span class="font-bold text-slate-900">Static Assets</span> analysis in progress...</p>
+</div>
+<div class="flex gap-3">
+<div class="w-1.5 h-1.5 rounded-full bg-slate-300 mt-1.5 shrink-0"></div>
+<p class="text-xs text-slate-500"><span class="font-bold">Backend API</span> pending scan.</p>
+</div>
+</div>
+</div>
+<div class="rounded-lg overflow-hidden glass relative group aspect-square">
+<img class="w-full h-full object-cover" data-alt="High tech server room with neon blue and cyan lighting and depth of field aesthetic" src="https://lh3.googleusercontent.com/aida-public/AB6AXuDC3H1LswhUk3Yc1LBS-k8bge8deodIHYvKYl4xTqyO1Tm0RVR2mUpSKP-yvQUJKJ6gqVzEMMScfNlDbRkeAOZmC3SpKlKnFPfxMl1XEHDuGR_3H6QLqCNrrIiCg1XXyx3mT-nR12tesKyUviFGypkA7KmFXEAU_N9mGIydBMhirsFwF7ddX2sZXJsqCBueaA6YiN89PuajIGcMug0wNisWP5xq60FOHuvjHZ1rb0Gb3LSMkEoL-XWgE2wDErX8IYJ6yE-tnSjyo_8"/>
+<div class="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent flex flex-col justify-end p-6">
+<p class="text-white text-sm font-bold">Node-04 Active</p>
+<p class="text-white/70 text-[10px]">Processing 4.2k requests/sec</p>
+</div>
+</div>
+</div>
+</aside>
+</div>
+</body></html>

@@ -1,0 +1,305 @@
+"use client";
+
+import { usePathname, useRouter } from "next/navigation";
+import { useEffect, useState, useTransition } from "react";
+import { ArrowRight, ExternalLink, Globe, Loader2 } from "lucide-react";
+import { useAuth } from "@/components/providers/auth-provider";
+import { type ScanQuotaSummary } from "@/lib/types";
+import { cn } from "@/lib/utils";
+
+type StartAuditFormProps = {
+  variant?: "hero" | "inline" | "header";
+  className?: string;
+};
+
+async function fetchJson<T>(url: string, init?: RequestInit) {
+  const response = await fetch(url, { cache: "no-store", ...init });
+  const payload = (await response.json().catch(() => null)) as
+    | T
+    | { error?: string; code?: string; details?: unknown }
+    | null;
+
+  if (!response.ok) {
+    const message =
+      payload && typeof payload === "object" && "error" in payload && typeof payload.error === "string"
+        ? payload.error
+        : "Request failed";
+
+    throw Object.assign(new Error(message), {
+      code:
+        payload && typeof payload === "object" && "code" in payload ? payload.code : undefined,
+      details:
+        payload && typeof payload === "object" && "details" in payload ? payload.details : undefined,
+    });
+  }
+
+  return payload as T;
+}
+
+export function StartAuditForm({ variant = "hero", className }: StartAuditFormProps) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const { user, status, isConfigured, signInWithGoogle, ensureServerSession } = useAuth();
+  const [target, setTarget] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [quota, setQuota] = useState<ScanQuotaSummary | null>(null);
+  const [checkoutPending, setCheckoutPending] = useState(false);
+  const [isPending, startTransition] = useTransition();
+
+  type FormError = Error & {
+    code?: string;
+    details?: unknown;
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadQuota = async () => {
+      if (status !== "signed-in" || !user) {
+        if (!cancelled) {
+          setQuota(null);
+        }
+        return;
+      }
+
+      try {
+        await ensureServerSession();
+        const payload = await fetchJson<{ quota: ScanQuotaSummary }>("/api/me/usage");
+        if (!cancelled) {
+          setQuota(payload.quota);
+        }
+      } catch {
+        if (!cancelled) {
+          setQuota(null);
+        }
+      }
+    };
+
+    void loadQuota();
+    return () => {
+      cancelled = true;
+    };
+  }, [ensureServerSession, status, user]);
+
+  const handleUpgrade = async () => {
+    setError(null);
+
+    if (!isConfigured) {
+      setError("Google login must be configured before billing can start.");
+      return;
+    }
+
+    setCheckoutPending(true);
+    try {
+      if (status === "signed-in" && user) {
+        await ensureServerSession();
+      } else {
+        await signInWithGoogle();
+      }
+
+      const payload = await fetchJson<{ url?: string; alreadyActive?: boolean }>("/api/billing/checkout", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          purpose: "scan-plan",
+          returnPath: pathname,
+        }),
+      });
+
+      if (payload.alreadyActive) {
+        const usagePayload = await fetchJson<{ quota: ScanQuotaSummary }>("/api/me/usage");
+        setQuota(usagePayload.quota);
+        setError(null);
+        return;
+      }
+
+      if (!payload.url) {
+        throw new Error("Unable to start checkout.");
+      }
+
+      window.location.assign(payload.url);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Unable to start checkout.");
+    } finally {
+      setCheckoutPending(false);
+    }
+  };
+
+  const handleSubmit = () => {
+    const value = target.trim();
+    if (!value) {
+      setError("Enter a domain to start the scan.");
+      return;
+    }
+
+    setError(null);
+
+    startTransition(async () => {
+      try {
+        if (!isConfigured) {
+          setError("Google login must be configured before a new scan can start.");
+          return;
+        }
+
+        if (status === "signed-in" && user) {
+          await ensureServerSession();
+        } else {
+          await signInWithGoogle();
+        }
+
+        const payload = await fetchJson<{ scan: { id: string } }>("/api/scans", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ target: value }),
+        });
+
+        router.push(`/scans/${payload.scan.id}`);
+      } catch (nextError) {
+        const resolvedError = nextError as FormError;
+        if (resolvedError.code === "SCAN_QUOTA_EXCEEDED") {
+          if (
+            resolvedError.details &&
+            typeof resolvedError.details === "object"
+          ) {
+            setQuota(resolvedError.details as ScanQuotaSummary);
+          }
+        }
+
+        setError(nextError instanceof Error ? nextError.message : "Network error while creating the scan.");
+      }
+    });
+  };
+
+  return (
+    <div className={cn("w-full", variant === "header" && "relative", className)}>
+      <div
+        className={cn(
+          "glass-panel flex w-full flex-col gap-3 shadow-xl ring-1 ring-black/5 md:flex-row md:items-center",
+          variant === "hero"
+            ? "mx-auto max-w-[580px] rounded-full p-2"
+            : variant === "header"
+              ? "rounded-full border border-white/60 bg-white/80 p-1.5 shadow-[0_10px_28px_rgba(15,23,42,0.08)]"
+              : "rounded-[1.7rem] p-3",
+        )}
+      >
+        <div
+          className={cn(
+            "flex items-center gap-4",
+            variant === "hero"
+              ? "px-4 md:pl-6 md:pr-1"
+              : variant === "header"
+                ? "min-w-0 flex-1 px-4"
+                : "px-4 py-1",
+          )}
+        >
+          <Globe className="h-5 w-5 text-[var(--ink-soft)]" />
+          <input
+            value={target}
+            onChange={(event) => setTarget(event.target.value)}
+            placeholder="Enter your domain URL (e.g. cyberaudit.io)"
+            className={cn(
+              "w-full bg-transparent text-sm text-[var(--ink)] outline-none placeholder:text-[var(--ink-soft)]",
+              variant === "header" ? "h-10" : "h-12",
+            )}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                handleSubmit();
+              }
+            }}
+          />
+        </div>
+        <button
+          type="button"
+          className={cn(
+            "inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[var(--primary)] px-6 text-sm font-semibold text-white transition-all hover:bg-[#004ca1] active:scale-[0.98]",
+            variant === "hero"
+              ? "md:px-8"
+              : variant === "header"
+                ? "h-10 px-5 md:min-w-[140px]"
+                : "md:min-w-[180px]",
+          )}
+          disabled={isPending || checkoutPending}
+          onClick={handleSubmit}
+        >
+          {isPending ? "Creating scan..." : "Start Scan"}
+          <ArrowRight className="h-4 w-4" />
+        </button>
+      </div>
+
+      {variant === "header" ? (
+        error || quota?.requiresUpgrade ? (
+          <div className="absolute left-0 top-[calc(100%+0.65rem)] z-50 w-full max-w-[520px] rounded-[1.2rem] border border-white/70 bg-white/95 p-4 shadow-[0_18px_48px_rgba(15,23,42,0.12)]">
+            {error ? <p className="text-sm font-medium text-[var(--danger)]">{error}</p> : null}
+            {quota?.requiresUpgrade ? (
+              <div className={cn("flex flex-col gap-3", error ? "mt-3" : "")}>
+                <p className="text-sm text-slate-600">
+                  {quota.usedScans} of {quota.freeLimit} free scans are already used on this Google account.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => void handleUpgrade()}
+                  disabled={checkoutPending}
+                  className="inline-flex items-center gap-2 self-start rounded-full border border-slate-200 bg-white px-5 py-2.5 text-sm font-semibold text-slate-800 shadow-sm transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {checkoutPending ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Opening checkout...
+                    </>
+                  ) : (
+                    <>
+                      Upgrade to unlimited for ${quota.upgradePriceUsd}
+                      <ExternalLink className="h-4 w-4" />
+                    </>
+                  )}
+                </button>
+              </div>
+            ) : null}
+          </div>
+        ) : null
+      ) : (
+        <div className={cn("mt-4 flex flex-col gap-3", variant === "hero" ? "items-center" : "items-start")}>
+          {quota ? (
+            <p className="text-sm text-slate-500">
+              {quota.hasUnlimitedPlan
+                ? "Unlimited scans are active on this account."
+                : `${quota.usedScans} of ${quota.freeLimit} free scans used on this Google account.`}
+            </p>
+          ) : (
+            <p className="text-sm text-slate-500">
+              Sign in with Google to save the scan, unlock fixes, and keep the free 5-scan quota tied to your email.
+            </p>
+          )}
+
+          {error ? <p className="text-sm font-medium text-[var(--danger)]">{error}</p> : null}
+
+          {(quota?.requiresUpgrade || error?.includes("free scans")) ? (
+            <button
+              type="button"
+              onClick={() => void handleUpgrade()}
+              disabled={checkoutPending}
+              className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-5 py-2.5 text-sm font-semibold text-slate-800 shadow-sm transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {checkoutPending ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Opening checkout...
+                </>
+              ) : (
+                <>
+                  Upgrade to unlimited for ${quota?.upgradePriceUsd ?? 9}
+                  <ExternalLink className="h-4 w-4" />
+                </>
+              )}
+            </button>
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+}
