@@ -167,6 +167,20 @@ export function createMemoryRepository(): Repository {
       return next;
     },
 
+    async addUserScanCredits(uid, credits) {
+      const user = state.users.get(uid);
+      if (!user) {
+        throw notFound("User not found.");
+      }
+
+      const next: UserRecord = {
+        ...user,
+        purchasedScanCredits: (user.purchasedScanCredits ?? 0) + credits,
+      };
+      state.users.set(uid, next);
+      return next;
+    },
+
     async upsertPayment(payment) {
       state.payments.set(payment.checkoutSessionId, payment);
       return payment;

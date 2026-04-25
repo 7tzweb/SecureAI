@@ -188,6 +188,25 @@ export function createFirestoreRepository(): Repository {
       return next;
     },
 
+    async addUserScanCredits(uid, credits) {
+      const ref = db.collection("users").doc(uid);
+
+      return db.runTransaction(async (transaction) => {
+        const snapshot = await transaction.get(ref);
+        if (!snapshot.exists) {
+          throw notFound("User not found.");
+        }
+
+        const user = snapshot.data() as UserRecord;
+        const next = {
+          ...user,
+          purchasedScanCredits: (user.purchasedScanCredits ?? 0) + credits,
+        };
+        transaction.set(ref, next, { merge: true });
+        return next;
+      });
+    },
+
     async upsertPayment(payment) {
       await db.collection("payments").doc(payment.checkoutSessionId).set(payment, { merge: true });
       return payment;

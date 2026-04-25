@@ -24,6 +24,8 @@
 .DS_Store
 *.pem
 .cyberaudit/
+.pdf-previews/
+*.pdf
 serviceAccountKey.json
 
 # debug

@@ -25,6 +25,14 @@ const severityPenalty: Record<Severity, number> = {
   info: 1,
 };
 
+const warningPenaltyCap: Record<Severity, number> = {
+  critical: 36,
+  high: 28,
+  medium: 18,
+  low: 8,
+  info: 0,
+};
+
 const statusRank: Record<FindingStatus, number> = {
   fail: 4,
   warning: 3,
@@ -68,19 +76,43 @@ export function deriveFindingStatus(finding: Pick<ScanFinding, "severity"> & { s
 }
 
 export function computeScore(findings: ScanFinding[]) {
-  const totalPenalty = findings.reduce((sum, finding) => {
+  const warningPenaltyTotals: Record<Severity, number> = {
+    critical: 0,
+    high: 0,
+    medium: 0,
+    low: 0,
+    info: 0,
+  };
+
+  const failPenalty = findings.reduce((sum, finding) => {
     const status = deriveFindingStatus(finding);
     if (status === "pass" || status === "info") {
       return sum;
     }
 
-    const penalty = severityPenalty[finding.severity];
-    const weightedPenalty =
-      (status === "warning" ? Math.max(1, Math.round(penalty * 0.6)) : penalty) *
-      (finding.scoreWeight ?? 1);
+    const weightedPenalty = Math.max(
+      1,
+      Math.round(
+        severityPenalty[finding.severity] *
+          (finding.scoreWeight ?? 1) *
+          (status === "warning" ? 0.5 : 1),
+      ),
+    );
+
+    if (status === "warning") {
+      warningPenaltyTotals[finding.severity] += weightedPenalty;
+      return sum;
+    }
+
     return sum + weightedPenalty;
   }, 0);
-  return clamp(Math.round(100 - totalPenalty), 0, 100);
+
+  const cappedWarningPenalty = (Object.keys(warningPenaltyTotals) as Severity[]).reduce(
+    (sum, severity) => sum + Math.min(warningPenaltyTotals[severity], warningPenaltyCap[severity]),
+    0,
+  );
+
+  return clamp(Math.round(100 - failPenalty - cappedWarningPenalty), 0, 100);
 }
 
 export function sortFindings(findings: ScanFinding[]) {

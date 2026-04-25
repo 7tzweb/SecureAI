@@ -1,6 +1,6 @@
 # CyberAudit
 
-CyberAudit is a production-oriented Next.js application for website auditing across security, SEO, and performance. It creates scans immediately, processes categories asynchronously, streams partial results to the report page, keeps fix details behind Google sign-in, and enforces a free 5-scan quota per signed-in account with a $9 unlimited upgrade path.
+CyberAudit is a production-oriented Next.js application for website auditing across security, SEO, and performance. It creates scans immediately, processes categories asynchronously, streams partial results to the report page, keeps fix details behind Google sign-in, and enforces 3 free scans per signed-in account with optional 30-scan PayPal credit packs.
 
 ## Stack
 
@@ -9,7 +9,8 @@ CyberAudit is a production-oriented Next.js application for website auditing acr
 - Tailwind CSS 4
 - Firebase Authentication + Firebase Admin + Firestore
 - Redis + BullMQ
-- Stripe
+- Stripe legacy routes
+- PayPal checkout
 
 ## Local Development
 
@@ -45,9 +46,9 @@ The app is built to run locally even before external services are configured.
 - Without Redis, scan jobs run through an in-process async queue.
 - Without Firebase client credentials, Google login buttons remain disabled.
 - Without a Firebase service account file, Google sessions still work through Firebase token verification, but Firestore stays disabled.
-- Without Stripe configuration, quota upgrades remain disabled.
+- Without PayPal configuration, scan credit purchases remain disabled.
 
-These fallbacks are for development convenience only. Production deployment should use Firestore, Redis/BullMQ, Firebase Auth, and Stripe.
+These fallbacks are for development convenience only. Production deployment should use Firestore, Redis/BullMQ, Firebase Auth, and PayPal.
 
 ## Environment Variables
 
@@ -81,6 +82,10 @@ See `.env.example` for the full list.
 - `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`
 - `STRIPE_PRICE_ID_PREMIUM`
 - `STRIPE_SCAN_PLAN_PRICE_USD`
+- `PAYPAL_ENV`
+- `NEXT_PUBLIC_PAYPAL_CLIENT_ID`
+- `PAYPAL_CLIENT_ID`
+- `PAYPAL_CLIENT_SECRET`
 - `OPENAI_API_KEY`
 
 ## Routes
@@ -104,6 +109,8 @@ API:
 - `POST /api/billing/checkout`
 - `POST /api/billing/confirm`
 - `POST /api/billing/webhook`
+- `POST /api/billing/paypal/order`
+- `POST /api/billing/paypal/capture`
 
 ## Verification
 

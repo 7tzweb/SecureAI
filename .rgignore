@@ -1,0 +1,9 @@
+.next/
+node_modules/
+.git/
+.cyberaudit/
+.pdf-previews/
+docs/archive/
+*.pdf
+package-lock.json
+tsconfig.tsbuildinfo

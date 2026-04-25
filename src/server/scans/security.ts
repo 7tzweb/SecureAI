@@ -11,9 +11,11 @@ import {
   createFinding,
   createResponseLocation,
   describeDomLocation,
+  isHtmlLikeResponse,
+  isLikelyEdgeInterstitial,
   loadAttempt,
 } from "@/server/scans/helpers";
-import { type CategoryScanResult, type NormalizedTarget } from "@/server/scans/types";
+import { type CategoryScanResult, type HttpAttempt, type NormalizedTarget } from "@/server/scans/types";
 
 function buildSecurityCheck(input: {
   checkKey: string;
@@ -50,6 +52,12 @@ function isSensitiveCookie(name: string) {
   return /(session|sess|auth|token|jwt|sid|csrf|xsrf)/i.test(name);
 }
 
+function isInfrastructureCookie(name: string) {
+  return /^(?:__cf|cf_|_cfuvid|ak_bmsc|bm_sz|bm_sv|datadome|didomi_token|incap_ses|visid_incap|nlbi_|aka_)/i.test(
+    name,
+  );
+}
+
 function headerEvidence(url: string, headerName: string, summary: string) {
   return {
     checkedUrl: url,
@@ -80,6 +88,59 @@ function parseMaxAge(value: string) {
 
 function directoryListingDetected(bodyText: string) {
   return /<title>\s*Index of\s|Directory listing for|Index of \//i.test(bodyText);
+}
+
+function isSuccessfulNonChallengeResponse(attempt: HttpAttempt) {
+  return attempt.status >= 200 && attempt.status < 300 && !isLikelyEdgeInterstitial(attempt);
+}
+
+function looksLikeEnvFile(attempt: HttpAttempt) {
+  if (!isSuccessfulNonChallengeResponse(attempt) || isHtmlLikeResponse(attempt.headers, attempt.bodyText)) {
+    return false;
+  }
+
+  const envLines = attempt.bodyText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+    .filter((line) => /^[A-Za-z_][A-Za-z0-9_]{1,80}\s*=\s*.+$/.test(line));
+
+  return (
+    envLines.length >= 2 ||
+    envLines.some((line) => /(SECRET|TOKEN|KEY|DATABASE|PASSWORD|PRIVATE|REDIS|AWS|FIREBASE|STRIPE|PAYPAL|OPENAI)/i.test(line))
+  );
+}
+
+function looksLikeExposedBackupArtifact(attempt: HttpAttempt, path: string) {
+  if (!isSuccessfulNonChallengeResponse(attempt) || isHtmlLikeResponse(attempt.headers, attempt.bodyText)) {
+    return false;
+  }
+
+  const contentType = attempt.headers["content-type"] ?? "";
+  if (/\.zip$/i.test(path)) {
+    return /zip|octet-stream/i.test(contentType) || attempt.bodyText.startsWith("PK");
+  }
+
+  if (/\.env/i.test(path)) {
+    return looksLikeEnvFile(attempt);
+  }
+
+  return /<\?php|DB_|DATABASE|PASSWORD|SECRET|TOKEN|config/i.test(attempt.bodyText);
+}
+
+function looksLikeStructuredApiPayload(attempt: Pick<HttpAttempt, "headers" | "bodyText">) {
+  const contentType = attempt.headers["content-type"] ?? "";
+  const trimmedBody = attempt.bodyText.trim();
+  return (
+    /application\/(?:json|graphql-response\+json)|text\/plain|application\/xml|text\/xml/i.test(
+      contentType,
+    ) ||
+    /^[{\[]/.test(trimmedBody)
+  );
+}
+
+function looksLikeSensitiveApiPayload(bodyText: string) {
+  return /"(?:email|token|accessToken|session|userId|invoice|account|customerId)"\s*:/i.test(bodyText);
 }
 
 type ProbeMatch = {
@@ -235,7 +296,10 @@ function collectCookieHints(setCookies: string[]) {
   const cookies = setCookies.map((cookie) => ({
     name: cookieName(cookie),
     raw: cookie,
-    sensitive: sensitiveCookieNamePattern.test(cookieName(cookie)),
+    infrastructure: isInfrastructureCookie(cookieName(cookie)),
+    sensitive:
+      sensitiveCookieNamePattern.test(cookieName(cookie)) &&
+      !isInfrastructureCookie(cookieName(cookie)),
     ...parseCookieFlags(cookie),
   }));
 
@@ -249,6 +313,10 @@ function collectCookieHints(setCookies: string[]) {
 }
 
 function isReachableSensitiveEndpoint(attempt: ProbeMatch) {
+  if (isLikelyEdgeInterstitial(attempt)) {
+    return false;
+  }
+
   return (attempt.status >= 200 && attempt.status < 300) || [401, 403, 405].includes(attempt.status);
 }
 
@@ -405,7 +473,8 @@ function extractSimpleForms(url: string, bodyText: string, targetHostname: strin
   return $("form")
     .toArray()
     .flatMap((element, index) => {
-      const actionUrl = resolveHttpUrl($(element).attr("action") ?? url, url) ?? url;
+      const rawAction = $(element).attr("action")?.trim() ?? "";
+      const actionUrl = resolveHttpUrl(rawAction || url, url) ?? url;
       let parsed: URL;
       try {
         parsed = new URL(actionUrl);
@@ -447,20 +516,34 @@ function extractSimpleForms(url: string, bodyText: string, targetHostname: strin
       const csrfFieldNames = fields
         .filter((field) => csrfTokenNamePattern.test(field.name))
         .map((field) => field.name);
-      const lowerAction = actionUrl.toLowerCase();
       const fieldNames = fields.map((field) => field.name);
+      const method = ($(element).attr("method")?.trim().toUpperCase() || "GET");
+      const actionExplicit = rawAction.length > 0;
+      const lowerAction = rawAction.toLowerCase();
       const sensitiveKinds = new Set<string>();
+      const hasPasswordField = fields.some((field) => field.type === "password");
+      const hasAuthFieldHints =
+        hasPasswordField ||
+        fieldNames.some((fieldName) => /(email|username|login|signin|auth|password|otp|code|token)/i.test(fieldName)) ||
+        fields.some((field) => /current-password|new-password|username|one-time-code|email/i.test(field.autocomplete ?? ""));
+      const hasResetFieldHints =
+        fieldNames.some((fieldName) => /(reset|forgot|recover|new[-_]?password|otp|code|token)/i.test(fieldName)) ||
+        fields.some((field) => /new-password|one-time-code/i.test(field.autocomplete ?? ""));
+      const hasAccountFieldHints = fieldNames.some((fieldName) =>
+        /(email|address|billing|card|iban|invoice|profile|settings|phone|account)/i.test(fieldName),
+      );
 
-      if (
-        fields.some((field) => field.type === "password") ||
-        /(login|signin|auth|session)/i.test(lowerAction)
-      ) {
+      if (hasPasswordField || /(login|signin|auth|session)/i.test(lowerAction) || (actionExplicit && hasAuthFieldHints)) {
         sensitiveKinds.add("login");
       }
-      if (/(reset|forgot|recover|change-password|new-password)/i.test(lowerAction)) {
+      if (/(reset|forgot|recover|change-password|new-password)/i.test(lowerAction) || (actionExplicit && hasResetFieldHints)) {
         sensitiveKinds.add("password-reset");
       }
-      if (/(account|profile|settings|billing|payment|invoice)/i.test(lowerAction)) {
+      if (
+        method !== "GET" &&
+        (/(account|profile|settings|billing|payment|invoice)/i.test(lowerAction) ||
+          (actionExplicit && hasAccountFieldHints))
+      ) {
         sensitiveKinds.add("account");
       }
       if (fields.some((field) => field.type === "file")) {
@@ -471,11 +554,12 @@ function extractSimpleForms(url: string, bodyText: string, targetHostname: strin
         {
           url: actionUrl,
           sourceUrl: url,
-          method: ($(element).attr("method")?.trim().toUpperCase() || "GET"),
+          actionExplicit,
+          method,
           enctype: $(element).attr("enctype")?.trim() || "application/x-www-form-urlencoded",
           internal: parsed.hostname === targetHostname,
           secure: parsed.protocol === "https:",
-          hasPasswordField: fields.some((field) => field.type === "password"),
+          hasPasswordField,
           hasFileUpload: fields.some((field) => field.type === "file"),
           fieldNames,
           hiddenFieldNames,
@@ -508,16 +592,18 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
 
   const findings = [];
   const httpsDirectAttempt = artifacts.context.https;
+  const tlsInfo = artifacts.tlsInfo;
+  const primaryAttemptIsInterstitial = isLikelyEdgeInterstitial(primaryAttempt);
   const httpDirectAttempt = await loadAttempt(target.httpUrl, {
     includeBody: false,
     followRedirects: false,
     timeoutMs: 8_000,
   });
-  const pageForms = primaryPage.formSnapshots;
+  const pageForms = primaryAttemptIsInterstitial ? [] : primaryPage.formSnapshots;
   const metaCsrfTokenPresent = /<meta[^>]+name=["'][^"']*csrf[^"']*["'][^>]+content=["'][^"']+["']/i.test(
     primaryAttempt.bodyText,
   );
-  const firstPartyScriptResources = primaryPage.resources.filter(
+  const firstPartyScriptResources = (primaryAttemptIsInterstitial ? [] : primaryPage.resources).filter(
     (resource) => resource.kind === "script" && resource.internal,
   );
   const firstPartyScriptSamples = (
@@ -544,11 +630,13 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       location: PageResource["location"];
     } => Boolean(sample),
   );
-  const discoveredApiEndpoints = extractEndpointCandidatesFromContent(primaryOrigin, [
-    primaryAttempt.bodyText,
-    ...primaryPage.inlineScripts.map((script) => script.content),
-    ...firstPartyScriptSamples.map((sample) => sample.bodyText),
-  ]);
+  const discoveredApiEndpoints = primaryAttemptIsInterstitial
+    ? []
+    : extractEndpointCandidatesFromContent(primaryOrigin, [
+        primaryAttempt.bodyText,
+        ...primaryPage.inlineScripts.map((script) => script.content),
+        ...firstPartyScriptSamples.map((sample) => sample.bodyText),
+      ]);
   const sensitiveEndpointCandidates = uniqueUrls([
     ...collectSensitiveEndpointCandidates(primaryOrigin, primaryPage.url, pageForms),
     ...discoveredApiEndpoints.filter((url) => sensitivePathPattern.test(new URL(url).pathname)),
@@ -593,21 +681,39 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const allKnownForms = [...pageForms, ...discoveredAuthForms];
   const allKnownFormUrls = uniqueUrls(allKnownForms.map((form) => form.url));
 
+  const httpsProtectedOrChallenged = Boolean(
+    httpsDirectAttempt &&
+      ([401, 403, 405].includes(httpsDirectAttempt.status) || isLikelyEdgeInterstitial(httpsDirectAttempt)),
+  );
   findings.push(
     buildSecurityCheck({
       checkKey: "https-enabled",
       title: "HTTPS enabled",
-      status: httpsDirectAttempt && httpsDirectAttempt.status < 400 ? "pass" : "fail",
-      severity: httpsDirectAttempt && httpsDirectAttempt.status < 400 ? "info" : "high",
+      status:
+        httpsDirectAttempt && (httpsDirectAttempt.status < 400 || httpsProtectedOrChallenged || tlsInfo?.available)
+          ? "pass"
+          : "fail",
+      severity:
+        httpsDirectAttempt && (httpsDirectAttempt.status < 400 || httpsProtectedOrChallenged || tlsInfo?.available)
+          ? "info"
+          : "high",
       shortDescription:
         httpsDirectAttempt && httpsDirectAttempt.status < 400
           ? "The target hostname returned a successful HTTPS response."
-          : "The target hostname did not return a successful HTTPS response.",
+          : httpsProtectedOrChallenged
+            ? `HTTPS responded with status ${httpsDirectAttempt?.status}, which appears to be an intentional access-control or bot-protection response.`
+            : httpsDirectAttempt || tlsInfo?.available
+              ? `HTTPS is reachable and the hostname presents a TLS certificate, but the sampled page response returned status ${httpsDirectAttempt?.status ?? "unknown"}.`
+            : "The target hostname did not return a successful HTTPS response.",
       whyItMatters:
         "HTTPS protects data in transit and is the baseline for browser trust and secure sessions.",
       recommendation:
         httpsDirectAttempt && httpsDirectAttempt.status < 400
           ? "Keep TLS enabled on the public hostname."
+          : httpsProtectedOrChallenged
+            ? "Review whether the non-success status is an intentional access-control or bot-protection response."
+          : httpsDirectAttempt || tlsInfo?.available
+            ? "Review the non-success HTTPS response, but treat TLS availability separately from application access control."
           : "Enable HTTPS with a valid TLS certificate on the public hostname.",
       evidence: {
         checkedUrl: target.httpsUrl,
@@ -615,6 +721,10 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         summary:
           httpsDirectAttempt && httpsDirectAttempt.status < 400
             ? "HTTPS is available on the scanned hostname."
+            : httpsProtectedOrChallenged
+              ? "HTTPS is available, but the sampled response was intentionally gated."
+            : httpsDirectAttempt || tlsInfo?.available
+              ? "HTTPS is reachable, but the sampled response was not a directly accessible 2xx/3xx page response."
             : "HTTPS did not return a successful response for the scanned hostname.",
         statusCode: httpsDirectAttempt?.status ?? null,
       },
@@ -666,7 +776,6 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     }),
   );
 
-  const tlsInfo = artifacts.tlsInfo;
   const certificateValid = Boolean(tlsInfo?.available && !tlsInfo.authorizationError);
   const tlsDaysRemaining = tlsInfo?.daysRemaining ?? null;
   const tlsValidTo = tlsInfo?.validTo ?? null;
@@ -801,6 +910,8 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       : { status: "pass" as const, severity: "info" as const }
     : cspReportOnlyHeader
       ? { status: "warning" as const, severity: "low" as const }
+      : primaryAttemptIsInterstitial
+        ? { status: "info" as const, severity: "info" as const }
       : { status: "warning" as const, severity: "low" as const };
   findings.push(
     buildSecurityCheck({
@@ -812,6 +923,8 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         ? `Content-Security-Policy is set to "${cspHeader}".`
         : cspReportOnlyHeader
           ? `Content-Security-Policy-Report-Only is set to "${cspReportOnlyHeader}".`
+          : primaryAttemptIsInterstitial
+            ? "The sampled response looked like an edge interstitial, so CSP enforcement on the underlying app could not be verified."
           : "Content-Security-Policy is missing from the main response.",
       whyItMatters:
         "A strong CSP reduces exposure to XSS and limits where scripts, frames, and other content can load from.",
@@ -819,6 +932,8 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         ? "Tighten permissive directives like `unsafe-inline` or `unsafe-eval` when feasible."
         : cspReportOnlyHeader
           ? "Promote the report-only policy to an enforced `Content-Security-Policy` header once it is validated."
+          : primaryAttemptIsInterstitial
+            ? "Re-run the scan from a path or environment that can fetch the actual application HTML before treating CSP as missing."
           : "Add a Content-Security-Policy header to the main response.",
       evidence: effectiveCspHeader
         ? {
@@ -888,7 +1003,9 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   );
 
   const referrerPolicy = primaryAttempt.headers["referrer-policy"] ?? "";
-  const weakReferrer = /unsafe-url|no-referrer-when-downgrade|origin\b/i.test(referrerPolicy);
+  const weakReferrer = /^(unsafe-url|no-referrer-when-downgrade|origin|origin-when-cross-origin)$/i.test(
+    referrerPolicy.trim(),
+  );
   findings.push(
     buildSecurityCheck({
       checkKey: "referrer-policy",
@@ -1103,17 +1220,21 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const cookies = primaryAttempt.setCookies.map((cookie) => ({
     name: cookieName(cookie),
     raw: cookie,
-    sensitive: isSensitiveCookie(cookieName(cookie)),
+    infrastructure: isInfrastructureCookie(cookieName(cookie)),
+    sensitive:
+      isSensitiveCookie(cookieName(cookie)) &&
+      !isInfrastructureCookie(cookieName(cookie)),
     ...parseCookieFlags(cookie),
   }));
+  const applicationCookies = cookies.filter((cookie) => !cookie.infrastructure);
   const cookieHints = collectCookieHints(primaryAttempt.setCookies);
-  const missingSecure = cookies.filter((cookie) => !cookie.secure);
-  const missingHttpOnly = cookies.filter((cookie) => !cookie.httpOnly);
-  const missingSameSite = cookies.filter((cookie) => !cookie.sameSite);
+  const missingSecure = applicationCookies.filter((cookie) => !cookie.secure);
+  const missingHttpOnly = applicationCookies.filter((cookie) => !cookie.httpOnly);
+  const missingSameSite = applicationCookies.filter((cookie) => !cookie.sameSite);
   const cookieChecks: Array<{
     checkKey: string;
     title: string;
-    items: typeof cookies;
+    items: typeof applicationCookies;
     missing: typeof missingSecure;
     flag: "Secure" | "HttpOnly" | "SameSite";
     whyItMatters: string;
@@ -1122,7 +1243,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     {
       checkKey: "secure-cookies",
       title: "Secure cookies",
-      items: cookies,
+      items: applicationCookies,
       missing: missingSecure,
       flag: "Secure",
       whyItMatters:
@@ -1132,7 +1253,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     {
       checkKey: "httponly-cookies",
       title: "HttpOnly cookies",
-      items: cookies,
+      items: applicationCookies,
       missing: missingHttpOnly,
       flag: "HttpOnly",
       whyItMatters:
@@ -1142,7 +1263,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     {
       checkKey: "samesite-cookies",
       title: "SameSite cookies",
-      items: cookies,
+      items: applicationCookies,
       missing: missingSameSite,
       flag: "SameSite",
       whyItMatters:
@@ -1176,21 +1297,27 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         status,
         severity,
         shortDescription:
-          check.items.length === 0
-            ? "No response cookies were set on the primary document."
+          applicationCookies.length === 0 && cookies.length > 0
+            ? "Only infrastructure cookies were observed on the sampled response."
+            : check.items.length === 0
+              ? "No response cookies were set on the primary document."
             : check.missing.length === 0
               ? `All ${check.items.length} sampled response cookies include ${check.flag}.`
               : `${check.missing.length} of ${check.items.length} sampled response cookies are missing ${check.flag}.`,
         whyItMatters: check.whyItMatters,
         recommendation:
-          check.items.length === 0
-            ? "No change is required unless your application sets cookies on other routes."
+          applicationCookies.length === 0 && cookies.length > 0
+            ? "No application cookies were observed on this response, so this check is informational."
+            : check.items.length === 0
+              ? "No change is required unless your application sets cookies on other routes."
             : check.recommendation,
         evidence: {
           checkedUrl: primaryAttempt.finalUrl,
           expectedLocation: 'response.headers["set-cookie"]',
           summary:
-            check.items.length === 0
+            applicationCookies.length === 0 && cookies.length > 0
+              ? "Only infrastructure or edge-network cookies were set on the sampled response."
+            : check.items.length === 0
               ? "The primary document response did not set cookies."
               : `${check.missing.length} sampled cookies are missing ${check.flag}.`,
           cookieCount: check.items.length,
@@ -1209,8 +1336,10 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     );
   });
 
-  const sensitiveForms = allKnownForms.filter((form) =>
-    form.sensitiveKinds.some((kind) => ["login", "password-reset", "account"].includes(kind)),
+  const sensitiveForms = allKnownForms.filter(
+    (form) =>
+      form.method !== "GET" &&
+      form.sensitiveKinds.some((kind) => ["login", "password-reset", "account"].includes(kind)),
   );
   const clearlyProtectedForms = sensitiveForms.filter(
     (form) =>
@@ -1888,11 +2017,16 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   );
 
   const apiExposureSignals = apiSurfaceAttempts
-    .filter((attempt) => attempt.status < 400)
+    .filter(
+      (attempt) =>
+        attempt.status < 400 &&
+        !isLikelyEdgeInterstitial(attempt) &&
+        !isHtmlLikeResponse(attempt.headers, attempt.bodyText) &&
+        looksLikeStructuredApiPayload(attempt),
+    )
     .map((attempt) => ({
       url: attempt.finalUrl,
-      sensitiveResponse:
-        /"email"|"token"|"accessToken"|"session"|"userId"|"invoice"|"account"/i.test(attempt.bodyText),
+      sensitiveResponse: looksLikeSensitiveApiPayload(attempt.bodyText),
       contentType: attempt.headers["content-type"] ?? "",
     }));
   const apiExposureStatus =
@@ -1948,6 +2082,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         bodyText: string;
         introspectionOpen: boolean;
         reachable: boolean;
+        protected: boolean;
       }
     | null = null;
   if (graphqlTarget) {
@@ -1976,15 +2111,26 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         status: introspectionProbe?.status ?? baseProbe.status,
         bodyText: (introspectionProbe?.bodyText || baseProbe.bodyText || "").slice(0, 4_000),
         introspectionOpen: Boolean(introspectionProbe?.bodyText.includes("__schema")),
-        reachable: baseProbe.status !== 404 && baseProbe.status < 500,
+        reachable:
+          baseProbe.status !== 404 &&
+          baseProbe.status < 500 &&
+          !isLikelyEdgeInterstitial(baseProbe) &&
+          (baseProbe.status === 405 ||
+            (!isHtmlLikeResponse(baseProbe.headers, baseProbe.bodyText) && looksLikeStructuredApiPayload(baseProbe))),
+        protected:
+          isLikelyEdgeInterstitial(baseProbe) ||
+          [401, 403].includes(baseProbe.status) ||
+          (baseProbe.status === 405 && !isHtmlLikeResponse(baseProbe.headers, baseProbe.bodyText)),
       };
     }
   }
   const graphqlStatus =
     !graphqlTarget || !graphqlProbe?.reachable
       ? { status: "pass" as const, severity: "info" as const }
-      : graphqlProbe?.introspectionOpen
+    : graphqlProbe?.introspectionOpen
         ? { status: "fail" as const, severity: "high" as const }
+        : graphqlProbe.protected
+          ? { status: "info" as const, severity: "info" as const }
         : graphqlProbe.status < 500
           ? { status: "warning" as const, severity: "medium" as const }
           : { status: "pass" as const, severity: "info" as const };
@@ -1997,8 +2143,10 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       shortDescription:
         !graphqlTarget || !graphqlProbe?.reachable
           ? "No GraphQL endpoint was detected in the sampled surface."
-          : graphqlProbe?.introspectionOpen
+        : graphqlProbe?.introspectionOpen
             ? "The sampled GraphQL endpoint appears to expose introspection without a visible protection layer."
+            : graphqlProbe.protected
+              ? "A GraphQL-like endpoint was present, but the sampled response looked intentionally protected."
             : graphqlProbe
               ? "A GraphQL-like endpoint was reachable and should be reviewed."
               : "The sampled GraphQL endpoint was not reachable.",
@@ -2014,8 +2162,10 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         summary:
           !graphqlTarget || !graphqlProbe?.reachable
             ? "No GraphQL endpoint was found."
-            : graphqlProbe?.introspectionOpen
+          : graphqlProbe?.introspectionOpen
               ? "The sampled GraphQL endpoint appeared to disclose introspection data."
+              : graphqlProbe.protected
+                ? "A GraphQL endpoint was detected, but access looked intentionally restricted."
               : "A GraphQL endpoint was detected or probed.",
         introspectionOpen: graphqlProbe?.introspectionOpen ?? false,
         statusCode: graphqlProbe?.status ?? null,
@@ -2590,7 +2740,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     timeoutMs: 8_000,
     followRedirects: false,
   });
-  const envExposed = Boolean(envFile && envFile.status < 400 && /=/.test(envFile.bodyText));
+  const envExposed = Boolean(envFile && looksLikeEnvFile(envFile));
   findings.push(
     buildSecurityCheck({
       checkKey: "exposed-env",
@@ -2621,14 +2771,15 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     backupPaths.map((path) =>
       loadAttempt(`${primaryOrigin}${path}`, {
         timeoutMs: 8_000,
-        includeBody: false,
         followRedirects: false,
       }),
     ),
   );
   const exposedBackups = backupAttempts
     .flatMap((attempt, index) =>
-      attempt && attempt.status < 400 ? [{ attempt, path: backupPaths[index] }] : [],
+      attempt && looksLikeExposedBackupArtifact(attempt, backupPaths[index])
+        ? [{ attempt, path: backupPaths[index] }]
+        : [],
     );
   findings.push(
     buildSecurityCheck({

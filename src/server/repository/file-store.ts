@@ -283,6 +283,24 @@ export function createFileRepository(): Repository {
       });
     },
 
+    async addUserScanCredits(uid, credits) {
+      return withStoreLock(async () => {
+        const store = await readStore();
+        const user = store.users[uid];
+        if (!user) {
+          throw notFound("User not found.");
+        }
+
+        const next: UserRecord = {
+          ...user,
+          purchasedScanCredits: (user.purchasedScanCredits ?? 0) + credits,
+        };
+        store.users[uid] = next;
+        await writeStore(store);
+        return next;
+      });
+    },
+
     async upsertPayment(payment) {
       return withStoreLock(async () => {
         const store = await readStore();

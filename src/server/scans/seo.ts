@@ -10,9 +10,33 @@ import {
   createFinding,
   createResponseLocation,
   getOrigin,
+  isLikelyEdgeInterstitial,
   loadAttempt,
 } from "@/server/scans/helpers";
 import { type CategoryScanResult, type NormalizedTarget } from "@/server/scans/types";
+
+const limitedSeoChecks = [
+  ["title-tag-exists", "Title tag exists"],
+  ["title-length", "Title length"],
+  ["meta-description-exists", "Meta description exists"],
+  ["meta-description-length", "Meta description length"],
+  ["canonical-tag-exists", "Canonical tag exists"],
+  ["canonical-validity", "Canonical validity"],
+  ["robots-txt-exists", "robots.txt exists"],
+  ["sitemap-exists", "Sitemap exists"],
+  ["meta-robots-policy", "Meta robots policy"],
+  ["h1-presence", "H1 presence"],
+  ["heading-structure", "Heading structure"],
+  ["image-alt-text", "Image alt text"],
+  ["open-graph-tags", "Open Graph tags"],
+  ["twitter-card-tags", "Twitter card tags"],
+  ["structured-data-presence", "Structured data presence"],
+  ["viewport-meta", "Viewport meta"],
+  ["html-lang-attribute", "HTML lang attribute"],
+  ["broken-internal-links", "Broken internal links"],
+  ["broken-external-links", "Broken external links"],
+  ["duplicate-like-metadata", "Duplicate-like metadata"],
+] as const;
 
 function buildSeoCheck(input: {
   checkKey: string;
@@ -122,6 +146,34 @@ export async function runSeoScan(target: NormalizedTarget): Promise<CategoryScan
   const artifacts = await loadAuditArtifacts(target);
   const primaryPage = artifacts.primaryPage;
   const primaryAttempt = artifacts.context.primary;
+
+  if (primaryAttempt && isLikelyEdgeInterstitial(primaryAttempt)) {
+    const findings = limitedSeoChecks.map(([checkKey, title]) =>
+      buildSeoCheck({
+        checkKey,
+        title,
+        status: "info",
+        severity: "info",
+        shortDescription:
+          "This check was skipped because the sampled response looked like an edge interstitial or bot-protection page instead of the site's HTML document.",
+        whyItMatters:
+          "SEO checks need the actual page document to evaluate metadata, headings, links, and structured markup correctly.",
+        recommendation:
+          "Run the scan from an environment that can fetch the public HTML document before treating this SEO check as pass or fail.",
+        evidence: {
+          checkedUrl: primaryAttempt.finalUrl,
+          expectedLocation: "Public page HTML document",
+          summary:
+            "The scanner reached an edge interstitial or challenge page, so the underlying site HTML could not be evaluated reliably.",
+          statusCode: primaryAttempt.status,
+        },
+      }),
+    );
+    return {
+      findings: applyPremiumGating(findings),
+      score: computeScore(findings),
+    };
+  }
 
   if (!primaryPage || !primaryAttempt) {
     throw new Error("Unable to fetch and parse the target website.");

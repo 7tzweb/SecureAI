@@ -4,6 +4,7 @@ import { type FindingEvidenceLocation } from "@/lib/types";
 import {
   describeDomLocation,
   getOrigin,
+  isLikelyEdgeInterstitial,
   loadAttempt,
   loadPageContext,
 } from "@/server/scans/helpers";
@@ -48,6 +49,7 @@ export interface PageFormField {
 export interface PageFormSnapshot {
   url: string;
   sourceUrl: string;
+  actionExplicit: boolean;
   method: string;
   enctype: string;
   internal: boolean;
@@ -544,7 +546,7 @@ function buildPageSnapshot(
   const formSnapshots = $("form")
     .toArray()
     .flatMap((element, index) => {
-      const rawAction = $(element).attr("action")?.trim() ?? pageUrl;
+      const rawAction = $(element).attr("action")?.trim() ?? "";
       const url = safeAbsoluteUrl(rawAction || pageUrl, pageUrl) ?? pageUrl;
       let parsed: URL;
       try {
@@ -582,7 +584,9 @@ function buildPageSnapshot(
         });
 
       const lowerFieldNames = fields.map((field) => field.name.toLowerCase());
-      const lowerAction = url.toLowerCase();
+      const method = ($(element).attr("method")?.trim().toUpperCase() || "GET");
+      const actionExplicit = rawAction.length > 0;
+      const lowerAction = rawAction.toLowerCase();
       const visibleFieldTypes = fields
         .filter((field) => field.type !== "hidden")
         .map((field) => field.type);
@@ -593,19 +597,28 @@ function buildPageSnapshot(
         .filter((field) => /(csrf|xsrf|authenticity|requestverification|form[_-]?token|nonce)/i.test(field.name))
         .map((field) => field.name);
       const sensitiveKinds = new Set<string>();
+      const hasPasswordField = fields.some((field) => field.type === "password");
+      const hasAuthFieldHints =
+        hasPasswordField ||
+        lowerFieldNames.some((name) => /(email|username|login|signin|auth|password|otp|code|token)/i.test(name)) ||
+        fields.some((field) => /current-password|new-password|username|one-time-code|email/i.test(field.autocomplete ?? ""));
+      const hasResetFieldHints =
+        lowerFieldNames.some((name) => /(reset|forgot|recover|new[-_]?password|otp|code|token)/i.test(name)) ||
+        fields.some((field) => /new-password|one-time-code/i.test(field.autocomplete ?? ""));
+      const hasAccountFieldHints = lowerFieldNames.some((name) =>
+        /(email|address|billing|card|iban|invoice|profile|settings|phone|account)/i.test(name),
+      );
 
-      if (
-        fields.some((field) => field.type === "password") ||
-        /(login|signin|auth|session)/i.test(lowerAction)
-      ) {
+      if (hasPasswordField || /(login|signin|auth|session)/i.test(lowerAction) || (actionExplicit && hasAuthFieldHints)) {
         sensitiveKinds.add("login");
       }
-      if (/(reset|forgot|recover|new-password|change-password)/i.test(lowerAction)) {
+      if (/(reset|forgot|recover|new-password|change-password)/i.test(lowerAction) || (actionExplicit && hasResetFieldHints)) {
         sensitiveKinds.add("password-reset");
       }
       if (
-        /(profile|account|settings|email|billing|payment|checkout|invoice)/i.test(lowerAction) ||
-        lowerFieldNames.some((name) => /(email|address|billing|card|iban|invoice|profile)/i.test(name))
+        method !== "GET" &&
+        (/(profile|account|settings|email|billing|payment|checkout|invoice)/i.test(lowerAction) ||
+          (actionExplicit && hasAccountFieldHints))
       ) {
         sensitiveKinds.add("account");
       }
@@ -626,11 +639,12 @@ function buildPageSnapshot(
         {
           url,
           sourceUrl: pageUrl,
-          method: ($(element).attr("method")?.trim().toUpperCase() || "GET"),
+          actionExplicit,
+          method,
           enctype: $(element).attr("enctype")?.trim() || "application/x-www-form-urlencoded",
           internal: isInternalHostname(parsed.hostname, targetHostname),
           secure: parsed.protocol === "https:",
-          hasPasswordField: fields.some((field) => field.type === "password"),
+          hasPasswordField,
           hasFileUpload: fields.some((field) => field.type === "file"),
           fieldNames: fields.map((field) => field.name),
           hiddenFieldNames,
@@ -838,6 +852,7 @@ function detectWafCdn(context: PageContext) {
 async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts> {
   const context = await loadPageContext(target);
   const primaryPage = context.primary ? buildPageSnapshot(context.primary, target.targetHostname) : null;
+  const primaryIsInterstitial = isLikelyEdgeInterstitial(context.primary);
   const crawlTargets = primaryPage
     ? dedupeByUrl(
         primaryPage.links.filter(
@@ -847,8 +862,9 @@ async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts>
         .slice(0, 4)
         .map((link) => link.url)
     : [];
+  const scopedCrawlTargets = primaryIsInterstitial ? [] : crawlTargets;
 
-  const crawledAttempts = await mapWithConcurrency(crawlTargets, 3, async (url) =>
+  const crawledAttempts = await mapWithConcurrency(scopedCrawlTargets, 3, async (url) =>
     loadAttempt(url, {
       timeoutMs: 8_000,
     }),
@@ -859,7 +875,7 @@ async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts>
     .filter((page): page is PageSnapshot => Boolean(page));
   const allPages = primaryPage ? [primaryPage, ...crawledPages] : crawledPages;
 
-  const resourceTargets = primaryPage
+  const resourceTargets = primaryPage && !primaryIsInterstitial
     ? dedupeByUrl(primaryPage.resources).slice(0, 40)
     : [];
   const resourceProbes = await mapWithConcurrency(resourceTargets, 5, async (resource) =>

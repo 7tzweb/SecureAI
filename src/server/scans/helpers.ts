@@ -198,6 +198,30 @@ function splitSetCookie(headers: Headers) {
   return raw ? [raw] : [];
 }
 
+export function isHtmlLikeResponse(headers: Record<string, string>, bodyText: string) {
+  const contentType = headers["content-type"] ?? "";
+  return (
+    /text\/html|application\/xhtml\+xml/i.test(contentType) ||
+    /^\s*<!doctype html/i.test(bodyText) ||
+    /^\s*<html[\s>]/i.test(bodyText)
+  );
+}
+
+export function isLikelyEdgeInterstitial(
+  attempt: Pick<HttpAttempt, "headers" | "bodyText"> | null | undefined,
+) {
+  if (!attempt) {
+    return false;
+  }
+
+  return (
+    /challenge/i.test(attempt.headers["cf-mitigated"] ?? "") ||
+    /window\._cf_chl_opt|challenge-platform|Enable JavaScript and cookies to continue|verify you are human|Just a moment/i.test(
+      attempt.bodyText,
+    )
+  );
+}
+
 export async function loadAttempt(
   url: string,
   init: RequestInit & { timeoutMs?: number; includeBody?: boolean; followRedirects?: boolean } = {},
@@ -232,11 +256,20 @@ export async function loadPageContext(target: NormalizedTarget): Promise<PageCon
     loadAttempt(target.httpUrl),
   ]);
 
+  const preferredHttps = https && https.status < 400 && !isLikelyEdgeInterstitial(https) ? https : null;
+  const preferredHttp = http && http.status < 400 && !isLikelyEdgeInterstitial(http) ? http : null;
+  const fallbackHttps = https && !isLikelyEdgeInterstitial(https) ? https : null;
+  const fallbackHttp = http && !isLikelyEdgeInterstitial(http) ? http : null;
+
   return {
     https,
     http,
     primary:
-      https && https.status < 500 ? https : http && http.status < 500 ? http : https ?? http,
+      preferredHttps ||
+      preferredHttp ||
+      fallbackHttps ||
+      fallbackHttp ||
+      (https && https.status < 500 ? https : http && http.status < 500 ? http : https ?? http),
   };
 }
 

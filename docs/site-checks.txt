@@ -1,0 +1,105 @@
+CyberAudit site checks
+Source of truth: src/server/scans/security.ts, src/server/scans/seo.ts, src/server/scans/performance.ts
+
+Notes:
+- This file lists the named checks produced by the current scanner implementation.
+- Each check can return pass, warning, fail, or info depending on the target site.
+- Some results can vary based on the page, headers, redirects, cookies, or discovered forms/endpoints.
+
+SECURITY
+- HTTPS enabled
+- HTTP to HTTPS redirect
+- SSL certificate valid
+- SSL expiration window
+- Domain matches certificate
+- HSTS header
+- Content-Security-Policy
+- X-Frame-Options
+- X-Content-Type-Options
+- Referrer-Policy
+- Permissions-Policy
+- Clickjacking protection
+- CORS misconfiguration
+- Secure cookies
+- HttpOnly cookies
+- SameSite cookies
+- CSRF protection on sensitive forms
+- Session handling review
+- Reflected input exposure
+- XSS risk indicators
+- SQL injection risk indicators
+- Database error disclosure
+- IDOR risk indicators
+- Open redirect indicators
+- Sensitive endpoint discovery
+- Authentication surface review
+- Password field security
+- File upload risk indicators
+- API exposure review
+- GraphQL exposure
+- Rate limiting indicators
+- Error handling hardening
+- Cache-Control on sensitive pages
+- Dangerous methods exposure
+- TRACE method enabled
+- Host header / origin trust indicators
+- Sensitive data exposure in HTML / JS
+- Mixed content
+- Insecure internal links
+- Insecure external resources
+- Insecure form submission
+- Third-party scripts without SRI
+- Exposed .git
+- Exposed .env
+- Exposed backup files
+- Directory listing
+- Server header disclosure
+- X-Powered-By disclosure
+- security.txt
+- robots.txt presence
+- Technology fingerprinting
+- Basic WAF / CDN detection
+
+SEO
+- Title tag exists
+- Title length
+- Meta description exists
+- Meta description length
+- Canonical tag exists
+- Canonical validity
+- robots.txt exists
+- Sitemap exists
+- Meta robots policy
+- H1 presence
+- Heading structure
+- Image alt text
+- Open Graph tags
+- Twitter card tags
+- Structured data presence
+- Viewport meta
+- HTML lang attribute
+- Broken internal links
+- Broken external links
+- Duplicate-like metadata
+
+PERFORMANCE
+- TTFB
+- HTML response time
+- Total request count
+- Total page weight
+- JavaScript bundle weight
+- CSS bundle weight
+- Unoptimized images
+- Modern image formats
+- Image dimensions vs declared size
+- Lazy loading
+- Compression enabled
+- Cache headers
+- Render-blocking resources
+- Third-party script weight
+- Redirect chains
+- Fonts optimization
+- DOM size
+- Main thread pressure hint
+- LCP-style hint
+- CLS-style hint

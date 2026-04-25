@@ -133,7 +133,7 @@ export function HeaderAuthControls() {
   if (!user) {
     return (
       <Button size="sm" onClick={() => void signInWithGoogle()}>
-        Continue with Google
+        Sign in
       </Button>
     );
   }

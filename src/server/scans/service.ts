@@ -8,13 +8,14 @@ import {
   type ScanSummaryResponse,
 } from "@/lib/types";
 import { emptyCategoryState } from "@/lib/utils";
-import { notFound, paymentRequired, unauthorized } from "@/server/api/errors";
+import { notFound, paymentRequired } from "@/server/api/errors";
 import { getQueueDriver } from "@/server/queue";
 import { getRepository } from "@/server/repository";
 import { validateTarget } from "@/server/scans/helpers";
 
-export const FREE_SCAN_LIMIT = 5;
-export const SCAN_PLAN_PRICE_USD = 9;
+export const FREE_SCAN_LIMIT = 3;
+export const SCAN_CREDIT_PACK_SIZE = 30;
+export const SCAN_CREDIT_PACK_PRICE_USD = 4.9;
 const PRIVILEGED_SCAN_EMAIL = "7tzweb@gmail.com";
 const PRIVILEGED_SCAN_LIMIT = 999_999;
 
@@ -26,8 +27,8 @@ function buildEvent(input: Omit<ScanEvent, "id" | "createdAt">): ScanEvent {
   };
 }
 
-function canAccessFixes(sessionUserId: string | null) {
-  return Boolean(sessionUserId);
+function canAccessFixes(scan: ScanRecord, sessionUserId: string | null) {
+  return Boolean(sessionUserId && scan.createdByUserId === sessionUserId);
 }
 
 function hasPrivilegedScanAllowance(email: string | null | undefined) {
@@ -88,21 +89,25 @@ export async function getScanQuotaSummary(userId: string): Promise<ScanQuotaSumm
   ]);
 
   const privilegedAllowance = hasPrivilegedScanAllowance(user?.email);
-  const hasUnlimitedPlan =
-    privilegedAllowance || user?.subscriptionStatus === "premium" || user?.entitlementLevel === "premium";
+  const hasUnlimitedPlan = privilegedAllowance;
   const freeLimit = privilegedAllowance ? PRIVILEGED_SCAN_LIMIT : FREE_SCAN_LIMIT;
-  const remainingScans = hasUnlimitedPlan
-    ? Math.max(0, freeLimit - usedScans)
-    : Math.max(0, freeLimit - usedScans);
+  const purchasedScanCredits = privilegedAllowance ? 0 : (user?.purchasedScanCredits ?? 0);
+  const totalScanAllowance = hasUnlimitedPlan
+    ? PRIVILEGED_SCAN_LIMIT
+    : freeLimit + purchasedScanCredits;
+  const remainingScans = Math.max(0, totalScanAllowance - usedScans);
 
   return {
     usedScans,
     freeLimit,
+    purchasedScanCredits,
+    totalScanAllowance,
     remainingScans,
-    requiresUpgrade: !hasUnlimitedPlan && usedScans >= freeLimit,
+    requiresUpgrade: !hasUnlimitedPlan && usedScans >= totalScanAllowance,
     hasUnlimitedPlan,
-    canCreateScans: hasUnlimitedPlan || usedScans < freeLimit,
-    upgradePriceUsd: SCAN_PLAN_PRICE_USD,
+    canCreateScans: hasUnlimitedPlan || usedScans < totalScanAllowance,
+    upgradePriceUsd: SCAN_CREDIT_PACK_PRICE_USD,
+    upgradeScanCredits: SCAN_CREDIT_PACK_SIZE,
   };
 }
 
@@ -110,7 +115,7 @@ async function assertCanCreateScan(userId: string) {
   const quota = await getScanQuotaSummary(userId);
   if (!quota.canCreateScans) {
     throw paymentRequired(
-      `You reached the ${quota.freeLimit} free scans included with your Google account. Upgrade for $${quota.upgradePriceUsd} to keep creating scans.`,
+      `You reached your ${quota.freeLimit} free scans. Buy ${quota.upgradeScanCredits} more scans for $${quota.upgradePriceUsd.toFixed(2)} to continue.`,
       "SCAN_QUOTA_EXCEEDED",
       quota,
     );
@@ -120,11 +125,10 @@ async function assertCanCreateScan(userId: string) {
 }
 
 export async function createScan(targetInput: string, userId: string | null) {
-  if (!userId) {
-    throw unauthorized("Sign in with Google to start a new scan.");
+  if (userId) {
+    await assertCanCreateScan(userId);
   }
 
-  await assertCanCreateScan(userId);
   const target = await validateTarget(targetInput);
   const repository = getRepository();
   const now = new Date().toISOString();
@@ -174,7 +178,7 @@ export async function getScanSummary(scanId: string, sessionUserId: string | nul
     return null;
   }
 
-  const viewerCanAccessFixes = canAccessFixes(sessionUserId);
+  const viewerCanAccessFixes = canAccessFixes(scan, sessionUserId);
   const response: ScanSummaryResponse = {
     scan,
     viewerCanAccessFixes,
@@ -198,7 +202,7 @@ export async function getScanFindings(
   }
 
   const findings = await repository.listFindings(scanId, category);
-  const viewerCanAccessFixes = canAccessFixes(sessionUserId);
+  const viewerCanAccessFixes = canAccessFixes(scan, sessionUserId);
   return {
     viewerCanAccessFixes,
     findings: redactFindings(findings, viewerCanAccessFixes),
@@ -211,6 +215,15 @@ export async function getScanEvents(scanId: string) {
 
 export async function claimScanToUser(scanId: string, userId: string) {
   const repository = getRepository();
+  const currentScan = await repository.getScan(scanId);
+  if (!currentScan) {
+    throw notFound("Scan not found.");
+  }
+
+  if (!currentScan.createdByUserId) {
+    await assertCanCreateScan(userId);
+  }
+
   const scan = await repository.claimScan(scanId, userId);
   await repository.addEvent(
     scanId,

@@ -80,7 +80,7 @@ export function HistoryClient() {
               className="flex w-full items-center gap-3 rounded-full px-4 py-3 text-slate-600 transition-all hover:bg-white/40"
             >
               <Shield className="h-4 w-4" />
-              <span className="text-sm font-medium">Dashboard</span>
+              <span className="text-sm font-medium">Home</span>
             </button>
             <div className="flex items-center gap-3 rounded-full bg-blue-600 px-4 py-3 text-white shadow-[0_4px_12px_rgba(0,122,255,0.3)]">
               <History className="h-4 w-4" />
@@ -129,7 +129,7 @@ export function HistoryClient() {
                 onClick={() => void signInWithGoogle()}
                 className="mt-6 rounded-full bg-[var(--primary)] px-6 py-3 text-sm font-semibold text-white transition-all hover:bg-[#004ca1]"
               >
-                Continue with Google
+                Sign in
               </button>
             </div>
           ) : (

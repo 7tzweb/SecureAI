@@ -302,7 +302,7 @@ export function FindingCard({
             className="inline-flex items-center gap-2 rounded-full bg-white/50 px-5 py-2.5 text-sm font-semibold text-[var(--primary)] shadow-sm transition-all hover:bg-[var(--primary)] hover:text-white disabled:cursor-not-allowed disabled:opacity-60"
           >
             <Lock className="h-4 w-4" />
-            Continue with Google
+            Sign in
           </button>
         ) : (
           <button

@@ -26,6 +26,9 @@ export const serverConfig = {
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? "",
   stripePriceIdPremium: process.env.STRIPE_PRICE_ID_PREMIUM ?? "",
   stripeScanPlanPriceUsd: Number(process.env.STRIPE_SCAN_PLAN_PRICE_USD ?? "9"),
+  paypalClientId: process.env.PAYPAL_CLIENT_ID ?? process.env.NEXT_PUBLIC_PAYPAL_CLIENT_ID ?? "",
+  paypalClientSecret: process.env.PAYPAL_CLIENT_SECRET ?? "",
+  paypalEnv: process.env.PAYPAL_ENV === "live" ? "live" : "sandbox",
   googleOAuthClientId: process.env.GOOGLE_OAUTH_CLIENT_ID ?? "",
   googleOAuthClientSecret: process.env.GOOGLE_OAUTH_CLIENT_SECRET ?? "",
   sessionSecret:
@@ -55,4 +58,7 @@ export const hasSessionAuthConfig = Boolean(
 export const hasStripeConfig = Boolean(serverConfig.stripeSecretKey);
 export const hasStripeWebhookConfig = Boolean(
   serverConfig.stripeSecretKey && serverConfig.stripeWebhookSecret,
+);
+export const hasPayPalConfig = Boolean(
+  serverConfig.paypalClientId && serverConfig.paypalClientSecret,
 );

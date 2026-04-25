@@ -5,8 +5,31 @@ import {
   loadAuditArtifacts,
   sumKnownBytes,
 } from "@/server/scans/artifacts";
-import { createFinding } from "@/server/scans/helpers";
+import { createFinding, isLikelyEdgeInterstitial } from "@/server/scans/helpers";
 import { type CategoryScanResult, type NormalizedTarget } from "@/server/scans/types";
+
+const limitedPerformanceChecks = [
+  ["ttfb", "TTFB"],
+  ["html-response-time", "HTML response time"],
+  ["total-request-count", "Total request count"],
+  ["total-page-weight", "Total page weight"],
+  ["javascript-bundle-weight", "JavaScript bundle weight"],
+  ["css-bundle-weight", "CSS bundle weight"],
+  ["unoptimized-images", "Unoptimized images"],
+  ["modern-image-formats", "Modern image formats"],
+  ["image-dimensions-vs-declared-size", "Image dimensions vs declared size"],
+  ["lazy-loading", "Lazy loading"],
+  ["compression-enabled", "Compression enabled"],
+  ["cache-headers", "Cache headers"],
+  ["render-blocking-resources", "Render-blocking resources"],
+  ["third-party-script-weight", "Third-party script weight"],
+  ["redirect-chains", "Redirect chains"],
+  ["fonts-optimization", "Fonts optimization"],
+  ["dom-size", "DOM size"],
+  ["main-thread-pressure-hint", "Main thread pressure hint"],
+  ["lcp-style-hint", "LCP-style hint"],
+  ["cls-style-hint", "CLS-style hint"],
+] as const;
 
 type ImageDimensionSample = {
   url: string;
@@ -200,6 +223,34 @@ export async function runPerformanceScan(
   const artifacts = await loadAuditArtifacts(target);
   const primaryAttempt = artifacts.context.primary;
   const primaryPage = artifacts.primaryPage;
+
+  if (primaryAttempt && isLikelyEdgeInterstitial(primaryAttempt)) {
+    const findings = limitedPerformanceChecks.map(([checkKey, title]) =>
+      buildPerformanceCheck({
+        checkKey,
+        title,
+        status: "info",
+        severity: "info",
+        shortDescription:
+          "This check was skipped because the sampled response looked like an edge interstitial or bot-protection page instead of the site's application payload.",
+        whyItMatters:
+          "Performance checks need the actual page and resource graph to measure transfer size, render blockers, image handling, and browser workload.",
+        recommendation:
+          "Run the scan from an environment that can fetch the real page response before treating this performance check as pass or fail.",
+        evidence: {
+          checkedUrl: primaryAttempt.finalUrl,
+          expectedLocation: "Public page HTML and resource graph",
+          summary:
+            "The scanner reached an edge interstitial or challenge response, so the underlying application performance could not be measured reliably.",
+          statusCode: primaryAttempt.status,
+        },
+      }),
+    );
+    return {
+      findings: applyPremiumGating(findings),
+      score: computeScore(findings),
+    };
+  }
 
   if (!primaryAttempt || !primaryPage) {
     throw new Error("Unable to fetch the target website.");

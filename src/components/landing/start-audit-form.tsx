@@ -1,8 +1,9 @@
 "use client";
 
-import { usePathname, useRouter } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { useEffect, useState, useTransition } from "react";
 import { ArrowRight, ExternalLink, Globe, Loader2 } from "lucide-react";
+import { PaypalCreditsDialog } from "@/components/billing/paypal-credits-dialog";
 import { useAuth } from "@/components/providers/auth-provider";
 import { type ScanQuotaSummary } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -38,12 +39,12 @@ async function fetchJson<T>(url: string, init?: RequestInit) {
 
 export function StartAuditForm({ variant = "hero", className }: StartAuditFormProps) {
   const router = useRouter();
-  const pathname = usePathname();
   const { user, status, isConfigured, signInWithGoogle, ensureServerSession } = useAuth();
   const [target, setTarget] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [quota, setQuota] = useState<ScanQuotaSummary | null>(null);
   const [checkoutPending, setCheckoutPending] = useState(false);
+  const [paypalOpen, setPaypalOpen] = useState(false);
   const [isPending, startTransition] = useTransition();
 
   type FormError = Error & {
@@ -97,29 +98,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
         await signInWithGoogle();
       }
 
-      const payload = await fetchJson<{ url?: string; alreadyActive?: boolean }>("/api/billing/checkout", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          purpose: "scan-plan",
-          returnPath: pathname,
-        }),
-      });
-
-      if (payload.alreadyActive) {
-        const usagePayload = await fetchJson<{ quota: ScanQuotaSummary }>("/api/me/usage");
-        setQuota(usagePayload.quota);
-        setError(null);
-        return;
-      }
-
-      if (!payload.url) {
-        throw new Error("Unable to start checkout.");
-      }
-
-      window.location.assign(payload.url);
+      setPaypalOpen(true);
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Unable to start checkout.");
     } finally {
@@ -138,15 +117,8 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
 
     startTransition(async () => {
       try {
-        if (!isConfigured) {
-          setError("Google login must be configured before a new scan can start.");
-          return;
-        }
-
         if (status === "signed-in" && user) {
           await ensureServerSession();
-        } else {
-          await signInWithGoogle();
         }
 
         const payload = await fetchJson<{ scan: { id: string } }>("/api/scans", {
@@ -166,6 +138,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
             typeof resolvedError.details === "object"
           ) {
             setQuota(resolvedError.details as ScanQuotaSummary);
+            setPaypalOpen(true);
           }
         }
 
@@ -190,7 +163,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
           className={cn(
             "flex items-center gap-4",
             variant === "hero"
-              ? "px-4 md:pl-6 md:pr-1"
+              ? "min-w-0 flex-1 px-4 md:pl-6 md:pr-1"
               : variant === "header"
                 ? "min-w-0 flex-1 px-4"
                 : "px-4 py-1",
@@ -216,7 +189,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
         <button
           type="button"
           className={cn(
-            "inline-flex h-12 items-center justify-center gap-2 rounded-full bg-[var(--primary)] px-6 text-sm font-semibold text-white transition-all hover:bg-[#004ca1] active:scale-[0.98]",
+            "inline-flex h-12 shrink-0 items-center justify-center gap-2 rounded-full bg-[var(--primary)] px-6 text-sm font-semibold text-white transition-all hover:bg-[#004ca1] active:scale-[0.98]",
             variant === "hero"
               ? "md:px-8"
               : variant === "header"
@@ -238,7 +211,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
             {quota?.requiresUpgrade ? (
               <div className={cn("flex flex-col gap-3", error ? "mt-3" : "")}>
                 <p className="text-sm text-slate-600">
-                  {quota.usedScans} of {quota.freeLimit} free scans are already used on this Google account.
+                  {quota.usedScans} of {quota.totalScanAllowance} scans are already used on this Google account.
                 </p>
                 <button
                   type="button"
@@ -253,7 +226,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
                     </>
                   ) : (
                     <>
-                      Upgrade to unlimited for ${quota.upgradePriceUsd}
+                      Buy {quota.upgradeScanCredits} scans for ${quota.upgradePriceUsd.toFixed(2)}
                       <ExternalLink className="h-4 w-4" />
                     </>
                   )}
@@ -267,12 +240,12 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
           {quota ? (
             <p className="text-sm text-slate-500">
               {quota.hasUnlimitedPlan
-                ? "Unlimited scans are active on this account."
-                : `${quota.usedScans} of ${quota.freeLimit} free scans used on this Google account.`}
+                ? "High-volume scans are active on this account."
+                : `${quota.remainingScans} scans remaining on this Google account.`}
             </p>
           ) : (
             <p className="text-sm text-slate-500">
-              Sign in with Google to save the scan, unlock fixes, and keep the free 5-scan quota tied to your email.
+              Scan now. Google sign-in is only needed to unlock fix guidance.
             </p>
           )}
 
@@ -292,7 +265,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
                 </>
               ) : (
                 <>
-                  Upgrade to unlimited for ${quota?.upgradePriceUsd ?? 9}
+                  Buy {quota?.upgradeScanCredits ?? 30} scans for ${(quota?.upgradePriceUsd ?? 4.9).toFixed(2)}
                   <ExternalLink className="h-4 w-4" />
                 </>
               )}
@@ -300,6 +273,16 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
           ) : null}
         </div>
       )}
+      <PaypalCreditsDialog
+        open={paypalOpen}
+        quota={quota}
+        onClose={() => setPaypalOpen(false)}
+        onApproved={(nextQuota) => {
+          setQuota(nextQuota);
+          setError(null);
+          setPaypalOpen(false);
+        }}
+      />
     </div>
   );
 }

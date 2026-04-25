@@ -53,6 +53,7 @@ function toUserRecord(sessionUser: SessionUser): UserRecord {
     subscriptionStatus: sessionUser.subscriptionStatus,
     stripeCustomerId: null,
     entitlementLevel: sessionUser.entitlementLevel,
+    purchasedScanCredits: 0,
   };
 }
 

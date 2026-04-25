@@ -4,6 +4,7 @@ import type { CSSProperties } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { startTransition, useEffect, useMemo, useState } from "react";
 import { Clock3, Download, FileText, History, Shield, Wrench, X } from "lucide-react";
+import { PaypalCreditsDialog } from "@/components/billing/paypal-credits-dialog";
 import { FindingCard } from "@/components/results/finding-card";
 import { useAuth } from "@/components/providers/auth-provider";
 import {
@@ -12,6 +13,7 @@ import {
   type ScanEvent,
   type ScanFinding,
   type ScanRecord,
+  type ScanQuotaSummary,
   type ScanSummaryResponse,
 } from "@/lib/types";
 import {
@@ -702,6 +704,8 @@ export function ResultsClient({ scanId }: { scanId: string }) {
   const [actionPending, setActionPending] = useState(false);
   const [downloadPending, setDownloadPending] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
+  const [quota, setQuota] = useState<ScanQuotaSummary | null>(null);
+  const [paypalOpen, setPaypalOpen] = useState(false);
 
   const requestedTab = (searchParams.get("tab") as CategoryKey | null) ?? "security";
   const activeTab = categoryKeys.includes(requestedTab) ? requestedTab : "security";
@@ -747,6 +751,12 @@ export function ResultsClient({ scanId }: { scanId: string }) {
     () =>
       categoryKeys.map((category) => {
         const snapshot = scan?.categoryStatus[category];
+        const findings = state.findings[category];
+        const count = snapshot?.findingCount ?? findings.length;
+        const passCount = findings.filter((finding) => {
+          const status = deriveFindingStatus(finding);
+          return status === "pass" || status === "info";
+        }).length;
         const score =
           category === "security"
             ? scan?.securityScore ?? null
@@ -757,11 +767,13 @@ export function ResultsClient({ scanId }: { scanId: string }) {
         return {
           category,
           status: snapshot?.status ?? "queued",
-          count: snapshot?.findingCount ?? 0,
+          count,
+          passCount,
+          failCount: Math.max(count - passCount, 0),
           score,
         };
       }),
-    [scan],
+    [scan, state.findings],
   );
 
   const activeFindings = state.findings[activeTab];
@@ -815,9 +827,17 @@ export function ResultsClient({ scanId }: { scanId: string }) {
       if (shouldClaimScan) {
         const claimResponse = await fetch(`/api/scans/${scanId}/claim`, { method: "POST" });
         const claimPayload = (await claimResponse.json().catch(() => null)) as
-          | { error?: string }
+          | { error?: string; code?: string; details?: unknown }
           | null;
         if (!claimResponse.ok) {
+          if (
+            claimPayload?.code === "SCAN_QUOTA_EXCEEDED" &&
+            claimPayload.details &&
+            typeof claimPayload.details === "object"
+          ) {
+            setQuota(claimPayload.details as ScanQuotaSummary);
+            setPaypalOpen(true);
+          }
           throw new Error(claimPayload?.error ?? "Unable to link this scan.");
         }
       }
@@ -908,7 +928,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
               <div className="space-y-2">
                 <div className="flex items-center gap-3 rounded-full bg-blue-600 px-4 py-3 text-white shadow-[0_4px_12px_rgba(0,122,255,0.3)]">
                   <Shield className="h-4 w-4" />
-                  <span className="text-sm font-semibold">Dashboard</span>
+                  <span className="text-sm font-semibold">Home</span>
                 </div>
                 <button
                   type="button"
@@ -1013,6 +1033,9 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                     style={{ width: `${scan.progress}%` }}
                   />
                 </div>
+                <p className="mt-4 text-sm text-slate-500">
+                  Live site checks across Security, SEO, and Performance.
+                </p>
                 <div className="mt-6 grid gap-3 md:grid-cols-3">
                   {categoryCards.map((item) => (
                     <div key={item.category} className="rounded-[1.3rem] bg-white/55 px-4 py-4">
@@ -1038,6 +1061,14 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                         </span>
                       </div>
                       <p className="mt-2 text-xs text-slate-500">{item.count} checks</p>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-700">
+                          {item.passCount} passed
+                        </span>
+                        <span className="rounded-full bg-rose-50 px-2.5 py-1 text-[11px] font-semibold text-rose-700">
+                          {item.failCount} failed
+                        </span>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -1107,7 +1138,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                   ? "Google login unavailable"
                   : state.viewerCanAccessFixes
                     ? "Google connected"
-                    : "Continue with Google"}
+                    : "Sign in"}
               </button>
             </div>
           </div>
@@ -1145,6 +1176,17 @@ export function ResultsClient({ scanId }: { scanId: string }) {
           </div>
         </main>
       </div>
+
+      <PaypalCreditsDialog
+        open={paypalOpen}
+        quota={quota}
+        onClose={() => setPaypalOpen(false)}
+        onApproved={async (nextQuota) => {
+          setQuota(nextQuota);
+          setPaypalOpen(false);
+          await handleContinueWithGoogle();
+        }}
+      />
 
       {reportOpen && scan ? (
         <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/45 px-4 py-8 backdrop-blur-[6px]">

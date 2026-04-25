@@ -2,8 +2,9 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Clock3, ExternalLink, Loader2, UserCircle2 } from "lucide-react";
+import { PaypalCreditsDialog } from "@/components/billing/paypal-credits-dialog";
 import { StartAuditForm } from "@/components/landing/start-audit-form";
 import { useAuth } from "@/components/providers/auth-provider";
 import { Button } from "@/components/ui/button";
@@ -50,23 +51,11 @@ export function SiteHeader() {
   const [quota, setQuota] = useState<ScanQuotaSummary | null>(null);
   const [accountOpen, setAccountOpen] = useState(false);
   const [actionPending, setActionPending] = useState(false);
+  const [paypalOpen, setPaypalOpen] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const isWorkspacePage = pathname.startsWith("/scans") || pathname.startsWith("/history");
-
-  const summaryText = useMemo(() => {
-    if (status !== "signed-in") {
-      return "Google sign-in unlocks saved scans";
-    }
-    if (quota?.hasUnlimitedPlan) {
-      return "Unlimited scans enabled";
-    }
-    if (quota) {
-      return `${quota.remainingScans} of ${quota.freeLimit} free scans left`;
-    }
-    return "History and fix access enabled";
-  }, [quota, status]);
 
   useEffect(() => {
     let cancelled = false;
@@ -138,7 +127,7 @@ export function SiteHeader() {
         const payload = await fetchJson<{ quota: ScanQuotaSummary }>("/api/me/usage");
         if (!cancelled) {
           setQuota(payload.quota);
-          setBanner("Unlimited scans are now active on your account.");
+          setBanner("Scan credits are now active on your account.");
         }
       } catch (error) {
         if (!cancelled) {
@@ -171,21 +160,6 @@ export function SiteHeader() {
     };
   }, []);
 
-  const handleJump = (elementId: string, fallbackHref: string) => {
-    const element = document.getElementById(elementId);
-    if (element) {
-      const input = element.querySelector("input");
-      if (input instanceof HTMLInputElement) {
-        input.focus();
-      }
-      element.scrollIntoView({ behavior: "smooth", block: "start" });
-      setAccountOpen(false);
-      return;
-    }
-
-    router.push(fallbackHref);
-  };
-
   const handleUpgrade = async () => {
     setActionError(null);
 
@@ -202,29 +176,7 @@ export function SiteHeader() {
         await signInWithGoogle();
       }
 
-      const payload = await fetchJson<{ url?: string; alreadyActive?: boolean }>("/api/billing/checkout", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          purpose: "scan-plan",
-          returnPath: pathname,
-        }),
-      });
-
-      if (payload.alreadyActive) {
-        const usagePayload = await fetchJson<{ quota: ScanQuotaSummary }>("/api/me/usage");
-        setQuota(usagePayload.quota);
-        setBanner("Unlimited scans are already active on this account.");
-        return;
-      }
-
-      if (!payload.url) {
-        throw new Error("Unable to start checkout.");
-      }
-
-      window.location.assign(payload.url);
+      setPaypalOpen(true);
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "Unable to start checkout.");
     } finally {
@@ -258,32 +210,8 @@ export function SiteHeader() {
                   : "border-transparent text-slate-500 hover:text-slate-900",
               )}
             >
-              Dashboard
+              Home
             </Link>
-            <button
-              type="button"
-              onClick={() => handleJump("global-scan-launcher", "/#scan-launch")}
-              className={cn(
-                "border-b-2 pb-1 text-sm tracking-tight transition-colors",
-                pathname.startsWith("/scans")
-                  ? "border-[var(--primary)] text-[var(--primary)]"
-                  : "border-transparent text-slate-500 hover:text-slate-900",
-              )}
-            >
-              Audits
-            </button>
-            <button
-              type="button"
-              onClick={() =>
-                handleJump(
-                  "threats-panel",
-                  pathname.startsWith("/scans") ? "#threats-panel" : "/#threats-panel",
-                )
-              }
-              className="border-b-2 border-transparent pb-1 text-sm tracking-tight text-slate-500 transition-colors hover:text-slate-900"
-            >
-              Threats
-            </button>
             <Link
               href="/history"
               className={cn(
@@ -343,15 +271,15 @@ export function SiteHeader() {
                       </p>
                       <p className="mt-2 text-sm text-slate-900">
                         {quota?.hasUnlimitedPlan
-                          ? "Unlimited scans are active."
+                          ? "High-volume scans are active."
                           : quota
-                            ? `${quota.usedScans} of ${quota.freeLimit} free scans used.`
+                            ? `${quota.remainingScans} scans remaining.`
                             : "Loading your quota..."}
                       </p>
                       <p className="mt-1 text-xs text-slate-500">
                         {quota?.hasUnlimitedPlan
-                          ? "Your account can keep launching scans without the 5-scan cap."
-                          : `Upgrade for $${quota?.upgradePriceUsd ?? 9} once the free quota is exhausted.`}
+                          ? "Your account can keep launching scans without the standard cap."
+                          : `3 free scans are included. Add ${quota?.upgradeScanCredits ?? 30} more for $${(quota?.upgradePriceUsd ?? 4.9).toFixed(2)}.`}
                       </p>
                     </div>
 
@@ -370,7 +298,7 @@ export function SiteHeader() {
                           </>
                         ) : (
                           <>
-                            Upgrade to Unlimited for ${quota?.upgradePriceUsd ?? 9}
+                            Buy {quota?.upgradeScanCredits ?? 30} scans for ${(quota?.upgradePriceUsd ?? 4.9).toFixed(2)}
                             <ExternalLink className="ml-2 h-4 w-4" />
                           </>
                         )}
@@ -381,7 +309,7 @@ export function SiteHeader() {
                   <div className="space-y-3">
                     <p className="text-sm font-semibold text-slate-900">Google account required</p>
                     <p className="text-sm leading-6 text-slate-500">
-                      Sign in to save history, unlock fixes, and keep the free 5-scan quota tied to your email.
+                      Sign in to save history, unlock fixes, and keep scan credits tied to your email.
                     </p>
                     <Button
                       size="sm"
@@ -389,7 +317,7 @@ export function SiteHeader() {
                       disabled={!isConfigured || actionPending}
                       onClick={() => void signInWithGoogle()}
                     >
-                      Continue with Google
+                      Sign in
                     </Button>
                   </div>
                 )}
@@ -397,30 +325,26 @@ export function SiteHeader() {
             ) : null}
           </div>
 
-          <div className="hidden text-right lg:block">
-            <p className="text-xs font-semibold text-slate-900">
-              {status === "signed-in"
-                ? quota?.hasUnlimitedPlan
-                  ? "Unlimited plan active"
-                  : quota
-                    ? `${quota.usedScans}/${quota.freeLimit} scans used`
-                    : "Syncing account"
-                : "Google sign-in available"}
-            </p>
-            <p className="text-xs text-[var(--ink-soft)]">{summaryText}</p>
-          </div>
-
           {status === "signed-in" ? (
-            <Button variant="outline" size="sm" onClick={() => void signOut()}>
-              Sign out
-            </Button>
+            <>
+              <div className="hidden rounded-full border border-white/70 bg-white/70 px-3 py-2 text-xs font-semibold text-slate-700 shadow-sm sm:block">
+                {quota
+                  ? quota.hasUnlimitedPlan
+                    ? "Credits: unlimited"
+                    : `Credits: ${quota.remainingScans}`
+                  : "Credits: ..."}
+              </div>
+              <Button variant="outline" size="sm" onClick={() => void signOut()}>
+                Sign out
+              </Button>
+            </>
           ) : (
             <Button
               size="sm"
               disabled={!isConfigured || actionPending}
               onClick={() => void signInWithGoogle()}
             >
-              Continue with Google
+              Sign in
             </Button>
           )}
         </div>
@@ -443,6 +367,16 @@ export function SiteHeader() {
           </div>
         </div>
       ) : null}
+      <PaypalCreditsDialog
+        open={paypalOpen}
+        quota={quota}
+        onClose={() => setPaypalOpen(false)}
+        onApproved={(nextQuota) => {
+          setQuota(nextQuota);
+          setPaypalOpen(false);
+          setBanner("30 scans were added to your account.");
+        }}
+      />
     </header>
   );
 }

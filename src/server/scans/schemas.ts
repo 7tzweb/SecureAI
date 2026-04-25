@@ -23,6 +23,10 @@ export const checkoutConfirmSchema = z.object({
   sessionId: z.string().trim().min(8).max(255),
 });
 
+export const paypalCaptureSchema = z.object({
+  orderId: z.string().trim().min(8).max(255),
+});
+
 export const sessionSchema = z.object({
   idToken: z.string().trim().min(10),
 });
