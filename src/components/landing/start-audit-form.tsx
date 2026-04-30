@@ -5,6 +5,7 @@ import { useEffect, useState, useTransition } from "react";
 import { ArrowRight, ExternalLink, Globe, Loader2 } from "lucide-react";
 import { PaypalCreditsDialog } from "@/components/billing/paypal-credits-dialog";
 import { useAuth } from "@/components/providers/auth-provider";
+import { dispatchQuotaRefresh, subscribeQuotaRefresh } from "@/lib/quota-events";
 import { type ScanQuotaSummary } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -82,6 +83,25 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
     };
   }, [ensureServerSession, status, user]);
 
+  useEffect(() => {
+    return subscribeQuotaRefresh(() => {
+      if (status !== "signed-in" || !user) {
+        setQuota(null);
+        return;
+      }
+
+      void (async () => {
+        try {
+          await ensureServerSession();
+          const payload = await fetchJson<{ quota: ScanQuotaSummary }>("/api/me/usage");
+          setQuota(payload.quota);
+        } catch {
+          setQuota(null);
+        }
+      })();
+    });
+  }, [ensureServerSession, status, user]);
+
   const handleUpgrade = async () => {
     setError(null);
 
@@ -129,6 +149,9 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
           body: JSON.stringify({ target: value }),
         });
 
+        if (status === "signed-in" && user) {
+          dispatchQuotaRefresh();
+        }
         router.push(`/scans/${payload.scan.id}`);
       } catch (nextError) {
         const resolvedError = nextError as FormError;
@@ -173,7 +196,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
           <input
             value={target}
             onChange={(event) => setTarget(event.target.value)}
-            placeholder="Enter your domain URL (e.g. cyberaudit.io)"
+            placeholder="Enter your website URL"
             className={cn(
               "w-full bg-transparent text-sm text-[var(--ink)] outline-none placeholder:text-[var(--ink-soft)]",
               variant === "header" ? "h-10" : "h-12",
@@ -189,7 +212,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
         <button
           type="button"
           className={cn(
-            "inline-flex h-12 shrink-0 items-center justify-center gap-2 rounded-full bg-[var(--primary)] px-6 text-sm font-semibold text-white transition-all hover:bg-[#004ca1] active:scale-[0.98]",
+            "inline-flex h-12 shrink-0 items-center justify-center gap-2 rounded-full bg-[var(--primary)] px-6 text-sm font-semibold !text-white transition-all hover:bg-[#004ca1] active:scale-[0.98]",
             variant === "hero"
               ? "md:px-8"
               : variant === "header"
@@ -199,8 +222,8 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
           disabled={isPending || checkoutPending}
           onClick={handleSubmit}
         >
-          {isPending ? "Creating scan..." : "Start Scan"}
-          <ArrowRight className="h-4 w-4" />
+          {isPending ? "Creating scan..." : "Scan Site"}
+          <ArrowRight className="h-4 w-4 text-white" />
         </button>
       </div>
 
@@ -211,7 +234,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
             {quota?.requiresUpgrade ? (
               <div className={cn("flex flex-col gap-3", error ? "mt-3" : "")}>
                 <p className="text-sm text-slate-600">
-                  {quota.usedScans} of {quota.totalScanAllowance} scans are already used on this Google account.
+                  {quota.usedScans} of {quota.totalScanAllowance} available scans are already used on this Google account.
                 </p>
                 <button
                   type="button"
@@ -226,7 +249,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
                     </>
                   ) : (
                     <>
-                      Buy {quota.upgradeScanCredits} scans for ${quota.upgradePriceUsd.toFixed(2)}
+                      Buy {quota.upgradeScanCredits} credits for ${quota.upgradePriceUsd.toFixed(2)}
                       <ExternalLink className="h-4 w-4" />
                     </>
                   )}
@@ -241,7 +264,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
             <p className="text-sm text-slate-500">
               {quota.hasUnlimitedPlan
                 ? "High-volume scans are active on this account."
-                : `${quota.remainingScans} scans remaining on this Google account.`}
+                : `${quota.remainingScans} scans remaining on this account.`}
             </p>
           ) : (
             <p className="text-sm text-slate-500">
@@ -265,7 +288,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
                 </>
               ) : (
                 <>
-                  Buy {quota?.upgradeScanCredits ?? 30} scans for ${(quota?.upgradePriceUsd ?? 4.9).toFixed(2)}
+                  Buy {quota?.upgradeScanCredits ?? 20} credits for ${(quota?.upgradePriceUsd ?? 10).toFixed(2)}
                   <ExternalLink className="h-4 w-4" />
                 </>
               )}
@@ -281,6 +304,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
           setQuota(nextQuota);
           setError(null);
           setPaypalOpen(false);
+          dispatchQuotaRefresh();
         }}
       />
     </div>

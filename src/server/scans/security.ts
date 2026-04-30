@@ -40,16 +40,31 @@ function cookieName(cookie: string) {
 }
 
 function parseCookieFlags(cookie: string) {
-  const lower = cookie.toLowerCase();
+  const attributes = cookie
+    .split(";")
+    .slice(1)
+    .map((part) => part.trim().toLowerCase())
+    .filter(Boolean);
+
   return {
-    secure: lower.includes("; secure"),
-    httpOnly: lower.includes("; httponly"),
-    sameSite: lower.includes("; samesite"),
+    secure: attributes.includes("secure"),
+    httpOnly: attributes.includes("httponly"),
+    sameSite: attributes.some((attribute) => attribute === "samesite" || attribute.startsWith("samesite=")),
   };
 }
 
+function isCsrfCookie(name: string) {
+  return /(csrf|xsrf)/i.test(name);
+}
+
 function isSensitiveCookie(name: string) {
-  return /(session|sess|auth|token|jwt|sid|csrf|xsrf)/i.test(name);
+  const lower = name.toLowerCase();
+
+  return (
+    /^(?:phpsessid|jsessionid|sessionid|connect\.sid)$/i.test(name) ||
+    /(?:^|[_.-])(?:session|sess|sid)(?:$|[_.-])/i.test(lower) ||
+    /(?:auth(?:entication)?|access|refresh|id)[_.-]?token|jwt/i.test(lower)
+  );
 }
 
 function isInfrastructureCookie(name: string) {
@@ -160,33 +175,42 @@ type ReflectionResult = {
 };
 
 const csrfTokenNamePattern = /(csrf|xsrf|authenticity|requestverification|form[_-]?token|nonce)/i;
-const sensitiveCookieNamePattern = /(session|sess|auth|token|jwt|sid|csrf|xsrf)/i;
 const sensitivePathPattern =
   /(login|signin|auth|register|signup|password|reset|forgot|admin|dashboard|account|profile|settings|billing|payment|invoice|export|download|upload|graphql|api|debug|status|metrics)/i;
-const apiPathPattern = /\/(?:api|graphql|rest|rpc|ajax|v\d+)\b/i;
+const apiPathPattern = /(?:^|\/)(?:api(?:\/v\d+)?|graphql|rest(?:\/v\d+)?|rpc|ajax)(?:\/|$)/i;
 const openRedirectParamPattern = /^(redirect|next|return|returnurl|continue|url|target|dest)$/i;
 const riskyInputParamPattern = /^(q|query|search|keyword|term|id|sort|filter|category|redirect|next|returnurl|continue|url)$/i;
 const sqlErrorPatterns = [
-  /sql syntax/i,
-  /mysql/i,
-  /postgres/i,
-  /sqlite/i,
+  /you have an error in your sql syntax/i,
+  /warning:\s*(?:mysql|mysqli|pg_|sqlite_|odbc|pdo)/i,
+  /\b(?:mysql|postgres(?:ql)?|sqlite|sqlserver|oracle)\b.{0,40}\b(?:syntax|error|exception|warning|query|driver|odbc|state)\b/i,
   /sqlstate/i,
   /odbc/i,
   /pdoexception/i,
-  /sequelize/i,
-  /prisma/i,
+  /sequelize[^<\n]{0,80}(?:error|exception)/i,
+  /prisma[^<\n]{0,80}(?:error|exception)/i,
   /database error/i,
   /query failed/i,
+  /syntax error at or near/i,
+  /unterminated quoted string/i,
+  /no such table/i,
+  /unknown column/i,
 ];
-const stackTracePatterns = [
+const strongVerboseErrorPatterns = [
   /stack trace/i,
-  /exception:/i,
-  /traceback/i,
-  /node_modules\//i,
-  /\/src\/.+\.(ts|js|php|py|rb|go|java)/i,
-  /\bat\s+[A-Za-z0-9_$]+\s+\(/i,
+  /traceback \(most recent call last\)/i,
+  /uncaught exception/i,
+  /unhandled (?:exception|rejection)/i,
+  /pdoexception/i,
+  /sqlstate/i,
 ];
+const sourcePathPattern = /node_modules\/|\/(?:src|app|usr|var|home)\/[^\s<]{4,}\.(?:ts|js|php|py|rb|go|java)/i;
+const stackFramePattern = /\bat\s+[A-Za-z0-9_$<>.]+\s+\((?:https?:\/\/|\/)[^)]+\)/i;
+const errorLabelPattern = /\b(?:error|exception|traceback)\b/i;
+const staticAssetPathPattern =
+  /\.(?:jpg|jpeg|png|gif|webp|avif|svg|ico|css|js|mjs|map|json|txt|xml|woff2?|ttf|eot|mp4|webm|mp3|wav|pdf)$/i;
+const thirdPartyAuthMethodPattern = /(?:signin|oauth|login|identifier|session)/i;
+
 const dangerousDomSinkPatterns: Array<[RegExp, string]> = [
   [/\.innerhtml\s*=/i, "innerHTML assignment"],
   [/\.outerhtml\s*=/i, "outerHTML assignment"],
@@ -196,6 +220,30 @@ const dangerousDomSinkPatterns: Array<[RegExp, string]> = [
   [/new\s+Function\s*\(/i, "new Function"],
   [/dangerouslysetinnerhtml/i, "dangerouslySetInnerHTML"],
 ];
+
+type SensitiveEndpointCandidate = {
+  url: string;
+  source:
+    | "internal-link"
+    | "form"
+    | "discovered-api"
+    | "synthetic-operational";
+};
+
+type SensitiveEndpointAttempt = ProbeMatch & {
+  sources: SensitiveEndpointCandidate["source"][];
+};
+
+const operationalSensitivePaths = [
+  "/api",
+  "/graphql",
+  "/debug",
+  "/status",
+  "/metrics",
+  "/export",
+  "/upload",
+];
+
 
 async function mapLimited<T, R>(
   items: T[],
@@ -257,6 +305,17 @@ function resolveHttpUrl(rawValue: string | null | undefined, baseUrl: string) {
   }
 }
 
+function isInternalHostMatch(hostname: string, targetHostname: string) {
+  const normalizedHost = hostname.toLowerCase();
+  const normalizedTarget = targetHostname.toLowerCase();
+
+  return (
+    normalizedHost === normalizedTarget ||
+    normalizedHost.endsWith(`.${normalizedTarget}`) ||
+    normalizedTarget.endsWith(`.${normalizedHost}`)
+  );
+}
+
 function extractDirectiveValue(headerValue: string | null | undefined, directiveName: string) {
   if (!headerValue) {
     return "";
@@ -298,7 +357,7 @@ function collectCookieHints(setCookies: string[]) {
     raw: cookie,
     infrastructure: isInfrastructureCookie(cookieName(cookie)),
     sensitive:
-      sensitiveCookieNamePattern.test(cookieName(cookie)) &&
+      isSensitiveCookie(cookieName(cookie)) &&
       !isInfrastructureCookie(cookieName(cookie)),
     ...parseCookieFlags(cookie),
   }));
@@ -378,40 +437,97 @@ function looksLikeSqlError(bodyText: string) {
 }
 
 function looksLikeVerboseError(bodyText: string) {
-  return stackTracePatterns.some((pattern) => pattern.test(bodyText));
+  if (strongVerboseErrorPatterns.some((pattern) => pattern.test(bodyText))) {
+    return true;
+  }
+
+  return errorLabelPattern.test(bodyText) && (sourcePathPattern.test(bodyText) || stackFramePattern.test(bodyText));
 }
 
-function collectSensitiveEndpointCandidates(primaryOrigin: string, primaryPageUrl: string, forms: PageFormSnapshot[]) {
-  const candidates = [
-    `${primaryOrigin}/login`,
-    `${primaryOrigin}/signin`,
-    `${primaryOrigin}/auth/login`,
-    `${primaryOrigin}/register`,
-    `${primaryOrigin}/signup`,
-    `${primaryOrigin}/reset-password`,
-    `${primaryOrigin}/forgot-password`,
-    `${primaryOrigin}/admin`,
-    `${primaryOrigin}/dashboard`,
-    `${primaryOrigin}/account`,
-    `${primaryOrigin}/api`,
-    `${primaryOrigin}/debug`,
-    `${primaryOrigin}/status`,
-    `${primaryOrigin}/metrics`,
-    `${primaryOrigin}/export`,
-    `${primaryOrigin}/graphql`,
-    `${primaryOrigin}/upload`,
-    primaryPageUrl,
+function extractComparableHtmlTitle(bodyText: string) {
+  const match = bodyText.match(/<title[^>]*>([^<]*)<\/title>/i);
+  return match?.[1]?.replace(/\s+/g, " ").trim().toLowerCase() ?? "";
+}
+
+function compactHtmlSignature(bodyText: string) {
+  return bodyText
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 1400)
+    .toLowerCase();
+}
+
+function looksLikePrimaryHtmlShell(primaryAttempt: HttpAttempt, attempt: ProbeMatch) {
+  if (!isHtmlLikeResponse(attempt.headers, attempt.bodyText) || attempt.status < 200 || attempt.status >= 300) {
+    return false;
+  }
+
+  const primaryTitle = extractComparableHtmlTitle(primaryAttempt.bodyText);
+  const attemptTitle = extractComparableHtmlTitle(attempt.bodyText);
+  if (!primaryTitle || !attemptTitle || primaryTitle !== attemptTitle) {
+    return false;
+  }
+
+  return compactHtmlSignature(primaryAttempt.bodyText) === compactHtmlSignature(attempt.bodyText);
+}
+
+function isStaticAssetUrl(url: string) {
+  try {
+    return staticAssetPathPattern.test(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+}
+
+function mergeSensitiveEndpointCandidates(candidates: SensitiveEndpointCandidate[]) {
+  const sourcesByUrl = new Map<string, Set<SensitiveEndpointCandidate["source"]>>();
+
+  candidates.forEach((candidate) => {
+    if (!candidate.url) {
+      return;
+    }
+
+    const current = sourcesByUrl.get(candidate.url) ?? new Set<SensitiveEndpointCandidate["source"]>();
+    current.add(candidate.source);
+    sourcesByUrl.set(candidate.url, current);
+  });
+
+  return [...sourcesByUrl.entries()].map(([url, sources]) => ({
+    url,
+    sources: [...sources],
+  }));
+}
+
+function collectSensitiveEndpointCandidates(
+  primaryOrigin: string,
+  links: Array<{ url: string; internal: boolean }>,
+  forms: PageFormSnapshot[],
+) {
+  return [
+    ...links
+      .filter((link) => link.internal && sensitivePathPattern.test(new URL(link.url).pathname))
+      .map((link) => ({
+        url: link.url,
+        source: "internal-link" as const,
+      })),
     ...forms
       .filter((form) => form.sensitiveKinds.length > 0)
-      .map((form) => form.url),
-  ];
-
-  return uniqueUrls(candidates).filter((url) => sensitivePathPattern.test(new URL(url).pathname)).slice(0, 12);
+      .map((form) => ({
+        url: form.url,
+        source: "form" as const,
+      })),
+    ...operationalSensitivePaths.map((path) => ({
+      url: `${primaryOrigin}${path}`,
+      source: "synthetic-operational" as const,
+    })),
+  ] satisfies SensitiveEndpointCandidate[];
 }
 
 function extractEndpointCandidatesFromContent(primaryOrigin: string, contents: string[]) {
   const matches = new Set<string>();
-  const pattern = /(["'`])((?:https?:\/\/[^"'`\s]+)?\/(?:api|graphql|rest|rpc|ajax|v\d+)[^"'`\s<]*)\1/gi;
+  const pattern = /(["'`])((?:https?:\/\/[^"'`\s]+)?\/(?:api(?:\/v\d+)?|graphql|rest(?:\/v\d+)?|rpc|ajax)[^"'`\s<]*)\1/gi;
 
   contents.forEach((content) => {
     let match: RegExpExecArray | null;
@@ -440,9 +556,14 @@ function detectSensitiveDataExposure(
       severity: "high",
     },
     {
-      pattern: /\b(?:api[_-]?key|secret|access[_-]?token|auth[_-]?token)\b[^"'`\n]{0,30}["'`:= ]+[A-Za-z0-9._-]{12,}/i,
+      pattern: /\b(?:secret|private[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token)\b[^"'`\n]{0,30}["'`:= ]+[A-Za-z0-9._-]{12,}/i,
       label: "Token-like configuration value",
       severity: "high",
+    },
+    {
+      pattern: /\bapi[_-]?key\b[^"'`\n]{0,30}["'`:= ]+[A-Za-z0-9._-]{12,}/i,
+      label: "Public API key-like configuration",
+      severity: "low",
     },
     {
       pattern: /https?:\/\/(?:localhost|127\.0\.0\.1|[^/"'\s]+(?:\.internal|\.local|\.lan|\.corp|\.staging|\.dev))[^"'\s<]*/i,
@@ -557,7 +678,7 @@ function extractSimpleForms(url: string, bodyText: string, targetHostname: strin
           actionExplicit,
           method,
           enctype: $(element).attr("enctype")?.trim() || "application/x-www-form-urlencoded",
-          internal: parsed.hostname === targetHostname,
+          internal: isInternalHostMatch(parsed.hostname, targetHostname),
           secure: parsed.protocol === "https:",
           hasPasswordField,
           hasFileUpload: fields.some((field) => field.type === "file"),
@@ -637,13 +758,18 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         ...primaryPage.inlineScripts.map((script) => script.content),
         ...firstPartyScriptSamples.map((sample) => sample.bodyText),
       ]);
-  const sensitiveEndpointCandidates = uniqueUrls([
-    ...collectSensitiveEndpointCandidates(primaryOrigin, primaryPage.url, pageForms),
-    ...discoveredApiEndpoints.filter((url) => sensitivePathPattern.test(new URL(url).pathname)),
+  const sensitiveEndpointCandidates = mergeSensitiveEndpointCandidates([
+    ...collectSensitiveEndpointCandidates(primaryOrigin, primaryPage.links, pageForms),
+    ...discoveredApiEndpoints
+      .filter((url) => sensitivePathPattern.test(new URL(url).pathname))
+      .map((url) => ({
+        url,
+        source: "discovered-api" as const,
+      })),
   ]).slice(0, 12);
   const sensitiveEndpointAttempts = (
-    await mapLimited(sensitiveEndpointCandidates, 4, async (url) => {
-      const attempt = await loadAttempt(url, {
+    await mapLimited(sensitiveEndpointCandidates, 4, async (candidate) => {
+      const attempt = await loadAttempt(candidate.url, {
         timeoutMs: 8_000,
         followRedirects: false,
       });
@@ -652,17 +778,25 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       }
 
       return {
-        url,
+        url: candidate.url,
         status: attempt.status,
         finalUrl: attempt.finalUrl,
         locationHeader: attempt.headers.location ?? "",
         headers: attempt.headers,
         bodyText: attempt.bodyText,
-      } satisfies ProbeMatch;
+        sources: candidate.sources,
+      } satisfies SensitiveEndpointAttempt;
     })
   ).filter(isPresent);
   const notableSensitiveEndpointAttempts = sensitiveEndpointAttempts.filter(
-    (attempt) => isReachableSensitiveEndpoint(attempt) || isProtectedSensitiveRedirect(attempt),
+    (attempt) =>
+      (isReachableSensitiveEndpoint(attempt) || isProtectedSensitiveRedirect(attempt)) &&
+      !(
+        attempt.sources.every((source) => source === "synthetic-operational") &&
+        attempt.status >= 200 &&
+        attempt.status < 300 &&
+        isHtmlLikeResponse(attempt.headers, attempt.bodyText)
+      ),
   );
   const authSurfaceAttempts = notableSensitiveEndpointAttempts.filter((attempt) =>
     /(login|signin|register|signup|password|reset|forgot|auth|account|accounts|session|identifier)/i.test(
@@ -1101,12 +1235,15 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           status: "warning" as const,
           severity: clickjackingSurfaceHighRisk ? "medium" as const : "low" as const,
         }
-      : { status: "fail" as const, severity: "high" as const };
+      : {
+          status: "warning" as const,
+          severity: clickjackingSurfaceHighRisk ? "medium" as const : "low" as const,
+        };
   findings.push(
     buildSecurityCheck({
       checkKey: "clickjacking-protection",
       title: "Clickjacking protection",
-      scoreWeight: clickjackingSurfaceHighRisk ? 1.4 : 1.1,
+      scoreWeight: clickjackingSurfaceHighRisk ? 0.95 : 0.7,
       ...clickjackingStatus,
       shortDescription:
         clickjackingStatus.status === "pass"
@@ -1161,6 +1298,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         acac: attempt.headers["access-control-allow-credentials"] ?? "",
         vary: attempt.headers.vary ?? "",
         status: attempt.status,
+        contentType: attempt.headers["content-type"] ?? "",
       };
     })
   ).filter(isPresent);
@@ -1171,9 +1309,15 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   );
   const broadCorsProbe = corsProbes.find(
     (probe) =>
-      probe.acao === "*" ||
-      probe.acao === corsProbeOrigin ||
-      (!!probe.acao && probe.acao !== new URL(probe.url).origin),
+      (probe.acao === "*" ||
+        probe.acao === corsProbeOrigin ||
+        (!!probe.acao && probe.acao !== new URL(probe.url).origin)) &&
+      !isStaticAssetUrl(probe.url) &&
+      !/text\/html/i.test(probe.contentType) &&
+      (apiPathPattern.test(new URL(probe.url).pathname) ||
+        /application\/(?:json|graphql-response\+json)|text\/plain|application\/xml|text\/xml/i.test(
+          probe.contentType,
+        )),
   );
   const corsStatus = dangerousCorsProbe
     ? { status: "fail" as const, severity: "high" as const }
@@ -1212,6 +1356,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           accessControlAllowOrigin: probe.acao || null,
           accessControlAllowCredentials: probe.acac || null,
           vary: probe.vary || null,
+          contentType: probe.contentType || null,
         })),
       },
     }),
@@ -1229,7 +1374,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const applicationCookies = cookies.filter((cookie) => !cookie.infrastructure);
   const cookieHints = collectCookieHints(primaryAttempt.setCookies);
   const missingSecure = applicationCookies.filter((cookie) => !cookie.secure);
-  const missingHttpOnly = applicationCookies.filter((cookie) => !cookie.httpOnly);
+  const missingHttpOnly = applicationCookies.filter((cookie) => !cookie.httpOnly && !isCsrfCookie(cookie.name));
   const missingSameSite = applicationCookies.filter((cookie) => !cookie.sameSite);
   const cookieChecks: Array<{
     checkKey: string;
@@ -1347,44 +1492,57 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       metaCsrfTokenPresent ||
       cookieHints.sensitiveCookies.some((cookie) => cookie.sameSite),
   );
+  const unprotectedSensitiveForms = sensitiveForms.filter((form) => !clearlyProtectedForms.includes(form));
+  const unprotectedAccountLikeForms = unprotectedSensitiveForms.filter(
+    (form) =>
+      form.sensitiveKinds.includes("account") ||
+      form.hasFileUpload,
+  );
+  const unprotectedAuthLikeForms = unprotectedSensitiveForms.filter(
+    (form) =>
+      form.hasPasswordField ||
+      form.sensitiveKinds.some((kind) => ["login", "password-reset"].includes(kind)) ||
+      thirdPartyAuthMethodPattern.test(form.url),
+  );
   const csrfStatus =
     sensitiveForms.length === 0
       ? { status: "info" as const, severity: "info" as const }
       : clearlyProtectedForms.length === sensitiveForms.length
         ? { status: "pass" as const, severity: "info" as const }
-        : clearlyProtectedForms.length > 0
-          ? { status: "warning" as const, severity: "medium" as const }
-          : { status: "fail" as const, severity: "high" as const };
+        : unprotectedAccountLikeForms.length > 0
+          ? { status: "fail" as const, severity: "high" as const }
+          : unprotectedAuthLikeForms.length > 0
+            ? { status: "warning" as const, severity: "medium" as const }
+            : { status: "warning" as const, severity: "low" as const };
   findings.push(
     buildSecurityCheck({
       checkKey: "csrf-protection-sensitive-forms",
       title: "CSRF protection on sensitive forms",
-      scoreWeight: 1.35,
+      scoreWeight: unprotectedAccountLikeForms.length > 0 ? 1.1 : 0.75,
       ...csrfStatus,
       shortDescription:
         sensitiveForms.length === 0
           ? "No sensitive forms were detected on the sampled pages."
           : clearlyProtectedForms.length === sensitiveForms.length
             ? "Each sampled sensitive form exposed a visible CSRF protection signal."
-            : `${sensitiveForms.length - clearlyProtectedForms.length} of ${sensitiveForms.length} sampled sensitive forms did not expose a clear CSRF protection signal.`,
+            : `${unprotectedSensitiveForms.length} of ${sensitiveForms.length} sampled sensitive forms did not expose a clear CSRF protection signal.`,
       whyItMatters:
         "Without CSRF protection, another site can sometimes trigger authenticated actions on behalf of a logged-in user.",
       recommendation:
         sensitiveForms.length === 0
           ? "No immediate change is required unless sensitive forms exist on unscanned routes."
-          : "Use per-request CSRF tokens or equivalent framework protections on sensitive forms, and pair them with SameSite cookies where appropriate.",
+          : "Use per-request CSRF tokens or equivalent framework protections on sensitive forms, and pair them with SameSite cookies where appropriate. For framework-managed login flows, verify the protection even if it is not visible in the HTML.",
       evidence: {
         checkedUrl: allKnownFormUrls.join(", "),
         expectedLocation: "Sensitive forms should expose CSRF token signals or equivalent framework protection",
         summary:
           csrfStatus.status === "pass"
             ? "Sampled sensitive forms exposed CSRF protection indicators."
-            : "Some sampled sensitive forms did not expose a clear CSRF protection indicator.",
+            : "Some sampled sensitive forms did not expose a clear CSRF protection indicator in the sampled HTML.",
         metaCsrfTokenPresent,
         sensitiveFormCount: sensitiveForms.length,
         protectedFormCount: clearlyProtectedForms.length,
-        locations: sensitiveForms
-          .filter((form) => !clearlyProtectedForms.includes(form))
+        locations: unprotectedSensitiveForms
           .slice(0, 8)
           .map((form, index) => ({
             ...form.location,
@@ -1781,21 +1939,28 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         parameter: config.parameter,
         status: attempt.status,
         location: attempt.headers.location ?? "",
+        resolvedLocation: resolveHttpUrl(attempt.headers.location, attempt.requestUrl),
         reflected: attempt.bodyText.includes(openRedirectProbeValue),
       };
     })
   ).filter(isPresent);
   const failingOpenRedirect = openRedirectResults.find((result) =>
-    result.location.startsWith(openRedirectProbeValue),
+    result.resolvedLocation?.startsWith(openRedirectProbeValue),
   );
-  const uncertainOpenRedirect = openRedirectResults.find(
-    (result) => result.reflected || (result.location && !result.location.startsWith("/") && !result.location.startsWith(primaryOrigin)),
+  const externalRedirectProbe = openRedirectResults.find(
+    (result) =>
+      result.resolvedLocation &&
+      !result.resolvedLocation.startsWith(primaryOrigin) &&
+      !result.resolvedLocation.startsWith(openRedirectProbeValue),
   );
+  const reflectedRedirectProbe = openRedirectResults.find((result) => result.reflected);
   const openRedirectStatus = failingOpenRedirect
     ? { status: "fail" as const, severity: "high" as const }
-    : uncertainOpenRedirect
+    : externalRedirectProbe
       ? { status: "warning" as const, severity: "medium" as const }
-      : { status: "pass" as const, severity: "info" as const };
+      : reflectedRedirectProbe
+        ? { status: "info" as const, severity: "info" as const }
+        : { status: "pass" as const, severity: "info" as const };
   findings.push(
     buildSecurityCheck({
       checkKey: "open-redirect-indicators",
@@ -1804,9 +1969,11 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       ...openRedirectStatus,
       shortDescription: failingOpenRedirect
         ? `A sampled redirect-style parameter on ${failingOpenRedirect.url} redirected to an external destination.`
-        : uncertainOpenRedirect
-          ? "A sampled redirect-style parameter influenced a response in a way that merits manual review."
-          : "Sampled redirect-style parameters did not produce an open redirect signal.",
+        : externalRedirectProbe
+          ? "A sampled redirect-style parameter influenced a redirect that leaves the scanned origin."
+          : reflectedRedirectProbe
+            ? "A sampled redirect-style parameter was reflected, but it did not produce an external redirect."
+            : "Sampled redirect-style parameters did not produce an open redirect signal.",
       whyItMatters:
         "Open redirects help attackers build more convincing phishing flows and can sometimes be chained into broader authentication and access-control abuse.",
       recommendation:
@@ -1819,7 +1986,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         summary:
           openRedirectStatus.status === "pass"
             ? "No sampled open redirect signal was detected."
-            : "At least one sampled redirect-style parameter influenced the response.",
+            : "At least one sampled redirect-style parameter influenced the response or redirect flow.",
         probeDestination: openRedirectProbeValue,
         results: openRedirectResults,
       },
@@ -1831,11 +1998,25 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     return (
       isReachableSensitiveEndpoint(attempt) &&
       (/(debug|metrics|status)/i.test(pathname) ||
-        (attempt.status >= 200 && attempt.status < 300 && /(admin|dashboard|export)/i.test(pathname)))
+        (attempt.status >= 200 &&
+          attempt.status < 300 &&
+          /(admin|dashboard|export)/i.test(pathname)) ||
+        (apiPathPattern.test(pathname) &&
+          attempt.status >= 200 &&
+          attempt.status < 300 &&
+          !isHtmlLikeResponse(attempt.headers, attempt.bodyText) &&
+          looksLikeStructuredApiPayload(attempt)))
     );
   });
   const visibleSensitiveEndpoint = notableSensitiveEndpointAttempts.find(
-    (attempt) => isReachableSensitiveEndpoint(attempt) && attempt.status >= 200 && attempt.status < 300,
+    (attempt) =>
+      isReachableSensitiveEndpoint(attempt) &&
+      attempt.status >= 200 &&
+      attempt.status < 300 &&
+      !/(login|signin|register|signup|password|reset|forgot|auth|account|accounts|session|identifier)/i.test(
+        new URL(attempt.url).pathname,
+      ) &&
+      !looksLikePrimaryHtmlShell(primaryAttempt, attempt),
   );
   const protectedSensitiveEndpoint = notableSensitiveEndpointAttempts.find(
     (attempt) => [401, 403, 405].includes(attempt.status) || isProtectedSensitiveRedirect(attempt),
@@ -1854,7 +2035,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     buildSecurityCheck({
       checkKey: "sensitive-endpoint-discovery",
       title: "Sensitive endpoint discovery",
-      scoreWeight: 1.2,
+      scoreWeight: exposedSensitiveEndpoint ? 1.0 : 0.65,
       ...sensitiveEndpointStatus,
       shortDescription:
         notableSensitiveEndpointAttempts.length === 0
@@ -1862,7 +2043,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           : exposedSensitiveEndpoint
             ? "A sampled high-risk endpoint returned a direct response and should be reviewed immediately."
             : visibleSensitiveEndpoint
-              ? `${notableSensitiveEndpointAttempts.length} sampled sensitive endpoint candidates returned a reachable response worth reviewing.`
+              ? `${notableSensitiveEndpointAttempts.length} sampled non-auth sensitive endpoint candidates returned a reachable response worth reviewing.`
               : "Sensitive endpoint candidates were found, but the sampled behavior looked protected rather than openly exposed.",
       whyItMatters:
         "Admin panels, debug routes, exports, internal APIs, and account flows increase attack surface when they are publicly exposed or leak too much information.",
@@ -1871,7 +2052,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           ? "Keep sensitive routes protected and hard to enumerate."
           : "Review sampled sensitive endpoints to ensure they require the intended authentication and do not expose unnecessary operational details.",
       evidence: {
-        checkedUrl: sensitiveEndpointCandidates.join(", "),
+        checkedUrl: sensitiveEndpointCandidates.map((candidate) => candidate.url).join(", "),
         expectedLocation: "Common auth, admin, API, debug, export, and status routes",
         summary:
           notableSensitiveEndpointAttempts.length === 0
@@ -1894,16 +2075,18 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const authReviewStatus =
     authForms.length === 0 && authSurfaceAttempts.length === 0
       ? { status: "info" as const, severity: "info" as const }
-      : authForms.some((form) => !form.secure) || clickjackingStatus.status === "fail"
-        ? { status: "fail" as const, severity: "critical" as const }
+      : authForms.some((form) => !form.secure)
+        ? { status: "fail" as const, severity: "high" as const }
         : cookieHints.sensitiveMissingSecure.length > 0 || cookieHints.sensitiveMissingHttpOnly.length > 0
-          ? { status: "warning" as const, severity: "high" as const }
+          ? { status: "warning" as const, severity: "medium" as const }
+          : clickjackingStatus.status !== "pass" || unprotectedAuthLikeForms.length > 0
+            ? { status: "warning" as const, severity: "medium" as const }
           : { status: "pass" as const, severity: "info" as const };
   findings.push(
     buildSecurityCheck({
       checkKey: "authentication-surface-review",
       title: "Authentication surface review",
-      scoreWeight: 1.5,
+      scoreWeight: authReviewStatus.status === "fail" ? 1.0 : 0.75,
       ...authReviewStatus,
       shortDescription:
         authForms.length === 0 && authSurfaceAttempts.length === 0
@@ -1935,21 +2118,23 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const passwordFieldStatus =
     passwordForms.length === 0
       ? { status: "info" as const, severity: "info" as const }
-      : passwordForms.some((form) => !form.secure) || clickjackingStatus.status === "fail"
-        ? { status: "fail" as const, severity: "critical" as const }
+      : passwordForms.some((form) => !form.secure)
+        ? { status: "fail" as const, severity: "high" as const }
+        : clickjackingStatus.status !== "pass"
+          ? { status: "warning" as const, severity: "medium" as const }
         : passwordForms.some(
               (form) =>
                 !form.autocompleteHints.some((hint) =>
                   /current-password|new-password|one-time-code/i.test(hint),
                 ),
             )
-          ? { status: "warning" as const, severity: "medium" as const }
+          ? { status: "warning" as const, severity: "low" as const }
           : { status: "pass" as const, severity: "info" as const };
   findings.push(
     buildSecurityCheck({
       checkKey: "password-field-security",
       title: "Password field security",
-      scoreWeight: 1.55,
+      scoreWeight: passwordFieldStatus.status === "fail" ? 1.0 : 0.7,
       ...passwordFieldStatus,
       shortDescription:
         passwordForms.length === 0
@@ -2120,7 +2305,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         protected:
           isLikelyEdgeInterstitial(baseProbe) ||
           [401, 403].includes(baseProbe.status) ||
-          (baseProbe.status === 405 && !isHtmlLikeResponse(baseProbe.headers, baseProbe.bodyText)),
+          baseProbe.status === 405,
       };
     }
   }
@@ -2205,14 +2390,12 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       ? { status: "info" as const, severity: "info" as const }
       : rateLimitSignals.length > 0
         ? { status: "pass" as const, severity: "info" as const }
-        : rateLimitProbeScope === "sensitive"
-          ? { status: "warning" as const, severity: "medium" as const }
-          : { status: "info" as const, severity: "info" as const };
+        : { status: "info" as const, severity: "info" as const };
   findings.push(
     buildSecurityCheck({
       checkKey: "rate-limiting-indicators",
       title: "Rate limiting indicators",
-      scoreWeight: 1.15,
+      scoreWeight: 0.4,
       ...rateLimitStatus,
       shortDescription:
         !rateLimitTarget
@@ -2237,7 +2420,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           : rateLimitSignals.length > 0
             ? "A sampled endpoint exposed rate-limit signals."
             : rateLimitProbeScope === "sensitive"
-              ? "No sampled rate-limit signal was detected."
+              ? "No visible rate-limit signal was detected during the cautious probe."
               : "No high-risk endpoint was available for a meaningful rate-limit assessment.",
         probeScope: rateLimitProbeScope,
         signals: rateLimitSignals,
@@ -2254,7 +2437,11 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     followRedirects: false,
   });
   const verboseErrorAttempt = [missingRouteAttempt, invalidInputAttempt].find(
-    (attempt) => attempt && (looksLikeVerboseError(attempt.bodyText) || looksLikeSqlError(attempt.bodyText)),
+    (attempt) =>
+      attempt &&
+      (looksLikeSqlError(attempt.bodyText) ||
+        strongVerboseErrorPatterns.some((pattern) => pattern.test(attempt.bodyText)) ||
+        (attempt.status >= 500 && looksLikeVerboseError(attempt.bodyText))),
   );
   const errorHandlingStatus = verboseErrorAttempt
     ? { status: "fail" as const, severity: "high" as const }

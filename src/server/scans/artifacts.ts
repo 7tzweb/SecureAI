@@ -219,7 +219,14 @@ function safeAbsoluteUrl(rawValue: string | undefined, baseUrl: string) {
 }
 
 function isInternalHostname(hostname: string, targetHostname: string) {
-  return hostname === targetHostname;
+  const normalizedHost = hostname.toLowerCase();
+  const normalizedTarget = targetHostname.toLowerCase();
+
+  return (
+    normalizedHost === normalizedTarget ||
+    normalizedHost.endsWith(`.${normalizedTarget}`) ||
+    normalizedTarget.endsWith(`.${normalizedHost}`)
+  );
 }
 
 function looksLikeHtmlPage(url: string) {
@@ -815,7 +822,11 @@ function detectTechnologies(context: PageContext, primaryPage: PageSnapshot | nu
   if (/react/i.test(html) && /data-reactroot|__next/i.test(html)) {
     hints.add("React");
   }
-  if (/shopify/i.test(html)) {
+  if (
+    /cdn\.shopify\.com|myshopify\.com|shopify-payment-button|shopify-section|shopify-analytics|Shopify\.(?:theme|routes|locale|Analytics)/i.test(
+      html,
+    )
+  ) {
     hints.add("Shopify");
   }
 

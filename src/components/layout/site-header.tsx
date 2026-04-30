@@ -2,12 +2,13 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Clock3, ExternalLink, Loader2, UserCircle2 } from "lucide-react";
 import { PaypalCreditsDialog } from "@/components/billing/paypal-credits-dialog";
 import { StartAuditForm } from "@/components/landing/start-audit-form";
 import { useAuth } from "@/components/providers/auth-provider";
 import { Button } from "@/components/ui/button";
+import { dispatchQuotaRefresh, subscribeQuotaRefresh } from "@/lib/quota-events";
 import { type ScanQuotaSummary } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -57,35 +58,39 @@ export function SiteHeader() {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const isWorkspacePage = pathname.startsWith("/scans") || pathname.startsWith("/history");
 
-  useEffect(() => {
-    let cancelled = false;
-
-    const loadQuota = async () => {
+  const refreshQuota = useCallback(async () => {
+    const nextQuota = await (async () => {
       if (status !== "signed-in" || !user) {
-        if (!cancelled) {
-          setQuota(null);
-        }
-        return;
+        return null;
       }
 
       try {
         await ensureServerSession();
         const payload = await fetchJson<{ quota: ScanQuotaSummary }>("/api/me/usage");
-        if (!cancelled) {
-          setQuota(payload.quota);
-        }
+        return payload.quota;
       } catch {
-        if (!cancelled) {
-          setQuota(null);
-        }
+        return null;
       }
-    };
+    })();
 
-    void loadQuota();
-    return () => {
-      cancelled = true;
-    };
+    setQuota(nextQuota);
   }, [ensureServerSession, status, user]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void refreshQuota();
+    }, 0);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [pathname, refreshQuota]);
+
+  useEffect(() => {
+    return subscribeQuotaRefresh(() => {
+      void refreshQuota();
+    });
+  }, [refreshQuota]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -221,7 +226,7 @@ export function SiteHeader() {
                   : "border-transparent text-slate-500 hover:text-slate-900",
               )}
             >
-              History
+              Scans
             </Link>
           </nav>
         </div>
@@ -261,13 +266,13 @@ export function SiteHeader() {
                         onClick={() => router.push("/history")}
                         className="rounded-full border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-50"
                       >
-                        History
+                        Scans
                       </button>
                     </div>
 
                     <div className="mt-4 rounded-[1.25rem] bg-slate-50 p-4">
                       <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-slate-400">
-                        Scan quota
+                        Scan credits
                       </p>
                       <p className="mt-2 text-sm text-slate-900">
                         {quota?.hasUnlimitedPlan
@@ -279,7 +284,7 @@ export function SiteHeader() {
                       <p className="mt-1 text-xs text-slate-500">
                         {quota?.hasUnlimitedPlan
                           ? "Your account can keep launching scans without the standard cap."
-                          : `3 free scans are included. Add ${quota?.upgradeScanCredits ?? 30} more for $${(quota?.upgradePriceUsd ?? 4.9).toFixed(2)}.`}
+                          : `3 free scans are included. Add ${quota?.upgradeScanCredits ?? 20} more credits for $${(quota?.upgradePriceUsd ?? 10).toFixed(2)}.`}
                       </p>
                     </div>
 
@@ -298,7 +303,7 @@ export function SiteHeader() {
                           </>
                         ) : (
                           <>
-                            Buy {quota?.upgradeScanCredits ?? 30} scans for ${(quota?.upgradePriceUsd ?? 4.9).toFixed(2)}
+                            Buy {quota?.upgradeScanCredits ?? 20} credits for ${(quota?.upgradePriceUsd ?? 10).toFixed(2)}
                             <ExternalLink className="ml-2 h-4 w-4" />
                           </>
                         )}
@@ -330,12 +335,12 @@ export function SiteHeader() {
               <div className="hidden rounded-full border border-white/70 bg-white/70 px-3 py-2 text-xs font-semibold text-slate-700 shadow-sm sm:block">
                 {quota
                   ? quota.hasUnlimitedPlan
-                    ? "Credits: unlimited"
-                    : `Credits: ${quota.remainingScans}`
-                  : "Credits: ..."}
+                    ? "Scans: unlimited"
+                    : `Scans: ${quota.remainingScans}`
+                  : "Scans: ..."}
               </div>
               <Button variant="outline" size="sm" onClick={() => void signOut()}>
-                Sign out
+                Log out
               </Button>
             </>
           ) : (
@@ -374,7 +379,8 @@ export function SiteHeader() {
         onApproved={(nextQuota) => {
           setQuota(nextQuota);
           setPaypalOpen(false);
-          setBanner("30 scans were added to your account.");
+          dispatchQuotaRefresh();
+          setBanner("Credits were added to your account.");
         }}
       />
     </header>

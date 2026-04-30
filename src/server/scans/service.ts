@@ -14,8 +14,8 @@ import { getRepository } from "@/server/repository";
 import { validateTarget } from "@/server/scans/helpers";
 
 export const FREE_SCAN_LIMIT = 3;
-export const SCAN_CREDIT_PACK_SIZE = 30;
-export const SCAN_CREDIT_PACK_PRICE_USD = 4.9;
+export const SCAN_CREDIT_PACK_SIZE = 20;
+export const SCAN_CREDIT_PACK_PRICE_USD = 10;
 const PRIVILEGED_SCAN_EMAIL = "7tzweb@gmail.com";
 const PRIVILEGED_SCAN_LIMIT = 999_999;
 
@@ -115,7 +115,7 @@ async function assertCanCreateScan(userId: string) {
   const quota = await getScanQuotaSummary(userId);
   if (!quota.canCreateScans) {
     throw paymentRequired(
-      `You reached your ${quota.freeLimit} free scans. Buy ${quota.upgradeScanCredits} more scans for $${quota.upgradePriceUsd.toFixed(2)} to continue.`,
+      `You reached your ${quota.freeLimit} free scans. Buy ${quota.upgradeScanCredits} more scan credits for $${quota.upgradePriceUsd.toFixed(2)} to continue.`,
       "SCAN_QUOTA_EXCEEDED",
       quota,
     );
@@ -245,14 +245,12 @@ export async function listScansForUser(userId: string) {
 }
 
 export async function listRecentScansForSidebar(sessionUserId: string | null, limit = 8) {
-  const scans = await getRepository().listRecentScans(limit * 3);
-  return scans
-    .filter(
-      (scan) =>
-        scan.visibility === "link" ||
-        (sessionUserId !== null && scan.createdByUserId === sessionUserId),
-    )
-    .slice(0, limit);
+  if (!sessionUserId) {
+    return [];
+  }
+
+  const scans = await getRepository().listUserScans(sessionUserId);
+  return scans.slice(0, limit);
 }
 
 export async function unlockPremiumForScan(scanId: string, userId: string) {

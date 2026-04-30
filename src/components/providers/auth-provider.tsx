@@ -144,10 +144,10 @@ export function HeaderAuthControls() {
         <p className="text-sm font-semibold text-[var(--ink)]">
           {user.displayName ?? user.email ?? "Signed in"}
         </p>
-        <p className="text-xs text-[var(--ink-soft)]">History and fix access enabled</p>
+        <p className="text-xs text-[var(--ink-soft)]">Scans and fix access enabled</p>
       </div>
       <Button variant="outline" size="sm" onClick={() => void signOut()}>
-        Sign out
+        Log out
       </Button>
     </div>
   );

@@ -33,6 +33,7 @@ export function HistoryClient() {
       if (!cancelled) {
         setLoading(true);
         setError(null);
+        setScans([]);
       }
 
       try {
@@ -84,7 +85,7 @@ export function HistoryClient() {
             </button>
             <div className="flex items-center gap-3 rounded-full bg-blue-600 px-4 py-3 text-white shadow-[0_4px_12px_rgba(0,122,255,0.3)]">
               <History className="h-4 w-4" />
-              <span className="text-sm font-semibold">History</span>
+              <span className="text-sm font-semibold">Scans</span>
             </div>
           </div>
           <button
@@ -102,7 +103,7 @@ export function HistoryClient() {
               Saved activity
             </p>
             <h1 className="mt-3 text-4xl font-semibold tracking-[-0.03em] text-slate-900">
-              Scan history
+              Scans
             </h1>
             <p className="mt-3 max-w-[720px] text-sm leading-7 text-slate-500">
               Reopen previous scans, compare scores, and keep Google-linked reports attached to the account that claimed them.

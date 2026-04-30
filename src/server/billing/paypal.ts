@@ -8,7 +8,16 @@ import {
   SCAN_CREDIT_PACK_SIZE,
 } from "@/server/scans/service";
 
-export const SCAN_CREDIT_PACK_PRODUCT_KEY = "scan-credit-pack-30";
+export const SCAN_CREDIT_PACK_PRODUCT_KEY = "scan-credit-purchase";
+const PAYPAL_SANDBOX_TEST_EMAIL = "xsever77@gmail.com";
+const SCAN_CREDIT_UNIT_PRICE_USD = SCAN_CREDIT_PACK_PRICE_USD / SCAN_CREDIT_PACK_SIZE;
+
+type PayPalEnvironment = "live" | "sandbox";
+type PayPalProfile = {
+  clientId: string;
+  clientSecret: string;
+  env: PayPalEnvironment;
+};
 
 type PayPalOrderResponse = {
   id?: string;
@@ -32,10 +41,19 @@ type PayPalOrderResponse = {
   }>;
 };
 
-function getPayPalApiBaseUrl() {
-  return serverConfig.paypalEnv === "live"
-    ? "https://api-m.paypal.com"
-    : "https://api-m.sandbox.paypal.com";
+type PayPalErrorResponse = {
+  error?: string;
+  error_description?: string;
+  message?: string;
+  name?: string;
+  details?: Array<{
+    description?: string;
+    issue?: string;
+  }>;
+};
+
+function getPayPalApiBaseUrl(env: PayPalEnvironment) {
+  return env === "live" ? "https://api-m.paypal.com" : "https://api-m.sandbox.paypal.com";
 }
 
 function assertPayPalConfigured() {
@@ -44,10 +62,120 @@ function assertPayPalConfigured() {
   }
 }
 
-async function paypalFetch<T>(path: string, init: RequestInit = {}) {
+function isSandboxTestUser(email: string | null | undefined) {
+  return email?.trim().toLowerCase() === PAYPAL_SANDBOX_TEST_EMAIL;
+}
+
+function getDefaultPayPalProfile(): PayPalProfile {
   assertPayPalConfigured();
 
-  const response = await fetch(`${getPayPalApiBaseUrl()}${path}`, {
+  if (serverConfig.paypalEnv === "live") {
+    return getLivePayPalProfile();
+  }
+
+  return getSandboxPayPalProfile();
+}
+
+function getLivePayPalProfile(): PayPalProfile {
+  assertPayPalConfigured();
+
+  if (!serverConfig.paypalLiveClientId || !serverConfig.paypalLiveClientSecret) {
+    throw serviceUnavailable("PayPal live checkout is not configured.");
+  }
+
+  return {
+    clientId: serverConfig.paypalLiveClientId,
+    clientSecret: serverConfig.paypalLiveClientSecret,
+    env: "live",
+  };
+}
+
+function getSandboxPayPalProfile(): PayPalProfile {
+  assertPayPalConfigured();
+
+  if (!serverConfig.paypalSandboxClientId || !serverConfig.paypalSandboxClientSecret) {
+    throw serviceUnavailable("PayPal sandbox checkout is not configured.");
+  }
+
+  return {
+    clientId: serverConfig.paypalSandboxClientId,
+    clientSecret: serverConfig.paypalSandboxClientSecret,
+    env: "sandbox",
+  };
+}
+
+function getPayPalProfile(userEmail: string | null | undefined): PayPalProfile {
+  if (isSandboxTestUser(userEmail)) {
+    return getSandboxPayPalProfile();
+  }
+
+  if (serverConfig.paypalLiveClientId && serverConfig.paypalLiveClientSecret) {
+    return getLivePayPalProfile();
+  }
+
+  return getDefaultPayPalProfile();
+}
+
+export function getPayPalCheckoutConfig(userEmail: string | null | undefined) {
+  const profile = getPayPalProfile(userEmail);
+  return {
+    clientId: profile.clientId,
+    mode: profile.env,
+  };
+}
+
+function normalizeCreditsPurchase(credits: number) {
+  if (!Number.isFinite(credits) || !Number.isInteger(credits)) {
+    throw badRequest("Credits must be a whole number.", "PAYPAL_CREDITS_INVALID");
+  }
+
+  if (credits < SCAN_CREDIT_PACK_SIZE) {
+    throw badRequest(
+      `Credits must start at ${SCAN_CREDIT_PACK_SIZE}.`,
+      "PAYPAL_CREDITS_BELOW_MINIMUM",
+    );
+  }
+
+  if (credits > 10_000) {
+    throw badRequest("Credits request is too large.", "PAYPAL_CREDITS_TOO_LARGE");
+  }
+
+  return credits;
+}
+
+function calculateCreditsAmountUsd(credits: number) {
+  return Number((credits * SCAN_CREDIT_UNIT_PRICE_USD).toFixed(2));
+}
+
+function inferCreditsFromAmount(value: string | undefined) {
+  const amountUsd = Number(value);
+  if (!Number.isFinite(amountUsd)) {
+    return null;
+  }
+
+  const credits = amountUsd / SCAN_CREDIT_UNIT_PRICE_USD;
+  if (!Number.isInteger(credits) || credits < SCAN_CREDIT_PACK_SIZE) {
+    return null;
+  }
+
+  return credits;
+}
+
+function resolvePayPalErrorMessage(payload: PayPalErrorResponse | null) {
+  const detail = payload?.details?.[0];
+  return (
+    payload?.message ??
+    payload?.error_description ??
+    detail?.description ??
+    detail?.issue ??
+    payload?.error ??
+    payload?.name ??
+    "PayPal request failed."
+  );
+}
+
+async function paypalFetch<T>(profile: PayPalProfile, path: string, init: RequestInit = {}) {
+  const response = await fetch(`${getPayPalApiBaseUrl(profile.env)}${path}`, {
     cache: "no-store",
     ...init,
     headers: {
@@ -56,12 +184,10 @@ async function paypalFetch<T>(path: string, init: RequestInit = {}) {
     },
   });
 
-  const payload = (await response.json().catch(() => null)) as T | { message?: string } | null;
+  const payload = (await response.json().catch(() => null)) as T | PayPalErrorResponse | null;
   if (!response.ok) {
     throw badRequest(
-      payload && typeof payload === "object" && "message" in payload && payload.message
-        ? payload.message
-        : "PayPal request failed.",
+      resolvePayPalErrorMessage(payload as PayPalErrorResponse | null),
       "PAYPAL_REQUEST_FAILED",
       payload,
     );
@@ -70,14 +196,10 @@ async function paypalFetch<T>(path: string, init: RequestInit = {}) {
   return payload as T;
 }
 
-async function getPayPalAccessToken() {
-  assertPayPalConfigured();
+async function getPayPalAccessToken(profile: PayPalProfile) {
+  const credentials = Buffer.from(`${profile.clientId}:${profile.clientSecret}`).toString("base64");
 
-  const credentials = Buffer.from(
-    `${serverConfig.paypalClientId}:${serverConfig.paypalClientSecret}`,
-  ).toString("base64");
-
-  const payload = await paypalFetch<{ access_token?: string }>("/v1/oauth2/token", {
+  const payload = await paypalFetch<{ access_token?: string }>(profile, "/v1/oauth2/token", {
     method: "POST",
     headers: {
       Authorization: `Basic ${credentials}`,
@@ -93,11 +215,18 @@ async function getPayPalAccessToken() {
   return payload.access_token;
 }
 
-export async function createPayPalScanCreditOrder(userId: string) {
-  const accessToken = await getPayPalAccessToken();
-  const price = SCAN_CREDIT_PACK_PRICE_USD.toFixed(2);
+export async function createPayPalScanCreditOrder(
+  userId: string,
+  credits: number,
+  userEmail: string | null | undefined,
+) {
+  const requestedCredits = normalizeCreditsPurchase(credits);
+  const profile = getPayPalProfile(userEmail);
+  const accessToken = await getPayPalAccessToken(profile);
+  const amountUsd = calculateCreditsAmountUsd(requestedCredits);
+  const price = amountUsd.toFixed(2);
 
-  const order = await paypalFetch<PayPalOrderResponse>("/v2/checkout/orders", {
+  const order = await paypalFetch<PayPalOrderResponse>(profile, "/v2/checkout/orders", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -109,7 +238,7 @@ export async function createPayPalScanCreditOrder(userId: string) {
       purchase_units: [
         {
           custom_id: userId,
-          description: `${SCAN_CREDIT_PACK_SIZE} CyberAudit scan credits`,
+          description: `${requestedCredits} CyberAudit scan credits`,
           amount: {
             currency_code: "USD",
             value: price,
@@ -122,11 +251,11 @@ export async function createPayPalScanCreditOrder(userId: string) {
           },
           items: [
             {
-              name: `${SCAN_CREDIT_PACK_SIZE} CyberAudit scans`,
-              quantity: "1",
+              name: "CyberAudit scan credit",
+              quantity: String(requestedCredits),
               unit_amount: {
                 currency_code: "USD",
-                value: price,
+                value: SCAN_CREDIT_UNIT_PRICE_USD.toFixed(2),
               },
             },
           ],
@@ -149,8 +278,8 @@ export async function createPayPalScanCreditOrder(userId: string) {
     productKey: SCAN_CREDIT_PACK_PRODUCT_KEY,
     paymentProvider: "paypal",
     paypalOrderId: order.id,
-    creditsPurchased: SCAN_CREDIT_PACK_SIZE,
-    amountUsd: SCAN_CREDIT_PACK_PRICE_USD,
+    creditsPurchased: requestedCredits,
+    amountUsd,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   });
@@ -158,7 +287,11 @@ export async function createPayPalScanCreditOrder(userId: string) {
   return order.id;
 }
 
-export async function capturePayPalScanCreditOrder(orderId: string, userId: string) {
+export async function capturePayPalScanCreditOrder(
+  orderId: string,
+  userId: string,
+  userEmail: string | null | undefined,
+) {
   const repository = getRepository();
   const existingPayment = await repository.getPaymentByCheckoutSessionId(orderId);
 
@@ -170,8 +303,10 @@ export async function capturePayPalScanCreditOrder(orderId: string, userId: stri
     return getScanQuotaSummary(userId);
   }
 
-  const accessToken = await getPayPalAccessToken();
+  const profile = getPayPalProfile(userEmail);
+  const accessToken = await getPayPalAccessToken(profile);
   const order = await paypalFetch<PayPalOrderResponse>(
+    profile,
     `/v2/checkout/orders/${encodeURIComponent(orderId)}/capture`,
     {
       method: "POST",
@@ -186,6 +321,9 @@ export async function capturePayPalScanCreditOrder(orderId: string, userId: stri
   const purchaseUnit = order.purchase_units?.[0];
   const capture = purchaseUnit?.payments?.captures?.[0];
   const amount = capture?.amount ?? purchaseUnit?.amount;
+  const expectedCredits = existingPayment?.creditsPurchased ?? inferCreditsFromAmount(amount?.value);
+  const expectedAmountUsd = existingPayment?.amountUsd ?? calculateCreditsAmountUsd(expectedCredits ?? 0);
+  const capturedAmountUsd = Number(amount?.value);
 
   if (order.status !== "COMPLETED" || capture?.status !== "COMPLETED") {
     throw badRequest("PayPal payment was not completed.", "PAYPAL_PAYMENT_INCOMPLETE", order);
@@ -195,9 +333,14 @@ export async function capturePayPalScanCreditOrder(orderId: string, userId: stri
     throw badRequest("This PayPal order belongs to another account.", "PAYPAL_ACCOUNT_MISMATCH");
   }
 
+  if (!expectedCredits) {
+    throw badRequest("PayPal payment credits are invalid.", "PAYPAL_CREDITS_INVALID", order);
+  }
+
   if (
     amount?.currency_code !== "USD" ||
-    Number(amount.value) < SCAN_CREDIT_PACK_PRICE_USD
+    !Number.isFinite(capturedAmountUsd) ||
+    Math.abs(capturedAmountUsd - expectedAmountUsd) > 0.001
   ) {
     throw badRequest("PayPal payment amount is invalid.", "PAYPAL_AMOUNT_MISMATCH", order);
   }
@@ -216,11 +359,11 @@ export async function capturePayPalScanCreditOrder(orderId: string, userId: stri
     productKey: SCAN_CREDIT_PACK_PRODUCT_KEY,
     paymentProvider: "paypal",
     paypalOrderId: orderId,
-    creditsPurchased: SCAN_CREDIT_PACK_SIZE,
-    amountUsd: SCAN_CREDIT_PACK_PRICE_USD,
+    creditsPurchased: expectedCredits,
+    amountUsd: expectedAmountUsd,
     updatedAt: now,
   });
 
-  await repository.addUserScanCredits(userId, SCAN_CREDIT_PACK_SIZE);
+  await repository.addUserScanCredits(userId, expectedCredits);
   return getScanQuotaSummary(userId);
 }

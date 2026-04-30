@@ -12,7 +12,7 @@ export async function POST(request: NextRequest) {
     const user = await requireSessionUser(request);
     assertRateLimit("checkout", user.uid);
     const parsed = paypalCaptureSchema.parse(await request.json());
-    const quota = await capturePayPalScanCreditOrder(parsed.orderId, user.uid);
+    const quota = await capturePayPalScanCreditOrder(parsed.orderId, user.uid, user.email);
     return NextResponse.json({ ok: true, quota });
   } catch (error) {
     return handleRouteError(error);

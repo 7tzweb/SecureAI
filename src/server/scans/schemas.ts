@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { categoryKeys } from "@/lib/types";
+import { SCAN_CREDIT_PACK_SIZE } from "@/server/scans/service";
 
 export const createScanSchema = z.object({
   target: z.string().trim().min(1).max(255),
@@ -25,6 +26,10 @@ export const checkoutConfirmSchema = z.object({
 
 export const paypalCaptureSchema = z.object({
   orderId: z.string().trim().min(8).max(255),
+});
+
+export const paypalOrderSchema = z.object({
+  credits: z.coerce.number().int().min(SCAN_CREDIT_PACK_SIZE).max(10_000),
 });
 
 export const sessionSchema = z.object({

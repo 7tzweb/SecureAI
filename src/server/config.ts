@@ -13,6 +13,18 @@ const firebasePrivateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n
 const firebaseServiceAccountResolvedPath = firebaseServiceAccountPath
   ? resolve(/* turbopackIgnore: true */ process.cwd(), firebaseServiceAccountPath)
   : "";
+const paypalEnv = process.env.PAYPAL_ENV === "live" ? "live" : "sandbox";
+const paypalLegacyClientId =
+  process.env.PAYPAL_CLIENT_ID ?? process.env.NEXT_PUBLIC_PAYPAL_CLIENT_ID ?? "";
+const paypalLegacyClientSecret = process.env.PAYPAL_CLIENT_SECRET ?? "";
+const paypalLiveClientId = process.env.PAYPAL_LIVE_CLIENT_ID ?? paypalLegacyClientId;
+const paypalLiveClientSecret =
+  process.env.PAYPAL_LIVE_CLIENT_SECRET ?? paypalLegacyClientSecret;
+const paypalSandboxClientId =
+  process.env.PAYPAL_SANDBOX_CLIENT_ID ?? (paypalEnv === "sandbox" ? paypalLegacyClientId : "");
+const paypalSandboxClientSecret =
+  process.env.PAYPAL_SANDBOX_CLIENT_SECRET ??
+  (paypalEnv === "sandbox" ? paypalLegacyClientSecret : "");
 
 export const serverConfig = {
   appUrl: process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000",
@@ -26,9 +38,13 @@ export const serverConfig = {
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? "",
   stripePriceIdPremium: process.env.STRIPE_PRICE_ID_PREMIUM ?? "",
   stripeScanPlanPriceUsd: Number(process.env.STRIPE_SCAN_PLAN_PRICE_USD ?? "9"),
-  paypalClientId: process.env.PAYPAL_CLIENT_ID ?? process.env.NEXT_PUBLIC_PAYPAL_CLIENT_ID ?? "",
-  paypalClientSecret: process.env.PAYPAL_CLIENT_SECRET ?? "",
-  paypalEnv: process.env.PAYPAL_ENV === "live" ? "live" : "sandbox",
+  paypalClientId: paypalLegacyClientId,
+  paypalClientSecret: paypalLegacyClientSecret,
+  paypalEnv,
+  paypalLiveClientId,
+  paypalLiveClientSecret,
+  paypalSandboxClientId,
+  paypalSandboxClientSecret,
   googleOAuthClientId: process.env.GOOGLE_OAUTH_CLIENT_ID ?? "",
   googleOAuthClientSecret: process.env.GOOGLE_OAUTH_CLIENT_SECRET ?? "",
   sessionSecret:
@@ -60,5 +76,6 @@ export const hasStripeWebhookConfig = Boolean(
   serverConfig.stripeSecretKey && serverConfig.stripeWebhookSecret,
 );
 export const hasPayPalConfig = Boolean(
-  serverConfig.paypalClientId && serverConfig.paypalClientSecret,
+  (serverConfig.paypalLiveClientId && serverConfig.paypalLiveClientSecret) ||
+    (serverConfig.paypalSandboxClientId && serverConfig.paypalSandboxClientSecret),
 );

@@ -7,6 +7,7 @@ import { Clock3, Download, FileText, History, Shield, Wrench, X } from "lucide-r
 import { PaypalCreditsDialog } from "@/components/billing/paypal-credits-dialog";
 import { FindingCard } from "@/components/results/finding-card";
 import { useAuth } from "@/components/providers/auth-provider";
+import { dispatchQuotaRefresh } from "@/lib/quota-events";
 import {
   categoryKeys,
   type CategoryKey,
@@ -706,6 +707,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
   const [reportOpen, setReportOpen] = useState(false);
   const [quota, setQuota] = useState<ScanQuotaSummary | null>(null);
   const [paypalOpen, setPaypalOpen] = useState(false);
+  const [displayProgress, setDisplayProgress] = useState(0);
 
   const requestedTab = (searchParams.get("tab") as CategoryKey | null) ?? "security";
   const activeTab = categoryKeys.includes(requestedTab) ? requestedTab : "security";
@@ -743,9 +745,50 @@ export function ResultsClient({ scanId }: { scanId: string }) {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [scanId]);
+  }, [scanId, status, user?.uid]);
 
   const scan = state.scan;
+  const progressTarget = scan ? Math.max(0, Math.min(100, scan.progress)) : 0;
+  const shouldAnimateProgress = scan ? scan.status === "queued" || scan.status === "running" : false;
+
+  useEffect(() => {
+    setDisplayProgress(0);
+  }, [scanId]);
+
+  useEffect(() => {
+    if (!scan) {
+      return;
+    }
+
+    if (!shouldAnimateProgress) {
+      setDisplayProgress(progressTarget);
+      return;
+    }
+
+    if (displayProgress > progressTarget) {
+      setDisplayProgress(progressTarget);
+      return;
+    }
+
+    if (displayProgress === progressTarget) {
+      return;
+    }
+
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setDisplayProgress(progressTarget);
+      return;
+    }
+
+    const remaining = progressTarget - displayProgress;
+    const delay = remaining > 40 ? 16 : remaining > 15 ? 24 : 36;
+    const timer = window.setTimeout(() => {
+      setDisplayProgress((current) => Math.min(current + 1, progressTarget));
+    }, delay);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [displayProgress, progressTarget, scan, shouldAnimateProgress]);
 
   const categoryCards = useMemo(
     () =>
@@ -840,6 +883,8 @@ export function ResultsClient({ scanId }: { scanId: string }) {
           }
           throw new Error(claimPayload?.error ?? "Unable to link this scan.");
         }
+
+        dispatchQuotaRefresh();
       }
 
       await refreshWorkspace();
@@ -936,14 +981,14 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                   className="flex w-full items-center gap-3 rounded-full px-4 py-3 text-slate-600 transition-all hover:bg-white/40"
                 >
                   <History className="h-4 w-4" />
-                  <span className="text-sm font-medium">History</span>
+                  <span className="text-sm font-medium">Scans</span>
                 </button>
               </div>
             </div>
 
             <div className="min-h-0 flex-1">
               <span className="mb-4 block px-4 text-[10px] font-bold uppercase tracking-[0.24em] text-slate-400">
-                Scan History
+                Your Scans
               </span>
               <div className="soft-scrollbar max-h-[320px] space-y-1 overflow-y-auto pr-2">
                 {state.recentScans.length ? (
@@ -1017,7 +1062,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                   </div>
                   <div className="text-right">
                     <span className="text-3xl font-semibold text-[var(--primary)]">
-                      {scan.progress}%
+                      {displayProgress}%
                     </span>
                     <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
                       Audited
@@ -1030,7 +1075,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                       "progress-stripes h-full rounded-full bg-[var(--primary)] shadow-[0_0_20px_rgba(0,88,188,0.35)] transition-all duration-700",
                       scan.status === "completed" && "after:hidden",
                     )}
-                    style={{ width: `${scan.progress}%` }}
+                    style={{ width: `${displayProgress}%` }}
                   />
                 </div>
                 <p className="mt-4 text-sm text-slate-500">
@@ -1184,6 +1229,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
         onApproved={async (nextQuota) => {
           setQuota(nextQuota);
           setPaypalOpen(false);
+          dispatchQuotaRefresh();
           await handleContinueWithGoogle();
         }}
       />

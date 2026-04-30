@@ -12,21 +12,21 @@ import { StartAuditForm } from "@/components/landing/start-audit-form";
 const featureCards = [
   {
     icon: ShieldCheck,
-    title: "Real-time Monitoring",
+    title: "Live Website Scan",
     description:
-      "Continuous surveillance of your infrastructure with low-latency alerts and automated issue discovery.",
+      "Live checks that find website risks, SEO issues, and performance problems in seconds.",
   },
   {
     icon: SearchCode,
     title: "Security Insights",
     description:
-      "Actionable analysis of headers, exposures, cookie posture, metadata gaps, and heavy assets.",
+      "Clear analysis of headers, exposed risks, cookies, metadata, and heavy assets.",
   },
   {
     icon: Activity,
-    title: "Threat Intelligence",
+    title: "AI Risk Insights",
     description:
-      "Operational context for public attack surface, indexing health, and rendering bottlenecks.",
+      "AI-powered context for security risks, SEO health, and speed bottlenecks.",
   },
 ];
 
@@ -40,13 +40,13 @@ export default function HomePage() {
         >
           <div className="w-full max-w-[800px]">
             <span className="mb-3 block text-xs font-semibold uppercase tracking-[0.24em] text-[var(--primary)]">
-              Intelligence driven security
+              AI WEBSITE SECURITY
             </span>
             <h1 className="mx-auto max-w-[760px] text-balance text-5xl font-semibold leading-[1.08] tracking-[-0.03em] text-[var(--ink)] md:text-6xl">
-              Secure your digital perimeter with precision.
+              Scan your website for security risks.
             </h1>
             <p className="mx-auto mb-12 mt-6 max-w-[600px] text-balance text-lg leading-8 text-[var(--ink-muted)]">
-              Instant website scans for security, SEO, and performance. Real findings stream live, and Google sign-in unlocks the exact fix guidance behind each check.
+              AI-powered scans for security, SEO, and performance. See live findings and clear guidance to fix each issue.
             </p>
 
             <StartAuditForm variant="hero" />
@@ -54,11 +54,11 @@ export default function HomePage() {
             <div className="mt-12 flex flex-col items-center justify-center gap-4 text-[var(--ink-soft)] md:flex-row md:gap-8">
               <div className="flex items-center gap-2 text-sm">
                 <CircleCheckBig className="h-4 w-4 text-[var(--primary)]" />
-                <span>Passive security checks</span>
+                <span>Safe security checks</span>
               </div>
               <div className="flex items-center gap-2 text-sm">
                 <Zap className="h-4 w-4 text-[var(--primary)]" />
-                <span>Real-time analysis</span>
+                <span>Live site analysis</span>
               </div>
             </div>
           </div>
@@ -72,10 +72,10 @@ export default function HomePage() {
                   Observability
                 </span>
                 <h3 className="text-3xl font-semibold tracking-[-0.02em] text-[var(--ink)]">
-                  Real-time Monitoring
+                  Live Website Scan
                 </h3>
                 <p className="mt-4 max-w-[420px] text-sm leading-7 text-[var(--ink-muted)]">
-                  Continuous surveillance of your infrastructure with sub-second scan updates, public attack-surface coverage, and issue prioritization for modern teams.
+                  Live checks that find website risks, SEO issues, and performance problems in seconds.
                 </p>
               </div>
               <div className="mt-12 flex justify-end">
@@ -131,10 +131,10 @@ export default function HomePage() {
                 <span className="relative z-10 text-4xl font-semibold text-[var(--primary)]">98</span>
               </div>
               <h3 className="text-2xl font-semibold tracking-[-0.02em] text-[var(--ink)]">
-                Performance Scoring
+                Website Health Score
               </h3>
               <p className="mt-3 text-sm leading-7 text-[var(--ink-muted)]">
-                Industry-benchmarked scores based on real HTML, header, asset, and indexing checks.
+                Clear scores based on security, SEO, speed, headers, and website structure checks.
               </p>
             </div>
 
@@ -142,13 +142,13 @@ export default function HomePage() {
               <div className="grid min-h-[260px] md:grid-cols-2">
                 <div className="p-8">
                   <h3 className="text-2xl font-semibold tracking-[-0.02em] text-[var(--ink)]">
-                    Threat Intelligence
+                    AI Website Analysis
                   </h3>
                   <ul className="mt-6 space-y-4 text-sm leading-7 text-[var(--ink-muted)]">
                     {[
-                      "Global surface checks for public exposures",
-                      "Security, SEO and performance in one pipeline",
-                      "Google-gated remediation with export-ready guidance",
+                      "AI checks for public security risks",
+                      "Security, SEO, and speed in one scan",
+                      "Clear fix guidance after sign-in",
                     ].map((item) => (
                       <li key={item} className="flex items-center gap-3">
                         <CheckCircle2 className="h-4 w-4 text-[var(--primary)]" />
@@ -182,10 +182,10 @@ export default function HomePage() {
           className="mx-auto grid max-w-[1200px] grid-cols-2 gap-6 px-6 py-8 text-center md:grid-cols-4 md:px-8"
         >
           {[
-            ["500M+", "Checks / Day"],
-            ["24ms", "Avg Response"],
-            ["99.9%", "Accuracy"],
-            ["12k+", "Global Clients"],
+            ["500K+", "CHECKS RUN"],
+            ["FAST", "SCAN SPEED"],
+            ["AI", "POWERED"],
+            ["24/7", "SITE CHECKS"],
           ].map(([value, label]) => (
             <div key={label}>
               <div className="text-4xl font-semibold tracking-[-0.03em] text-[var(--primary)]">{value}</div>
@@ -197,29 +197,29 @@ export default function HomePage() {
         </section>
 
         <section className="mx-auto max-w-[1200px] px-6 py-20 md:px-8">
-          <div className="glass-panel relative overflow-hidden rounded-[2rem] bg-slate-900 p-12 text-center text-white">
+          <div className="glass-panel relative overflow-hidden rounded-[2rem] p-12 text-center">
             <div className="absolute inset-0 opacity-20">
               <div className="absolute inset-0 bg-[radial-gradient(circle_at_30%_20%,#0070eb,transparent_40%)]" />
               <div className="absolute inset-0 bg-[radial-gradient(circle_at_70%_80%,#6664e4,transparent_40%)]" />
             </div>
             <div className="relative z-10">
-              <h2 className="text-4xl font-semibold tracking-[-0.03em]">Ready to scan your stack?</h2>
-              <p className="mx-auto mt-5 max-w-[600px] text-lg leading-8 text-white/75">
-                Run a live website scan, inspect real findings, then connect with Google to unlock the detailed fix guidance for each issue.
+              <h2 className="text-4xl font-semibold tracking-[-0.03em] text-slate-950">Ready to scan your website?</h2>
+              <p className="mx-auto mt-5 max-w-[600px] text-lg leading-8 text-slate-600">
+                Run an AI-powered website scan, review live findings, and get clear guidance to fix each issue.
               </p>
               <div className="mt-8 flex flex-col items-center justify-center gap-4 sm:flex-row">
                 <a
                   href="#home"
-                  className="inline-flex items-center gap-2 rounded-full bg-[var(--primary)] px-6 py-3 text-sm font-semibold text-white transition-all hover:bg-[#004ca1]"
+                  className="inline-flex items-center gap-2 rounded-full bg-[var(--primary)] px-6 py-3 text-sm font-semibold !text-white transition-all hover:bg-[#004ca1]"
                 >
-                  Start scan
-                  <ChevronRight className="h-4 w-4" />
+                  Scan Site
+                  <ChevronRight className="h-4 w-4 text-white" />
                 </a>
                 <a
                   href="/history"
-                  className="inline-flex items-center gap-2 rounded-full bg-white/10 px-6 py-3 text-sm font-semibold text-white backdrop-blur-md transition-all hover:bg-white/20"
+                  className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white/80 px-6 py-3 text-sm font-semibold text-slate-700 shadow-sm backdrop-blur-md transition-all hover:bg-white"
                 >
-                  Open history
+                  Open Scans
                 </a>
               </div>
             </div>
