@@ -11,6 +11,7 @@ import { emptyCategoryState } from "@/lib/utils";
 import { badRequest, notFound, paymentRequired } from "@/server/api/errors";
 import { getQueueDriver } from "@/server/queue";
 import { getRepository } from "@/server/repository";
+import { setScanAuthContext, type ScanAuthContext } from "@/server/scans/auth-context";
 import { validateTarget } from "@/server/scans/helpers";
 
 export const FREE_SCAN_LIMIT = 3;
@@ -145,6 +146,7 @@ export async function createScan(
   targetInput: string,
   userId: string | null,
   anonymousClientId: string | null,
+  authContext: ScanAuthContext = {},
 ) {
   if (userId) {
     await assertCanCreateScan(userId);
@@ -184,6 +186,10 @@ export async function createScan(
   };
 
   await repository.createScan(scan);
+  setScanAuthContext(scan.id, {
+    authCookieHeader: authContext.authCookieHeader?.trim() || null,
+    secondaryAuthCookieHeader: authContext.secondaryAuthCookieHeader?.trim() || null,
+  });
   await repository.addEvent(
     scan.id,
     buildEvent({

@@ -6,6 +6,8 @@ export interface NormalizedTarget {
   targetHostname: string;
   httpsUrl: string;
   httpUrl: string;
+  authCookieHeader?: string | null;
+  secondaryAuthCookieHeader?: string | null;
 }
 
 export interface HttpAttempt {

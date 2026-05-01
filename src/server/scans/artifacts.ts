@@ -48,6 +48,18 @@ export interface PageFormField {
   location: FindingEvidenceLocation;
 }
 
+export interface PageInteractiveElement {
+  kind: "button" | "input" | "tab" | "menuitem" | "link" | "dialog";
+  text: string;
+  name: string | null;
+  type: string | null;
+  role: string | null;
+  href: string | null;
+  sourceUrl: string;
+  sensitiveKinds: string[];
+  location: FindingEvidenceLocation;
+}
+
 export interface PageFormSnapshot {
   url: string;
   sourceUrl: string;
@@ -100,6 +112,7 @@ export interface PageSnapshot {
   images: PageResource[];
   forms: PageResource[];
   formSnapshots: PageFormSnapshot[];
+  interactiveElements: PageInteractiveElement[];
   inlineScripts: Array<{ content: string; location: FindingEvidenceLocation }>;
   nodeCount: number;
   htmlBytes: number;
@@ -164,6 +177,31 @@ export interface BrowserInspection {
   renderedPageCount: number;
   networkRequestCount: number;
   authenticated: boolean;
+  routeMap: BrowserRouteMap;
+}
+
+export interface BrowserRouteMap {
+  pages: string[];
+  apiEndpoints: string[];
+  forms: Array<{
+    url: string;
+    method: string;
+    sourceUrl: string;
+    sensitiveKinds: string[];
+    fieldNames: string[];
+  }>;
+  buttons: Array<{
+    text: string;
+    kind: PageInteractiveElement["kind"];
+    sourceUrl: string;
+    sensitiveKinds: string[];
+  }>;
+  inputs: Array<{
+    name: string;
+    type: string;
+    sourceUrl: string;
+    sensitiveKinds: string[];
+  }>;
 }
 
 export interface AuditArtifacts {
@@ -184,10 +222,10 @@ const globalState = globalThis as typeof globalThis & {
 };
 
 const BROWSER_NAVIGATION_TIMEOUT_MS = 9_000;
-const BROWSER_NETWORK_IDLE_TIMEOUT_MS = 2_000;
-const BROWSER_CRAWL_PAGE_LIMIT = 5;
+const BROWSER_NETWORK_IDLE_TIMEOUT_MS = 1_200;
+const BROWSER_CRAWL_PAGE_LIMIT = 4;
 const BROWSER_NETWORK_PROBE_LIMIT = 80;
-const FETCH_CRAWL_PAGE_LIMIT = 8;
+const FETCH_CRAWL_PAGE_LIMIT = 6;
 
 const emptyBrowserInspection: BrowserInspection = {
   attempted: false,
@@ -198,6 +236,13 @@ const emptyBrowserInspection: BrowserInspection = {
   renderedPageCount: 0,
   networkRequestCount: 0,
   authenticated: false,
+  routeMap: {
+    pages: [],
+    apiEndpoints: [],
+    forms: [],
+    buttons: [],
+    inputs: [],
+  },
 };
 
 function getCache() {
@@ -761,6 +806,72 @@ function buildPageSnapshot(
     });
   });
 
+  const interactiveElements = $(
+    "button, input, textarea, select, dialog, [role='button'], [role='tab'], [role='menuitem'], [aria-haspopup], [routerlink], [ng-reflect-router-link], [data-href]",
+  )
+    .toArray()
+    .map((element, index) => {
+      const node = $(element);
+      const tagName = element.tagName.toLowerCase();
+      const role = node.attr("role")?.trim().toLowerCase() ?? null;
+      const type =
+        tagName === "textarea"
+          ? "textarea"
+          : tagName === "select"
+            ? "select"
+            : node.attr("type")?.trim().toLowerCase() ?? null;
+      const rawHref =
+        node.attr("href") ||
+        node.attr("routerlink") ||
+        node.attr("ng-reflect-router-link") ||
+        node.attr("data-href") ||
+        null;
+      const href = rawHref ? safeAbsoluteUrl(rawHref, pageUrl) : null;
+      const text = truncate(
+        normalizeWhitespace(
+          node.text() ||
+            node.attr("aria-label") ||
+            node.attr("title") ||
+            node.attr("placeholder") ||
+            node.attr("name") ||
+            node.attr("id") ||
+            "",
+        ),
+        140,
+      );
+      const name = node.attr("name")?.trim() || node.attr("id")?.trim() || null;
+      const sensitiveKinds = classifySensitiveKinds(`${text} ${name ?? ""} ${type ?? ""} ${href ?? ""}`);
+      const kind: PageInteractiveElement["kind"] =
+        tagName === "dialog"
+          ? "dialog"
+          : role === "tab"
+            ? "tab"
+            : role === "menuitem"
+              ? "menuitem"
+              : ["input", "textarea", "select"].includes(tagName)
+                ? "input"
+                : href
+                  ? "link"
+                  : "button";
+
+      return {
+        kind,
+        text,
+        name,
+        type,
+        role,
+        href,
+        sourceUrl: pageUrl,
+        sensitiveKinds,
+        location: describeDomLocation($, element, pageUrl, {
+          label: `Interactive element ${index + 1}`,
+          attribute: rawHref ? "href" : name ? "name" : undefined,
+          note: [kind, text || name, type].filter(Boolean).join(" "),
+        }),
+      } satisfies PageInteractiveElement;
+    })
+    .filter((element) => element.text || element.name || element.href || element.sensitiveKinds.length > 0);
+
   const inlineScripts = $("script:not([src])")
     .toArray()
     .map((element, index) => ({
@@ -788,6 +899,7 @@ function buildPageSnapshot(
     images: resources.filter((resource) => resource.kind === "image"),
     forms: resources.filter((resource) => resource.kind === "form"),
     formSnapshots,
+    interactiveElements,
     inlineScripts,
     nodeCount: $("*").length,
     htmlBytes: Buffer.byteLength(attempt.bodyText, "utf8"),
@@ -1086,11 +1198,155 @@ function buildRenderedAttempt(input: {
   } satisfies HttpAttempt;
 }
 
+function classifySensitiveKinds(value: string) {
+  const kinds = new Set<string>();
+  if (/(login|log in|signin|sign in|auth|session|password|account)/i.test(value)) {
+    kinds.add("login");
+  }
+  if (/(reset|forgot|recover|new[- ]?password|otp|verification|code)/i.test(value)) {
+    kinds.add("password-reset");
+  }
+  if (/(profile|settings|billing|payment|card|invoice|address|phone|order|basket|cart)/i.test(value)) {
+    kinds.add("account");
+  }
+  if (/(upload|file|avatar|photo|document)/i.test(value)) {
+    kinds.add("upload");
+  }
+  if (/(search|find|query|filter|keyword)/i.test(value)) {
+    kinds.add("search");
+  }
+
+  return [...kinds];
+}
+
+function mergePageSnapshots(base: PageSnapshot, extras: PageSnapshot[]) {
+  const mergeByUrl = <T extends { url: string }>(items: T[]) => dedupeByUrl(items);
+  const mergeByLocation = <T extends { location: FindingEvidenceLocation }>(items: T[]) => {
+    const seen = new Set<string>();
+    return items.filter((item) => {
+      const key = `${item.location.url ?? ""}::${item.location.path ?? item.location.selector ?? ""}::${item.location.value ?? ""}`;
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+  };
+  const resources = mergeByUrl([base, ...extras].flatMap((page) => page.resources));
+
+  return {
+    ...base,
+    links: mergeByUrl([base, ...extras].flatMap((page) => page.links)),
+    resources,
+    images: resources.filter((resource) => resource.kind === "image"),
+    forms: resources.filter((resource) => resource.kind === "form"),
+    formSnapshots: mergeByUrl([base, ...extras].flatMap((page) => page.formSnapshots)),
+    interactiveElements: mergeByLocation([base, ...extras].flatMap((page) => page.interactiveElements)),
+    inlineScripts: [base, ...extras].flatMap((page) => page.inlineScripts).slice(0, 30),
+    headings: mergeByLocation([base, ...extras].flatMap((page) => page.headings)),
+    nodeCount: Math.max(base.nodeCount, ...extras.map((page) => page.nodeCount)),
+    htmlBytes: Math.max(base.htmlBytes, ...extras.map((page) => page.htmlBytes)),
+  } satisfies PageSnapshot;
+}
+
+function safeInteractionCandidate(candidate: {
+  text: string;
+  type: string;
+  role: string;
+  href: string;
+}) {
+  const haystack = `${candidate.text} ${candidate.type} ${candidate.role} ${candidate.href}`;
+  if (/(delete|remove|destroy|pay|checkout|purchase|buy|order now|confirm|submit|save|send|upload|register|sign up|signup)/i.test(haystack)) {
+    return false;
+  }
+
+  return /(login|log in|signin|sign in|account|profile|menu|nav|search|filter|tab|modal|dialog|open|details|settings|user)/i.test(
+    haystack,
+  );
+}
+
+async function discoverInteractiveSnapshots(
+  page: Page,
+  targetHostname: string,
+  sharedResources: Map<string, BrowserNetworkResource>,
+) {
+  const selector = [
+    "button",
+    "[role='button']",
+    "[role='tab']",
+    "[role='menuitem']",
+    "[aria-haspopup]",
+    "[data-toggle]",
+    "[data-bs-toggle]",
+    "input[type='button']",
+    "input[type='search']",
+    "input[type='text']",
+  ].join(",");
+  const locator = page.locator(selector);
+  const candidates = (
+    await locator
+      .evaluateAll((elements) =>
+        elements.map((element, index) => {
+          const htmlElement = element as HTMLElement;
+          return {
+            index,
+            text:
+              htmlElement.innerText ||
+              htmlElement.getAttribute("aria-label") ||
+              htmlElement.getAttribute("title") ||
+              htmlElement.getAttribute("placeholder") ||
+              "",
+            type: htmlElement.getAttribute("type") || "",
+            role: htmlElement.getAttribute("role") || "",
+            href:
+              htmlElement.getAttribute("href") ||
+              htmlElement.getAttribute("routerlink") ||
+              htmlElement.getAttribute("ng-reflect-router-link") ||
+              "",
+          };
+        }),
+      )
+      .catch(() => [])
+  )
+    .filter(safeInteractionCandidate)
+    .slice(0, 3);
+
+  const snapshots: PageSnapshot[] = [];
+  for (const candidate of candidates) {
+    const element = locator.nth(candidate.index);
+    await element.click({ timeout: 1_200 }).catch(() => undefined);
+    await page.waitForTimeout(300).catch(() => undefined);
+    await applyBrowserResourceTimings(page, sharedResources);
+    const bodyText = await page.content().catch(() => "");
+    if (!bodyText) {
+      continue;
+    }
+
+    const snapshot = buildPageSnapshot(
+      buildRenderedAttempt({
+        requestUrl: page.url(),
+        finalUrl: page.url(),
+        status: 200,
+        headers: {},
+        bodyText,
+        durationMs: 0,
+      }),
+      targetHostname,
+    );
+    if (snapshot) {
+      snapshots.push(mergeBrowserNetworkResources(snapshot, [...sharedResources.values()], targetHostname));
+    }
+  }
+
+  return snapshots;
+}
+
 async function renderBrowserPage(
   context: BrowserContext,
   url: string,
   targetHostname: string,
   sharedResources: Map<string, BrowserNetworkResource>,
+  options: { interact?: boolean } = {},
 ) {
   const page = await context.newPage();
   page.on("response", (response) => captureBrowserResponse(response, sharedResources));
@@ -1106,7 +1362,7 @@ async function renderBrowserPage(
     }
 
     await page.waitForLoadState("networkidle", { timeout: BROWSER_NETWORK_IDLE_TIMEOUT_MS }).catch(() => undefined);
-    await page.waitForTimeout(350).catch(() => undefined);
+    await page.waitForTimeout(250).catch(() => undefined);
     await applyBrowserResourceTimings(page, sharedResources);
 
     const finalUrl = page.url();
@@ -1120,7 +1376,14 @@ async function renderBrowserPage(
       bodyText,
       durationMs,
     });
-    const snapshot = buildPageSnapshot(renderedAttempt, targetHostname);
+    const initialSnapshot = buildPageSnapshot(renderedAttempt, targetHostname);
+    const interactionSnapshots = options.interact
+      ? await discoverInteractiveSnapshots(page, targetHostname, sharedResources)
+      : [];
+    const snapshot =
+      initialSnapshot && interactionSnapshots.length > 0
+        ? mergePageSnapshots(initialSnapshot, interactionSnapshots)
+        : initialSnapshot;
 
     return snapshot
       ? mergeBrowserNetworkResources(snapshot, [...sharedResources.values()], targetHostname)
@@ -1142,7 +1405,11 @@ export function getConfiguredAuthCookieHeader() {
   return raw.slice(0, 8_000);
 }
 
-function configuredBrowserCookies(primaryOrigin: string, targetHostname: string): Cookie[] {
+function configuredBrowserCookies(
+  primaryOrigin: string,
+  targetHostname: string,
+  scanAuthCookieHeader?: string | null,
+): Cookie[] {
   const raw = process.env.FIXNX_SCAN_AUTH_COOKIES?.trim();
   const fallbackHeader = getConfiguredAuthCookieHeader();
   const secure = primaryOrigin.startsWith("https://");
@@ -1167,7 +1434,7 @@ function configuredBrowserCookies(primaryOrigin: string, targetHostname: string)
     }
   }
 
-  const header = fallbackHeader || raw || "";
+  const header = scanAuthCookieHeader?.trim() || fallbackHeader || raw || "";
   if (!header) {
     return [];
   }
@@ -1234,6 +1501,7 @@ function collectBrowserCrawlTargets(
 async function inspectWithBrowser(
   startUrl: string,
   targetHostname: string,
+  scanAuthCookieHeader?: string | null,
 ): Promise<{
   primaryPage: PageSnapshot | null;
   crawledPages: PageSnapshot[];
@@ -1253,7 +1521,7 @@ async function inspectWithBrowser(
   const resources = new Map<string, BrowserNetworkResource>();
   let browser: Browser | null = null;
   const primaryOrigin = new URL(startUrl).origin;
-  const authCookies = configuredBrowserCookies(primaryOrigin, targetHostname);
+  const authCookies = configuredBrowserCookies(primaryOrigin, targetHostname, scanAuthCookieHeader);
 
   try {
     const { chromium } = await import("playwright");
@@ -1272,7 +1540,9 @@ async function inspectWithBrowser(
       await context.addCookies(authCookies);
     }
 
-    const primaryPage = await renderBrowserPage(context, startUrl, targetHostname, resources);
+    const primaryPage = await renderBrowserPage(context, startUrl, targetHostname, resources, {
+      interact: true,
+    });
     const crawlTargets = primaryPage ? collectBrowserCrawlTargets(primaryPage, targetHostname) : [];
     const crawledPages: PageSnapshot[] = [];
 
@@ -1299,6 +1569,7 @@ async function inspectWithBrowser(
         renderedPageCount,
         networkRequestCount: resources.size,
         authenticated: authCookies.length > 0,
+        routeMap: emptyBrowserInspection.routeMap,
       },
     };
   } catch (error) {
@@ -1315,11 +1586,77 @@ async function inspectWithBrowser(
         renderedPageCount: 0,
         networkRequestCount: resources.size,
         authenticated: authCookies.length > 0,
+        routeMap: emptyBrowserInspection.routeMap,
       },
     };
   } finally {
     await browser?.close().catch(() => undefined);
   }
+}
+
+function buildBrowserRouteMap(pages: PageSnapshot[], resourceProbes: UrlProbe[]): BrowserRouteMap {
+  const apiEndpoints = dedupeByUrl(
+    [
+      ...pages.flatMap((page) =>
+        page.resources
+          .filter((resource) => resource.kind === "fetch")
+          .map((resource) => ({ url: resource.url })),
+      ),
+      ...resourceProbes
+        .filter((probe) => /json|graphql|xml|text\/plain/i.test(probe.contentType ?? ""))
+        .map((probe) => ({ url: probe.url })),
+    ],
+  ).map((endpoint) => endpoint.url);
+
+  const buttonSeen = new Set<string>();
+  const inputSeen = new Set<string>();
+  return {
+    pages: pages.map((page) => page.url),
+    apiEndpoints: apiEndpoints.slice(0, 40),
+    forms: pages.flatMap((page) =>
+      page.formSnapshots.map((form) => ({
+        url: form.url,
+        method: form.method,
+        sourceUrl: form.sourceUrl,
+        sensitiveKinds: form.sensitiveKinds,
+        fieldNames: form.fieldNames,
+      })),
+    ),
+    buttons: pages.flatMap((page) =>
+      page.interactiveElements
+        .filter((element) => element.kind !== "input")
+        .map((element) => ({
+          text: element.text || element.name || element.href || element.kind,
+          kind: element.kind,
+          sourceUrl: element.sourceUrl,
+          sensitiveKinds: element.sensitiveKinds,
+        })),
+    ).filter((button) => {
+      const key = `${button.sourceUrl}::${button.text}::${button.kind}`;
+      if (buttonSeen.has(key)) {
+        return false;
+      }
+      buttonSeen.add(key);
+      return true;
+    }).slice(0, 60),
+    inputs: pages.flatMap((page) =>
+      page.interactiveElements
+        .filter((element) => element.kind === "input")
+        .map((element) => ({
+          name: element.name || element.text || "unnamed",
+          type: element.type || "text",
+          sourceUrl: element.sourceUrl,
+          sensitiveKinds: element.sensitiveKinds,
+        })),
+    ).filter((input) => {
+      const key = `${input.sourceUrl}::${input.name}::${input.type}`;
+      if (inputSeen.has(key)) {
+        return false;
+      }
+      inputSeen.add(key);
+      return true;
+    }).slice(0, 60),
+  };
 }
 
 function detectTechnologies(context: PageContext, primaryPage: PageSnapshot | null) {
@@ -1396,6 +1733,7 @@ async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts>
   const browserResult = await inspectWithBrowser(
     context.primary?.finalUrl ?? target.httpsUrl,
     target.targetHostname,
+    target.authCookieHeader,
   );
   const primaryPage = browserResult.primaryPage ?? fetchedPrimaryPage;
   const primaryIsInterstitial = isLikelyEdgeInterstitial(context.primary) && !browserResult.primaryPage;
@@ -1438,6 +1776,10 @@ async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts>
     probeUrl(resource.url),
   );
   const resourceProbes = dedupeByUrl([...browserResult.resourceProbes, ...fetchedResourceProbes]);
+  const browserInspection = {
+    ...browserResult.inspection,
+    routeMap: buildBrowserRouteMap(allPages, resourceProbes),
+  } satisfies BrowserInspection;
 
   const internalLinkTargets = dedupeByUrl(
     allPages.flatMap((page) => page.links.filter((link) => link.internal && looksLikeHtmlPage(link.url))),
@@ -1480,13 +1822,17 @@ async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts>
     internalLinkProbes,
     externalLinkProbes,
     tlsInfo,
-    browserInspection: browserResult.inspection,
+    browserInspection,
     technologyHints: detectTechnologies(context, primaryPage),
     wafHints: detectWafCdn(context),
   };
 }
 
 export async function loadAuditArtifacts(target: NormalizedTarget) {
+  if (target.authCookieHeader || target.secondaryAuthCookieHeader) {
+    return buildArtifacts(target);
+  }
+
   const cacheKey = target.normalizedTarget;
   const cache = getCache();
   const cached = cache.get(cacheKey);

@@ -198,17 +198,28 @@ type ActiveXssProbeResult = {
   context: ReflectionResult["context"] | null;
 };
 
+type BrowserXssExecutionResult = {
+  url: string;
+  parameter: string;
+  status: number | null;
+  executed: boolean;
+  payload: string;
+};
+
 type ActiveSqlProbeResult = {
   url: string;
   parameter: string;
   payload: string;
   status: number;
   baselineStatus: number | null;
+  baselineDurationMs: number | null;
+  probeDurationMs: number | null;
   sqlError: boolean;
   serverError: boolean;
   baselineRecordCount: number | null;
   probeRecordCount: number | null;
   recordExpansion: boolean;
+  timeDelay: boolean;
 };
 
 type IdorProbeResult = {
@@ -216,8 +227,10 @@ type IdorProbeResult = {
   mutatedUrl: string;
   status: number;
   originalStatus: number | null;
+  secondaryStatus: number | null;
   contentType: string | null;
   comparableResponse: boolean;
+  crossUserAccess: boolean;
 };
 
 type AuthBypassProbeResult = {
@@ -579,6 +592,80 @@ function mutationWithNextIdentifier(url: string) {
   return changed ? parsed.toString() : null;
 }
 
+function resolveSourceMapUrl(scriptUrl: string, scriptBody: string) {
+  const match = scriptBody.match(/sourceMappingURL=([^\s"'<>]+)/i);
+  const candidate = match?.[1] || (/\.(?:js|mjs)(?:[?#]|$)/i.test(scriptUrl) ? `${scriptUrl.split("#")[0].split("?")[0]}.map` : "");
+  return resolveHttpUrl(candidate, scriptUrl);
+}
+
+async function runBrowserXssExecutionProbes(
+  configs: Array<{ url: string; parameter: string }>,
+  authCookieHeader: string,
+) {
+  if (configs.length === 0 || process.env.FIXNX_BROWSER_SCAN === "0") {
+    return [];
+  }
+
+  let browser: Awaited<ReturnType<(typeof import("playwright"))["chromium"]["launch"]>> | null = null;
+  const token = `fixnx_xss_${Date.now().toString(36)}`;
+  const payload = `"><svg onload="window.__fixnxXss='${token}'"></svg>`;
+  const results: BrowserXssExecutionResult[] = [];
+
+  try {
+    const { chromium } = await import("playwright");
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--disable-dev-shm-usage", "--no-sandbox"],
+    });
+    const context = await browser.newContext({
+      ignoreHTTPSErrors: true,
+      javaScriptEnabled: true,
+      userAgent: "fixnx/1.0 xss-probe (+https://example.invalid/cyberaudit)",
+      extraHTTPHeaders: authCookieHeader ? { cookie: authCookieHeader } : undefined,
+    });
+    const page = await context.newPage();
+    await page.addInitScript(() => {
+      Object.defineProperty(window as Window & { __fixnxXss?: string | null }, "__fixnxXss", {
+        configurable: true,
+        writable: true,
+        value: null,
+      });
+    });
+
+    for (const config of configs.slice(0, 4)) {
+      const url = new URL(config.url);
+      url.searchParams.set(config.parameter, payload);
+      const response = await page.goto(url.toString(), {
+        waitUntil: "domcontentloaded",
+        timeout: 7_000,
+      }).catch(() => null);
+      await page.waitForTimeout(600).catch(() => undefined);
+      const executed = await page
+        .evaluate(
+          (expectedToken) =>
+            (window as Window & { __fixnxXss?: string | null }).__fixnxXss === expectedToken,
+          token,
+        )
+        .catch(() => false);
+      results.push({
+        url: url.toString(),
+        parameter: config.parameter,
+        status: response?.status() ?? null,
+        executed,
+        payload,
+      });
+    }
+
+    await context.close().catch(() => undefined);
+  } catch {
+    return results;
+  } finally {
+    await browser?.close().catch(() => undefined);
+  }
+
+  return results;
+}
+
 function extractComparableHtmlTitle(bodyText: string) {
   const match = bodyText.match(/<title[^>]*>([^<]*)<\/title>/i);
   return match?.[1]?.replace(/\s+/g, " ").trim().toLowerCase() ?? "";
@@ -847,7 +934,12 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   }
 
   const findings = [];
-  const configuredAuthCookie = getConfiguredAuthCookieHeader();
+  const configuredAuthCookie = target.authCookieHeader?.trim() || getConfiguredAuthCookieHeader();
+  const configuredSecondaryAuthCookie =
+    target.secondaryAuthCookieHeader?.trim() ||
+    process.env.FIXNX_SCAN_SECONDARY_AUTH_COOKIE_HEADER?.trim().slice(0, 8_000) ||
+    process.env.FIXNX_SCAN_SECONDARY_AUTH_COOKIES?.trim().slice(0, 8_000) ||
+    "";
   const authHeadersFor = (url: string): HeadersInit | undefined => {
     if (!configuredAuthCookie) {
       return undefined;
@@ -857,6 +949,20 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       const parsed = new URL(url);
       return isInternalHostMatch(parsed.hostname, target.targetHostname)
         ? { cookie: configuredAuthCookie }
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const secondaryAuthHeadersFor = (url: string): HeadersInit | undefined => {
+    if (!configuredSecondaryAuthCookie || configuredSecondaryAuthCookie.startsWith("[") || configuredSecondaryAuthCookie.startsWith("{")) {
+      return undefined;
+    }
+
+    try {
+      const parsed = new URL(url);
+      return isInternalHostMatch(parsed.hostname, target.targetHostname)
+        ? { cookie: configuredSecondaryAuthCookie }
         : undefined;
     } catch {
       return undefined;
@@ -1936,14 +2042,21 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const activeXssFailure = activeXssResults.find(
     (result) => result.context && ["html", "attribute", "url-attribute", "script"].includes(result.context),
   );
+  const browserXssExecutionResults = await runBrowserXssExecutionProbes(
+    inputProbeConfigs.slice(0, 4),
+    configuredAuthCookie,
+  );
+  const confirmedBrowserXss = browserXssExecutionResults.find((result) => result.executed);
   findings.push(
     buildSecurityCheck({
       checkKey: "active-xss-payload-reflection",
-      title: "Active XSS payload reflection",
+      title: "Active XSS exploit probe",
       scoreWeight: 1.4,
-      status: activeXssFailure ? "fail" : activeXssResults.length > 0 ? "warning" : "pass",
-      severity: activeXssFailure ? "high" : activeXssResults.length > 0 ? "medium" : "info",
-      shortDescription: activeXssFailure
+      status: confirmedBrowserXss || activeXssFailure ? "fail" : activeXssResults.length > 0 ? "warning" : "pass",
+      severity: confirmedBrowserXss ? "critical" : activeXssFailure ? "high" : activeXssResults.length > 0 ? "medium" : "info",
+      shortDescription: confirmedBrowserXss
+        ? `A sampled XSS payload executed in a real browser on ${confirmedBrowserXss.url}.`
+        : activeXssFailure
         ? `A sampled parameter reflected an HTML payload without clear output encoding on ${activeXssFailure.url}.`
         : activeXssResults.length > 0
           ? "A sampled XSS payload was reflected and should be reviewed for output encoding."
@@ -1957,12 +2070,21 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       evidence: {
         checkedUrl: inputProbeConfigs.slice(0, 8).map((config) => config.url).join(", "),
         expectedLocation: "Injected HTML payload should be encoded before rendering",
-        summary: activeXssFailure
-          ? "A raw HTML payload came back in an executable-capable context."
+        summary: confirmedBrowserXss
+            ? "The browser-side execution marker was set by the injected payload."
+          : activeXssFailure
+            ? "A raw HTML payload came back in an executable-capable context."
           : activeXssResults.length > 0
             ? "The payload was reflected raw, but the context needs manual confirmation."
             : "No raw active XSS payload reflection was detected.",
         probePayload: redactValue(activeXssPayload),
+        browserExecution: browserXssExecutionResults.map((result) => ({
+          url: result.url,
+          parameter: result.parameter,
+          status: result.status,
+          executed: result.executed,
+          payload: redactValue(result.payload),
+        })),
         results: activeXssResults.map((result) => ({
           url: result.url,
           parameter: result.parameter,
@@ -1990,9 +2112,11 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const elevatedReflectionDetected = reflectionResults.some(
     (result) => result.context === "html" || result.context === "attribute",
   );
-  const activeXssDetected = Boolean(activeXssFailure);
+  const activeXssDetected = Boolean(activeXssFailure || confirmedBrowserXss);
   const xssStatus =
-    activeXssDetected
+    confirmedBrowserXss
+      ? { status: "fail" as const, severity: "critical" as const }
+    : activeXssDetected
       ? { status: "fail" as const, severity: "high" as const }
     : dangerousReflectionDetected && !hasAnyCspPolicy
       ? { status: "fail" as const, severity: "high" as const }
@@ -2002,7 +2126,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   findings.push(
     buildSecurityCheck({
       checkKey: "xss-risk-indicators",
-      title: "XSS risk indicators",
+      title: "XSS evidence review",
       scoreWeight: 1.45,
       ...xssStatus,
       shortDescription:
@@ -2034,6 +2158,12 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           parameter: result.parameter,
           context: result.context,
         })),
+        browserExecutions: browserXssExecutionResults.map((result) => ({
+          url: result.url,
+          parameter: result.parameter,
+          status: result.status,
+          executed: result.executed,
+        })),
         dangerousDomSinks: dangerousDomSinks.slice(0, 8).map((entry) => ({
           source: entry.source,
           sink: entry.sink,
@@ -2044,12 +2174,12 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   );
 
   const sqlProbeToken = "cyberaudit-sql-baseline";
-  const sqlProbePayloads = ["'", "' OR '1'='1'--", "')) OR 1=1--"];
+  const sqlProbePayloads = ["'", "' OR '1'='1'--", "')) OR 1=1--", "' OR SLEEP(2)--"];
   const sqlProbeConfigs = inputProbeConfigs
     .filter((config) => riskyInputParamPattern.test(config.parameter))
     .slice(0, 6);
   const sqlProbeResults = (
-    await mapLimited(sqlProbeConfigs, 2, async (config) => {
+    await mapLimited(sqlProbeConfigs, 2, async (config, configIndex) => {
       const baselineUrl = new URL(config.url);
       baselineUrl.searchParams.set(config.parameter, sqlProbeToken);
       const baselineAttempt = await loadAttempt(baselineUrl.toString(), {
@@ -2060,7 +2190,12 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       const baselineRecordCount = baselineAttempt ? countStructuredRecords(baselineAttempt.bodyText) : null;
 
       return (
-        await mapLimited(sqlProbePayloads, 1, async (payload) => {
+        await mapLimited(
+          configIndex < 2
+            ? sqlProbePayloads
+            : sqlProbePayloads.filter((payload) => !/sleep/i.test(payload)),
+          1,
+          async (payload) => {
           const url = new URL(config.url);
           url.searchParams.set(config.parameter, payload);
           const attempt = await loadAttempt(url.toString(), {
@@ -2073,11 +2208,19 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           }
 
           const probeRecordCount = countStructuredRecords(attempt.bodyText);
+          const baselineDurationMs = baselineAttempt?.totalDurationMs ?? baselineAttempt?.durationMs ?? null;
+          const probeDurationMs = attempt.totalDurationMs ?? attempt.durationMs ?? null;
           const recordExpansion =
             baselineRecordCount !== null &&
             probeRecordCount !== null &&
             probeRecordCount > baselineRecordCount &&
             probeRecordCount >= Math.max(3, baselineRecordCount + 3);
+          const timeDelay =
+            /sleep|benchmark|pg_sleep|waitfor/i.test(payload) &&
+            baselineDurationMs !== null &&
+            probeDurationMs !== null &&
+            probeDurationMs - baselineDurationMs >= 1_600 &&
+            probeDurationMs >= 1_900;
 
           return {
             url: attempt.finalUrl,
@@ -2085,33 +2228,42 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
             payload,
             status: attempt.status,
             baselineStatus: baselineAttempt?.status ?? null,
+            baselineDurationMs,
+            probeDurationMs,
             sqlError: looksLikeSqlError(attempt.bodyText),
             serverError: attempt.status >= 500 && (baselineAttempt?.status ?? 200) < 500,
             baselineRecordCount,
             probeRecordCount,
             recordExpansion,
+            timeDelay,
           } satisfies ActiveSqlProbeResult;
-        })
+          },
+        )
       ).filter(isPresent);
     })
   ).flat();
   const sqlErrorResult = sqlProbeResults.find((result) => result.sqlError || result.recordExpansion);
   const anomalousSqlResult = sqlProbeResults.find((result) => result.serverError);
+  const timeBasedSqlResult = sqlProbeResults.find((result) => result.timeDelay);
   const sqlStatus = sqlErrorResult
     ? { status: "fail" as const, severity: "critical" as const }
+    : timeBasedSqlResult
+      ? { status: "warning" as const, severity: "high" as const }
     : anomalousSqlResult
       ? { status: "warning" as const, severity: "high" as const }
       : { status: "pass" as const, severity: "info" as const };
   findings.push(
     buildSecurityCheck({
       checkKey: "sql-injection-risk-indicators",
-      title: "SQL injection risk indicators",
+      title: "SQL injection active probe",
       scoreWeight: 1.6,
       ...sqlStatus,
       shortDescription: sqlErrorResult
         ? sqlErrorResult.sqlError
           ? `A sampled parameter on ${sqlErrorResult.url} triggered a database-like error response.`
           : `A SQL-style payload on ${sqlErrorResult.url} expanded the structured response from ${sqlErrorResult.baselineRecordCount ?? 0} to ${sqlErrorResult.probeRecordCount ?? 0} records.`
+        : timeBasedSqlResult
+          ? `A time-delay payload on ${timeBasedSqlResult.url} responded ${Math.max(0, (timeBasedSqlResult.probeDurationMs ?? 0) - (timeBasedSqlResult.baselineDurationMs ?? 0))} ms slower than baseline.`
         : anomalousSqlResult
           ? `A sampled parameter on ${anomalousSqlResult.url} triggered an unexpected server error.`
           : "Sampled input probes did not expose SQL injection indicators.",
@@ -2135,12 +2287,24 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           payload: redactValue(result.payload),
           status: result.status,
           baselineStatus: result.baselineStatus,
+          baselineDurationMs: result.baselineDurationMs,
+          probeDurationMs: result.probeDurationMs,
           sqlError: result.sqlError,
           serverError: result.serverError,
           baselineRecordCount: result.baselineRecordCount,
           probeRecordCount: result.probeRecordCount,
           recordExpansion: result.recordExpansion,
+          timeDelay: result.timeDelay,
         })),
+        confidence: sqlErrorResult
+          ? sqlErrorResult.recordExpansion
+            ? "confirmed-response-difference"
+            : "confirmed-error-based"
+          : timeBasedSqlResult
+            ? "suspected-time-based"
+            : anomalousSqlResult
+              ? "suspected-server-error"
+              : "not-detected",
       },
     }),
   );
@@ -2302,7 +2466,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         return null;
       }
 
-      const [originalAttempt, mutatedAttempt] = await Promise.all([
+      const [originalAttempt, mutatedAttempt, secondaryAttempt] = await Promise.all([
         loadAttempt(candidate.url, {
           timeoutMs: 8_000,
           followRedirects: false,
@@ -2313,6 +2477,13 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           followRedirects: false,
           headers: authHeadersFor(mutatedUrl),
         }),
+        secondaryAuthHeadersFor(candidate.url)
+          ? loadAttempt(candidate.url, {
+              timeoutMs: 8_000,
+              followRedirects: false,
+              headers: secondaryAuthHeadersFor(candidate.url),
+            })
+          : Promise.resolve(null),
       ]);
       if (!mutatedAttempt) {
         return null;
@@ -2320,6 +2491,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
 
       const originalContentType = originalAttempt?.headers["content-type"] ?? "";
       const mutatedContentType = mutatedAttempt.headers["content-type"] ?? "";
+      const secondaryContentType = secondaryAttempt?.headers["content-type"] ?? "";
       const comparableResponse =
         mutatedAttempt.status >= 200 &&
         mutatedAttempt.status < 300 &&
@@ -2330,20 +2502,37 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         (!originalContentType ||
           !mutatedContentType ||
           originalContentType.split(";")[0] === mutatedContentType.split(";")[0]);
+      const crossUserAccess = Boolean(
+        originalAttempt &&
+          secondaryAttempt &&
+          originalAttempt.status >= 200 &&
+          originalAttempt.status < 300 &&
+          secondaryAttempt.status >= 200 &&
+          secondaryAttempt.status < 300 &&
+          (!originalContentType ||
+            !secondaryContentType ||
+            originalContentType.split(";")[0] === secondaryContentType.split(";")[0]) &&
+          !isLikelyEdgeInterstitial(secondaryAttempt),
+      );
 
       return {
         originalUrl: candidate.url,
         mutatedUrl: mutatedAttempt.finalUrl,
         status: mutatedAttempt.status,
         originalStatus: originalAttempt?.status ?? null,
+        secondaryStatus: secondaryAttempt?.status ?? null,
         contentType: mutatedAttempt.headers["content-type"] ?? null,
         comparableResponse,
+        crossUserAccess,
       } satisfies IdorProbeResult;
     })
   ).filter(isPresent);
-  const exposedIdorProbe = idorProbeResults.find((result) => result.comparableResponse);
+  const exposedIdorProbe = idorProbeResults.find((result) => result.comparableResponse || result.crossUserAccess);
+  const confirmedIdorProbe = idorProbeResults.find((result) => result.crossUserAccess);
   const idorStatus =
-    exposedIdorProbe
+    confirmedIdorProbe
+      ? { status: "fail" as const, severity: "critical" as const }
+    : exposedIdorProbe
       ? { status: "warning" as const, severity: "high" as const }
     : idorCandidates.length === 0
       ? { status: "pass" as const, severity: "info" as const }
@@ -2353,11 +2542,13 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   findings.push(
     buildSecurityCheck({
       checkKey: "idor-risk-indicators",
-      title: "IDOR risk indicators",
+      title: "IDOR authorization probe",
       scoreWeight: 1.3,
       ...idorStatus,
       shortDescription:
-        exposedIdorProbe
+        confirmedIdorProbe
+          ? `A secondary authenticated session could access ${confirmedIdorProbe.originalUrl}.`
+        : exposedIdorProbe
           ? `Changing an object identifier returned a comparable successful response on ${exposedIdorProbe.mutatedUrl}.`
         : idorCandidates.length === 0
           ? "No obvious object-ID style URLs were detected in the sampled internal surface."
@@ -2372,13 +2563,17 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         checkedUrl: idorCandidates.map((candidate) => candidate.url).join(", "),
         expectedLocation: "ID-based internal URLs should enforce object-level authorization",
         summary:
-          exposedIdorProbe
+          confirmedIdorProbe
+            ? "A cross-user authorization probe returned a successful comparable response."
+          : exposedIdorProbe
             ? "A sampled object identifier could be changed and still returned a comparable successful response."
           : idorCandidates.length === 0
             ? "No strong IDOR-style URL patterns were found in the sampled links."
             : "ID-based internal URLs were found and should be reviewed for object-level access control.",
         candidates: idorCandidates,
         activeProbes: idorProbeResults,
+        confidence: confirmedIdorProbe ? "confirmed-cross-user" : exposedIdorProbe ? "suspected-id-mutation" : "not-detected",
+        secondarySessionProvided: Boolean(configuredSecondaryAuthCookie),
       },
     }),
   );
@@ -2552,8 +2747,29 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const authForms = allKnownForms.filter(
     (form) => form.hasPasswordField || form.sensitiveKinds.some((kind) => ["login", "password-reset"].includes(kind)),
   );
+  const authRouteMapSignals = [
+    ...artifacts.browserInspection.routeMap.forms
+      .filter((form) => form.sensitiveKinds.some((kind) => ["login", "password-reset", "account"].includes(kind)))
+      .map((form) => form.url),
+    ...artifacts.browserInspection.routeMap.buttons
+      .filter((button) => button.sensitiveKinds.some((kind) => ["login", "password-reset", "account"].includes(kind)))
+      .map((button) => `${button.sourceUrl}#${button.text}`),
+    ...artifacts.browserInspection.routeMap.inputs
+      .filter((input) =>
+        input.sensitiveKinds.some((kind) => ["login", "password-reset", "account"].includes(kind)) ||
+        /password|email|username|otp|token/i.test(`${input.name} ${input.type}`),
+      )
+      .map((input) => `${input.sourceUrl}#${input.name}`),
+  ];
+  const authSurfaceDetected =
+    authForms.length > 0 ||
+    authSurfaceAttempts.length > 0 ||
+    Boolean(successfulAuthBypass) ||
+    authRouteMapSignals.length > 0;
   const authReviewStatus =
-    authForms.length === 0 && authSurfaceAttempts.length === 0
+    successfulAuthBypass
+      ? { status: "fail" as const, severity: "critical" as const }
+    : !authSurfaceDetected
       ? { status: "info" as const, severity: "info" as const }
       : authForms.some((form) => !form.secure)
         ? { status: "fail" as const, severity: "high" as const }
@@ -2569,7 +2785,9 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       scoreWeight: authReviewStatus.status === "fail" ? 1.0 : 0.75,
       ...authReviewStatus,
       shortDescription:
-        authForms.length === 0 && authSurfaceAttempts.length === 0
+        successfulAuthBypass
+          ? "Authentication surface was detected and one active bypass probe returned an authentication success signal."
+        : !authSurfaceDetected
           ? "No authentication forms or routes were detected in the sampled surface."
           : authReviewStatus.status === "pass"
             ? "Sampled authentication surfaces look protected by HTTPS and baseline browser controls."
@@ -2581,14 +2799,23 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           ? "Keep authentication flows protected by HTTPS, strong session cookies, and iframe restrictions."
           : "Harden authentication routes with HTTPS-only delivery, secure session cookies, anti-clickjacking controls, and explicit CSRF protection where applicable.",
       evidence: {
-        checkedUrl: [...authSurfaceAttempts.map((attempt) => attempt.finalUrl), ...authForms.map((form) => form.url)].join(", "),
+        checkedUrl: uniqueUrls([
+          ...authSurfaceAttempts.map((attempt) => attempt.finalUrl),
+          ...authForms.map((form) => form.url),
+          ...authRouteMapSignals,
+          ...authBypassTargets,
+        ]).join(", "),
         expectedLocation: "Login, reset, and account-recovery routes and forms",
         summary:
-          authReviewStatus.status === "pass"
+          successfulAuthBypass
+            ? "An active authentication bypass result confirms that authentication routes exist and require urgent review."
+          : authReviewStatus.status === "pass"
             ? "Sampled auth surfaces looked reasonably hardened."
             : "At least one sampled auth surface lacked a baseline control.",
         authRouteCount: authSurfaceAttempts.length,
         passwordFormCount: authForms.length,
+        routeMapSignals: authRouteMapSignals.slice(0, 12),
+        authBypassProbeStatus: successfulAuthBypass ? "confirmed" : authBypassReachable ? "tested" : "not-tested",
         clickjackingStatus: clickjackingStatus.status,
       },
     }),
@@ -3369,6 +3596,72 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           thirdPartyScriptsWithoutSri,
           "This third-party script is missing an integrity attribute.",
         ),
+      },
+    }),
+  );
+
+  const sourceMapCandidates = uniqueUrls(
+    firstPartyScriptSamples
+      .flatMap((sample) => {
+        const sourceMapUrl = resolveSourceMapUrl(sample.url, sample.bodyText);
+        return sourceMapUrl ? [sourceMapUrl] : [];
+      })
+      .slice(0, 8),
+  );
+  const sourceMapAttempts = (
+    await mapLimited(sourceMapCandidates.slice(0, 6), 3, async (url) => {
+      const attempt = await loadAttempt(url, {
+        timeoutMs: 8_000,
+        followRedirects: false,
+      });
+      if (!attempt) {
+        return null;
+      }
+
+      return {
+        url: attempt.finalUrl,
+        status: attempt.status,
+        sourceMapLike:
+          attempt.status < 400 &&
+          /"version"\s*:\s*3|"sources"\s*:\s*\[|"sourcesContent"\s*:\s*\[/i.test(attempt.bodyText),
+        includesSourcesContent: /"sourcesContent"\s*:\s*\[/i.test(attempt.bodyText),
+      };
+    })
+  ).filter(isPresent);
+  const exposedSourceMaps = sourceMapAttempts.filter((attempt) => attempt.sourceMapLike);
+  findings.push(
+    buildSecurityCheck({
+      checkKey: "exposed-source-maps",
+      title: "Exposed source maps",
+      scoreWeight: 0.95,
+      status: exposedSourceMaps.some((attempt) => attempt.includesSourcesContent)
+        ? "fail"
+        : exposedSourceMaps.length > 0
+          ? "warning"
+          : "pass",
+      severity: exposedSourceMaps.some((attempt) => attempt.includesSourcesContent)
+        ? "high"
+        : exposedSourceMaps.length > 0
+          ? "medium"
+          : "info",
+      shortDescription:
+        exposedSourceMaps.length === 0
+          ? "No public first-party JavaScript source maps were detected in the sampled scripts."
+          : `${exposedSourceMaps.length} public source map file(s) were reachable from sampled first-party JavaScript.`,
+      whyItMatters:
+        "Source maps can expose original source paths, comments, internal route names, and sometimes secrets that were not meant for production users.",
+      recommendation:
+        exposedSourceMaps.length === 0
+          ? "Keep production source maps private unless they are intentionally published."
+          : "Remove public source maps from production or serve them only to trusted error-reporting infrastructure.",
+      evidence: {
+        checkedUrl: sourceMapCandidates.join(", "),
+        expectedLocation: "First-party JavaScript sourceMappingURL comments and .map files",
+        summary:
+          exposedSourceMaps.length === 0
+            ? "No sampled source map endpoint returned source-map-like content."
+            : "At least one sampled source map endpoint returned source map content.",
+        sourceMaps: sourceMapAttempts,
       },
     }),
   );

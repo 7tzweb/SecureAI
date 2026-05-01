@@ -1,18 +1,22 @@
 import { average } from "@/lib/utils";
 import { categoryKeys, type CategoryKey, type CategoryState, type ScanRecord } from "@/lib/types";
 import { getRepository } from "@/server/repository";
+import { getScanAuthContext } from "@/server/scans/auth-context";
 import { runPerformanceScan } from "@/server/scans/performance";
 import { runSecurityScan } from "@/server/scans/security";
 import { runSeoScan } from "@/server/scans/seo";
 import { type CategoryScanResult, type NormalizedTarget } from "@/server/scans/types";
 
 function buildTarget(scan: ScanRecord): NormalizedTarget {
+  const authContext = getScanAuthContext(scan.id);
   return {
     originalInput: scan.target,
     normalizedTarget: scan.normalizedTarget,
     targetHostname: scan.targetHostname,
     httpsUrl: `https://${scan.targetHostname}`,
     httpUrl: `http://${scan.targetHostname}`,
+    authCookieHeader: authContext.authCookieHeader ?? null,
+    secondaryAuthCookieHeader: authContext.secondaryAuthCookieHeader ?? null,
   };
 }
 

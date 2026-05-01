@@ -21,7 +21,10 @@ export async function POST(request: NextRequest) {
     assertRateLimit("create-scan", identifier);
 
     const parsed = createScanSchema.parse(await request.json());
-    const scan = await createScan(parsed.target, sessionUser?.uid ?? null, anonymousClientId);
+    const scan = await createScan(parsed.target, sessionUser?.uid ?? null, anonymousClientId, {
+      authCookieHeader: parsed.authCookieHeader,
+      secondaryAuthCookieHeader: parsed.secondaryAuthCookieHeader,
+    });
     const response = NextResponse.json({ scan }, { status: 201 });
 
     if (!sessionUser && !existingAnonymousId && anonymousClientId) {

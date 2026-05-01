@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useEffect, useState, useTransition } from "react";
-import { ArrowRight, ExternalLink, Globe, Loader2 } from "lucide-react";
+import { ArrowRight, ExternalLink, Globe, KeyRound, Loader2 } from "lucide-react";
 import { PaypalCreditsDialog } from "@/components/billing/paypal-credits-dialog";
 import { useAuth } from "@/components/providers/auth-provider";
 import { dispatchQuotaRefresh, subscribeQuotaRefresh } from "@/lib/quota-events";
@@ -47,6 +47,9 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
   const [quota, setQuota] = useState<ScanQuotaSummary | null>(null);
   const [checkoutPending, setCheckoutPending] = useState(false);
   const [paypalOpen, setPaypalOpen] = useState(false);
+  const [showAuthOptions, setShowAuthOptions] = useState(false);
+  const [authCookieHeader, setAuthCookieHeader] = useState("");
+  const [secondaryAuthCookieHeader, setSecondaryAuthCookieHeader] = useState("");
   const [isPending, startTransition] = useTransition();
 
   type FormError = Error & {
@@ -175,7 +178,11 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ target: value }),
+          body: JSON.stringify({
+            target: value,
+            authCookieHeader: authCookieHeader.trim() || undefined,
+            secondaryAuthCookieHeader: secondaryAuthCookieHeader.trim() || undefined,
+          }),
         });
 
         if (status === "signed-in" && user) {
@@ -263,6 +270,38 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
           <ArrowRight className="h-4 w-4 text-white" />
         </button>
       </div>
+
+      {variant !== "header" ? (
+        <div className={cn("mt-3", variant === "hero" ? "mx-auto max-w-[580px]" : "")}>
+          <button
+            type="button"
+            onClick={() => setShowAuthOptions((current) => !current)}
+            className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white/80 px-4 py-2 text-xs font-semibold text-slate-700 shadow-sm transition-colors hover:bg-white"
+          >
+            <KeyRound className="h-3.5 w-3.5 text-[var(--primary)]" />
+            Authenticated scan
+          </button>
+
+          {showAuthOptions ? (
+            <div className="mt-3 grid gap-3 rounded-[1.3rem] border border-white/70 bg-white/70 p-3 shadow-[0_12px_36px_rgba(15,23,42,0.08)]">
+              <textarea
+                value={authCookieHeader}
+                onChange={(event) => setAuthCookieHeader(event.target.value)}
+                placeholder="User A cookie header"
+                spellCheck={false}
+                className="min-h-20 w-full resize-y rounded-[1rem] border border-slate-200 bg-white px-4 py-3 text-xs leading-5 text-slate-700 outline-none transition-colors placeholder:text-slate-400 focus:border-[var(--primary)]"
+              />
+              <textarea
+                value={secondaryAuthCookieHeader}
+                onChange={(event) => setSecondaryAuthCookieHeader(event.target.value)}
+                placeholder="User B cookie header"
+                spellCheck={false}
+                className="min-h-20 w-full resize-y rounded-[1rem] border border-slate-200 bg-white px-4 py-3 text-xs leading-5 text-slate-700 outline-none transition-colors placeholder:text-slate-400 focus:border-[var(--primary)]"
+              />
+            </div>
+          ) : null}
+        </div>
+      ) : null}
 
       {variant === "header" ? (
         error || quota?.requiresUpgrade ? (

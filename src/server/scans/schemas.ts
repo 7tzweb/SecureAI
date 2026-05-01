@@ -4,6 +4,8 @@ import { SCAN_CREDIT_PACK_SIZE } from "@/server/scans/service";
 
 export const createScanSchema = z.object({
   target: z.string().trim().min(1).max(255),
+  authCookieHeader: z.string().trim().max(8_000).optional(),
+  secondaryAuthCookieHeader: z.string().trim().max(8_000).optional(),
 });
 
 export const checkoutSchema = z.object({

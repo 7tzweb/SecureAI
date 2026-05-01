@@ -63,14 +63,31 @@ function humanizeKey(key: string) {
 }
 
 function formatEvidenceValue(value: unknown) {
+  const compact = (input: string) =>
+    input.length > 700 ? `${input.slice(0, 697).trimEnd()}...` : input;
   if (typeof value === "string") {
-    return value;
+    return compact(value);
   }
   if (typeof value === "number" || typeof value === "boolean") {
     return String(value);
   }
   if (Array.isArray(value) && value.every((entry) => typeof entry === "string")) {
-    return value.join(", ");
+    return compact(value.join(", "));
+  }
+  if (Array.isArray(value)) {
+    return compact(
+      value
+        .slice(0, 4)
+        .map((entry) =>
+          typeof entry === "object" && entry !== null
+            ? JSON.stringify(entry)
+            : String(entry),
+        )
+        .join(" | "),
+    );
+  }
+  if (typeof value === "object" && value !== null) {
+    return compact(JSON.stringify(value));
   }
   return null;
 }
