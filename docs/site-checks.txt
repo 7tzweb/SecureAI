@@ -1,4 +1,4 @@
-CyberAudit site checks
+fixnx site checks
 Source of truth: src/server/scans/security.ts, src/server/scans/seo.ts, src/server/scans/performance.ts
 
 Notes:

@@ -111,6 +111,16 @@ export function createFirestoreRepository(): Repository {
       return snapshot.data().count;
     },
 
+    async countAnonymousScans(anonymousClientId) {
+      const snapshot = await db
+        .collection("scans")
+        .where("anonymousClientId", "==", anonymousClientId)
+        .count()
+        .get();
+
+      return snapshot.data().count;
+    },
+
     async listRecentScans(limit = 8) {
       const snapshot = await db
         .collection("scans")

@@ -147,7 +147,7 @@ export async function runSeoScan(target: NormalizedTarget): Promise<CategoryScan
   const primaryPage = artifacts.primaryPage;
   const primaryAttempt = artifacts.context.primary;
 
-  if (primaryAttempt && isLikelyEdgeInterstitial(primaryAttempt)) {
+  if (primaryAttempt && isLikelyEdgeInterstitial(primaryAttempt) && !artifacts.browserInspection.rendered) {
     const findings = limitedSeoChecks.map(([checkKey, title]) =>
       buildSeoCheck({
         checkKey,

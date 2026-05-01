@@ -139,6 +139,14 @@ a {
   animation: shimmer 2.2s infinite;
 }
 
+.completion-bar-finish {
+  animation: completion-bar-glow 1.15s ease-out;
+}
+
+.scan-complete-check {
+  animation: completion-check-pop 0.72s cubic-bezier(0.2, 1.25, 0.35, 1);
+}
+
 .score-ring-modern {
   position: relative;
   display: inline-flex;
@@ -177,5 +185,35 @@ a {
   }
   100% {
     box-shadow: 0 0 0 0 rgba(0, 88, 188, 0);
+  }
+}
+
+@keyframes completion-check-pop {
+  0% {
+    opacity: 0;
+    transform: translateX(0.45rem) scale(0.55);
+  }
+  60% {
+    opacity: 1;
+    transform: translateX(0) scale(1.12);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+@keyframes completion-bar-glow {
+  0% {
+    box-shadow: 0 0 0 rgba(24, 138, 82, 0);
+    filter: saturate(1);
+  }
+  45% {
+    box-shadow: 0 0 28px rgba(24, 138, 82, 0.42);
+    filter: saturate(1.25);
+  }
+  100% {
+    box-shadow: 0 0 20px rgba(0, 88, 188, 0.35);
+    filter: saturate(1);
   }
 }

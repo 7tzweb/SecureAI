@@ -1,9 +1,11 @@
 "use client";
 
 import Link from "next/link";
+import Image from "next/image";
 import { usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Clock3, ExternalLink, Loader2, UserCircle2 } from "lucide-react";
+import { Clock3, ExternalLink, Loader2, Plus, UserCircle2, X } from "lucide-react";
+import logoImage from "../../../logomain.png";
 import { PaypalCreditsDialog } from "@/components/billing/paypal-credits-dialog";
 import { StartAuditForm } from "@/components/landing/start-audit-form";
 import { useAuth } from "@/components/providers/auth-provider";
@@ -51,6 +53,7 @@ export function SiteHeader() {
   } = useAuth();
   const [quota, setQuota] = useState<ScanQuotaSummary | null>(null);
   const [accountOpen, setAccountOpen] = useState(false);
+  const [mobileScanOpen, setMobileScanOpen] = useState(false);
   const [actionPending, setActionPending] = useState(false);
   const [paypalOpen, setPaypalOpen] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
@@ -79,6 +82,8 @@ export function SiteHeader() {
   useEffect(() => {
     const timer = window.setTimeout(() => {
       void refreshQuota();
+      setAccountOpen(false);
+      setMobileScanOpen(false);
     }, 0);
 
     return () => {
@@ -156,6 +161,7 @@ export function SiteHeader() {
     const handlePointerDown = (event: MouseEvent) => {
       if (!panelRef.current?.contains(event.target as Node)) {
         setAccountOpen(false);
+        setMobileScanOpen(false);
       }
     };
 
@@ -201,8 +207,17 @@ export function SiteHeader() {
         )}
       >
         <div className="flex items-center gap-8">
-          <Link href="/" className="text-[2rem] font-semibold tracking-tight text-slate-900">
-            CyberAudit
+          <Link
+            href="/"
+            className="relative inline-flex h-12 w-[88px] shrink-0 items-center overflow-hidden min-[360px]:w-[116px] sm:w-[132px]"
+            aria-label="fixnx home"
+          >
+            <Image
+              src={logoImage}
+              alt="fixnx"
+              priority
+              className="absolute left-1/2 top-1/2 h-[108px] w-[108px] max-w-none -translate-x-1/2 -translate-y-1/2 object-contain min-[360px]:h-[142px] min-[360px]:w-[142px] sm:h-[160px] sm:w-[160px]"
+            />
           </Link>
 
           <nav className="hidden items-center gap-6 md:flex">
@@ -238,12 +253,27 @@ export function SiteHeader() {
           <StartAuditForm variant="header" />
         </div>
 
+        <button
+          type="button"
+          onClick={() => {
+            setMobileScanOpen((current) => !current);
+            setAccountOpen(false);
+          }}
+          className="inline-flex items-center gap-2 rounded-full border border-white/70 bg-white/80 px-3 py-2.5 text-sm font-semibold text-slate-800 shadow-sm transition-all hover:bg-white min-[360px]:px-4 lg:hidden"
+          aria-expanded={mobileScanOpen}
+          aria-label="Open new scan form"
+        >
+          <Plus className="h-4 w-4 text-[var(--primary)]" />
+          <span className="hidden min-[360px]:inline">Scan</span>
+        </button>
+
         <div className="flex items-center gap-3">
           <div className="relative">
             <button
               type="button"
               onClick={() => {
                 setAccountOpen((current) => !current);
+                setMobileScanOpen(false);
               }}
               className="rounded-full p-2 text-slate-600 transition-all hover:bg-white/20"
             >
@@ -251,15 +281,15 @@ export function SiteHeader() {
             </button>
 
             {accountOpen ? (
-              <div className="absolute right-0 top-12 w-[340px] rounded-[1.5rem] border border-white/70 bg-white/95 p-4 shadow-[0_20px_60px_rgba(15,23,42,0.12)]">
+              <div className="fixed left-4 right-4 top-20 max-h-[calc(100vh-6rem)] overflow-y-auto rounded-[1.5rem] border border-white/70 bg-white/95 p-4 shadow-[0_20px_60px_rgba(15,23,42,0.12)] sm:absolute sm:left-auto sm:right-0 sm:top-12 sm:w-[340px]">
                 {status === "signed-in" && user ? (
                   <>
                     <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <p className="text-sm font-semibold text-slate-900">
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-semibold text-slate-900">
                           {user.displayName ?? user.email ?? "Signed in"}
                         </p>
-                        <p className="mt-1 text-xs text-slate-500">{user.email ?? "Google account"}</p>
+                        <p className="mt-1 break-all text-xs text-slate-500">{user.email ?? "Google account"}</p>
                       </div>
                       <button
                         type="button"
@@ -353,6 +383,26 @@ export function SiteHeader() {
             </Button>
           )}
         </div>
+
+        {mobileScanOpen ? (
+          <div className="fixed left-4 right-4 top-20 z-50 rounded-[1.5rem] border border-white/70 bg-white/95 p-4 shadow-[0_20px_60px_rgba(15,23,42,0.14)] lg:hidden">
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">New scan</p>
+                <p className="mt-1 text-xs text-slate-500">Enter another website URL.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setMobileScanOpen(false)}
+                className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 transition-colors hover:bg-slate-50"
+                aria-label="Close scan form"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <StartAuditForm variant="inline" />
+          </div>
+        ) : null}
       </div>
 
       {banner || actionError ? (

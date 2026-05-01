@@ -1,5 +1,6 @@
 import tls from "node:tls";
 import { load as loadHtml } from "cheerio";
+import type { Browser, BrowserContext, Cookie, Page, Response as PlaywrightResponse } from "playwright";
 import { type FindingEvidenceLocation } from "@/lib/types";
 import {
   describeDomLocation,
@@ -20,6 +21,7 @@ type ResourceKind =
   | "image"
   | "iframe"
   | "font"
+  | "fetch"
   | "form"
   | "link";
 
@@ -124,6 +126,13 @@ export interface UrlProbe {
   error: string | null;
 }
 
+interface BrowserNetworkResource extends UrlProbe {
+  kind: ResourceKind;
+  initiatorType: string | null;
+  transferSize: number | null;
+  decodedBodySize: number | null;
+}
+
 export interface LinkProbe extends UrlProbe {
   sourceUrl: string;
   text: string;
@@ -146,6 +155,17 @@ export interface TlsInspection {
   daysRemaining: number | null;
 }
 
+export interface BrowserInspection {
+  attempted: boolean;
+  rendered: boolean;
+  finalUrl: string | null;
+  durationMs: number | null;
+  error: string | null;
+  renderedPageCount: number;
+  networkRequestCount: number;
+  authenticated: boolean;
+}
+
 export interface AuditArtifacts {
   context: PageContext;
   primaryPage: PageSnapshot | null;
@@ -154,12 +174,30 @@ export interface AuditArtifacts {
   internalLinkProbes: LinkProbe[];
   externalLinkProbes: LinkProbe[];
   tlsInfo: TlsInspection | null;
+  browserInspection: BrowserInspection;
   technologyHints: string[];
   wafHints: string[];
 }
 
 const globalState = globalThis as typeof globalThis & {
   __cyberAuditArtifactsCache?: Map<string, { expiresAt: number; promise: Promise<AuditArtifacts> }>;
+};
+
+const BROWSER_NAVIGATION_TIMEOUT_MS = 9_000;
+const BROWSER_NETWORK_IDLE_TIMEOUT_MS = 2_000;
+const BROWSER_CRAWL_PAGE_LIMIT = 5;
+const BROWSER_NETWORK_PROBE_LIMIT = 80;
+const FETCH_CRAWL_PAGE_LIMIT = 8;
+
+const emptyBrowserInspection: BrowserInspection = {
+  attempted: false,
+  rendered: false,
+  finalUrl: null,
+  durationMs: null,
+  error: null,
+  renderedPageCount: 0,
+  networkRequestCount: 0,
+  authenticated: false,
 };
 
 function getCache() {
@@ -196,18 +234,19 @@ function safeAbsoluteUrl(rawValue: string | undefined, baseUrl: string) {
     return null;
   }
 
+  const trimmedValue = rawValue.trim();
   if (
-    rawValue.startsWith("#") ||
-    rawValue.startsWith("mailto:") ||
-    rawValue.startsWith("tel:") ||
-    rawValue.startsWith("javascript:") ||
-    rawValue.startsWith("data:")
+    (trimmedValue.startsWith("#") && !/^#(?:!\/?|\/)/.test(trimmedValue)) ||
+    trimmedValue.startsWith("mailto:") ||
+    trimmedValue.startsWith("tel:") ||
+    trimmedValue.startsWith("javascript:") ||
+    trimmedValue.startsWith("data:")
   ) {
     return null;
   }
 
   try {
-    const resolved = new URL(rawValue, baseUrl);
+    const resolved = new URL(trimmedValue, baseUrl);
     if (!["http:", "https:"].includes(resolved.protocol)) {
       return null;
     }
@@ -410,10 +449,16 @@ function buildPageSnapshot(
     })
     .filter((heading) => heading.text);
 
-  const links = $("a[href]")
+  const links = $("a[href], area[href], [routerlink], [ng-reflect-router-link], [data-href], button[formaction]")
     .toArray()
     .flatMap((element, index) => {
-      const url = safeAbsoluteUrl($(element).attr("href"), pageUrl);
+      const rawUrl =
+        $(element).attr("href") ||
+        $(element).attr("routerlink") ||
+        $(element).attr("ng-reflect-router-link") ||
+        $(element).attr("data-href") ||
+        $(element).attr("formaction");
+      const url = safeAbsoluteUrl(rawUrl, pageUrl);
       if (!url) {
         return [];
       }
@@ -435,7 +480,16 @@ function buildPageSnapshot(
           secure: parsed.protocol === "https:",
           location: describeDomLocation($, element, pageUrl, {
             label: `Link ${index + 1}`,
-            attribute: "href",
+            attribute:
+              $(element).attr("href") !== undefined
+                ? "href"
+                : $(element).attr("routerlink") !== undefined
+                  ? "routerlink"
+                  : $(element).attr("ng-reflect-router-link") !== undefined
+                    ? "ng-reflect-router-link"
+                    : $(element).attr("data-href") !== undefined
+                      ? "data-href"
+                      : "formaction",
             note: text,
           }),
         } satisfies PageLink,
@@ -480,6 +534,27 @@ function buildPageSnapshot(
       attribute: "href",
       location: describeDomLocation($, element, pageUrl, {
         label: `Stylesheet ${index + 1}`,
+        attribute: "href",
+      }),
+    });
+  });
+
+  $('link[rel="modulepreload"][href], link[rel="preload"][as="script"][href]').each((index, element) => {
+    const url = safeAbsoluteUrl($(element).attr("href"), pageUrl);
+    if (!url) {
+      return;
+    }
+    const parsed = new URL(url);
+    resources.push({
+      url,
+      sourceUrl: pageUrl,
+      kind: "script",
+      internal: isInternalHostname(parsed.hostname, targetHostname),
+      secure: parsed.protocol === "https:",
+      attribute: "href",
+      integrity: $(element).attr("integrity") ?? null,
+      location: describeDomLocation($, element, pageUrl, {
+        label: `Preloaded script ${index + 1}`,
         attribute: "href",
       }),
     });
@@ -792,6 +867,461 @@ async function probeUrl(url: string): Promise<UrlProbe> {
   };
 }
 
+function classifyBrowserResourceKind(
+  url: string,
+  resourceType: string | null | undefined,
+  contentType: string | null | undefined,
+): ResourceKind {
+  const lowerType = (resourceType ?? "").toLowerCase();
+  const lowerContentType = (contentType ?? "").toLowerCase();
+  const lowerUrl = url.toLowerCase();
+
+  if (lowerType === "script" || /javascript|ecmascript/.test(lowerContentType) || /\.(?:js|mjs)(?:[?#]|$)/.test(lowerUrl)) {
+    return "script";
+  }
+  if (lowerType === "stylesheet" || /text\/css/.test(lowerContentType) || /\.css(?:[?#]|$)/.test(lowerUrl)) {
+    return "stylesheet";
+  }
+  if (lowerType === "image" || /^image\//.test(lowerContentType)) {
+    return "image";
+  }
+  if (lowerType === "font" || /font|woff|ttf|otf|eot/.test(lowerContentType) || /\.(?:woff2?|ttf|otf|eot)(?:[?#]|$)/.test(lowerUrl)) {
+    return "font";
+  }
+  if (lowerType === "iframe" || lowerType === "frame") {
+    return "iframe";
+  }
+  if (lowerType === "fetch" || lowerType === "xhr" || /json|graphql|xml/.test(lowerContentType)) {
+    return "fetch";
+  }
+
+  return "link";
+}
+
+function browserNetworkLocation(resource: BrowserNetworkResource, pageUrl: string): FindingEvidenceLocation {
+  return {
+    label: `Browser-loaded ${resource.kind}`,
+    url: resource.url,
+    path: "browser.network",
+    value: resource.url,
+    note: `Loaded while rendering ${pageUrl} with JavaScript enabled.`,
+  };
+}
+
+function mergeBrowserNetworkResources(
+  snapshot: PageSnapshot,
+  networkResources: BrowserNetworkResource[],
+  targetHostname: string,
+) {
+  const seen = new Set(snapshot.resources.map((resource) => `${resource.kind}::${resource.url}`));
+  const additions = networkResources
+    .filter((resource) => resource.kind !== "link")
+    .flatMap((resource) => {
+      const key = `${resource.kind}::${resource.url}`;
+      if (seen.has(key)) {
+        return [];
+      }
+      seen.add(key);
+
+      let parsed: URL;
+      try {
+        parsed = new URL(resource.url);
+      } catch {
+        return [];
+      }
+
+      return [
+        {
+          url: resource.url,
+          sourceUrl: snapshot.url,
+          kind: resource.kind,
+          internal: isInternalHostname(parsed.hostname, targetHostname),
+          secure: parsed.protocol === "https:",
+          attribute: "browser.network",
+          integrity: null,
+          location: browserNetworkLocation(resource, snapshot.url),
+        } satisfies PageResource,
+      ];
+    });
+
+  const resources = [...snapshot.resources, ...additions];
+  return {
+    ...snapshot,
+    resources,
+    images: resources.filter((resource) => resource.kind === "image"),
+    forms: resources.filter((resource) => resource.kind === "form"),
+  } satisfies PageSnapshot;
+}
+
+function browserResourceProbeKey(url: string) {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+function captureBrowserResponse(
+  response: PlaywrightResponse,
+  resources: Map<string, BrowserNetworkResource>,
+) {
+  const url = response.url();
+  if (resources.size >= BROWSER_NETWORK_PROBE_LIMIT && !resources.has(browserResourceProbeKey(url))) {
+    return;
+  }
+  if (!/^https?:\/\//i.test(url)) {
+    return;
+  }
+
+  const headers = response.headers();
+  const contentType = headers["content-type"] ?? null;
+  const kind = classifyBrowserResourceKind(url, response.request().resourceType(), contentType);
+  const contentLength = parseCountHeader(headers["content-length"]);
+  const key = browserResourceProbeKey(url);
+  const current = resources.get(key);
+
+  resources.set(key, {
+    url,
+    finalUrl: url,
+    status: response.status(),
+    headers,
+    contentType,
+    contentLength: contentLength ?? current?.contentLength ?? null,
+    contentEncoding: headers["content-encoding"] ?? null,
+    cacheControl: headers["cache-control"] ?? null,
+    etag: headers.etag ?? null,
+    lastModified: headers["last-modified"] ?? null,
+    durationMs: current?.durationMs ?? null,
+    totalDurationMs: current?.totalDurationMs ?? null,
+    redirectCount: 0,
+    error: null,
+    kind,
+    initiatorType: response.request().resourceType(),
+    transferSize: current?.transferSize ?? null,
+    decodedBodySize: current?.decodedBodySize ?? null,
+  });
+}
+
+async function applyBrowserResourceTimings(
+  page: Page,
+  resources: Map<string, BrowserNetworkResource>,
+) {
+  const timings = await page
+    .evaluate(() =>
+      performance.getEntriesByType("resource").map((entry) => {
+        const resource = entry as PerformanceResourceTiming;
+        return {
+          name: resource.name,
+          initiatorType: resource.initiatorType,
+          transferSize: Number.isFinite(resource.transferSize) ? resource.transferSize : 0,
+          decodedBodySize: Number.isFinite(resource.decodedBodySize) ? resource.decodedBodySize : 0,
+          duration: Number.isFinite(resource.duration) ? resource.duration : 0,
+        };
+      }),
+    )
+    .catch(() => []);
+
+  timings.forEach((timing) => {
+    if (!/^https?:\/\//i.test(timing.name)) {
+      return;
+    }
+
+    const key = browserResourceProbeKey(timing.name);
+    const current = resources.get(key);
+    const contentLength =
+      current?.contentLength ??
+      (timing.transferSize > 0
+        ? Math.round(timing.transferSize)
+        : timing.decodedBodySize > 0
+          ? Math.round(timing.decodedBodySize)
+          : null);
+    const contentType = current?.contentType ?? null;
+
+    resources.set(key, {
+      url: current?.url ?? timing.name,
+      finalUrl: current?.finalUrl ?? timing.name,
+      status: current?.status ?? 200,
+      headers: current?.headers ?? {},
+      contentType,
+      contentLength,
+      contentEncoding: current?.contentEncoding ?? null,
+      cacheControl: current?.cacheControl ?? null,
+      etag: current?.etag ?? null,
+      lastModified: current?.lastModified ?? null,
+      durationMs: current?.durationMs ?? Math.round(timing.duration),
+      totalDurationMs: current?.totalDurationMs ?? Math.round(timing.duration),
+      redirectCount: current?.redirectCount ?? 0,
+      error: current?.error ?? null,
+      kind: current?.kind ?? classifyBrowserResourceKind(timing.name, timing.initiatorType, contentType),
+      initiatorType: current?.initiatorType ?? timing.initiatorType,
+      transferSize: timing.transferSize > 0 ? Math.round(timing.transferSize) : current?.transferSize ?? null,
+      decodedBodySize: timing.decodedBodySize > 0 ? Math.round(timing.decodedBodySize) : current?.decodedBodySize ?? null,
+    });
+  });
+}
+
+function buildRenderedAttempt(input: {
+  requestUrl: string;
+  finalUrl: string;
+  status: number;
+  headers: Record<string, string>;
+  bodyText: string;
+  durationMs: number;
+}) {
+  return {
+    requestUrl: input.requestUrl,
+    finalUrl: input.finalUrl,
+    status: input.status,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      ...input.headers,
+    },
+    setCookies: [],
+    bodyText: input.bodyText,
+    durationMs: input.durationMs,
+    totalDurationMs: input.durationMs,
+    redirectChain: [],
+  } satisfies HttpAttempt;
+}
+
+async function renderBrowserPage(
+  context: BrowserContext,
+  url: string,
+  targetHostname: string,
+  sharedResources: Map<string, BrowserNetworkResource>,
+) {
+  const page = await context.newPage();
+  page.on("response", (response) => captureBrowserResponse(response, sharedResources));
+
+  const startedAt = Date.now();
+  try {
+    const response = await page.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: BROWSER_NAVIGATION_TIMEOUT_MS,
+    });
+    if (response && response.status() >= 500) {
+      return null;
+    }
+
+    await page.waitForLoadState("networkidle", { timeout: BROWSER_NETWORK_IDLE_TIMEOUT_MS }).catch(() => undefined);
+    await page.waitForTimeout(350).catch(() => undefined);
+    await applyBrowserResourceTimings(page, sharedResources);
+
+    const finalUrl = page.url();
+    const bodyText = await page.content();
+    const durationMs = Date.now() - startedAt;
+    const renderedAttempt = buildRenderedAttempt({
+      requestUrl: url,
+      finalUrl,
+      status: response?.status() ?? 200,
+      headers: response?.headers() ?? {},
+      bodyText,
+      durationMs,
+    });
+    const snapshot = buildPageSnapshot(renderedAttempt, targetHostname);
+
+    return snapshot
+      ? mergeBrowserNetworkResources(snapshot, [...sharedResources.values()], targetHostname)
+      : null;
+  } finally {
+    await page.close().catch(() => undefined);
+  }
+}
+
+export function getConfiguredAuthCookieHeader() {
+  const raw =
+    process.env.FIXNX_SCAN_AUTH_COOKIE_HEADER?.trim() ||
+    process.env.FIXNX_SCAN_AUTH_COOKIES?.trim() ||
+    "";
+  if (!raw || raw.startsWith("[") || raw.startsWith("{")) {
+    return "";
+  }
+
+  return raw.slice(0, 8_000);
+}
+
+function configuredBrowserCookies(primaryOrigin: string, targetHostname: string): Cookie[] {
+  const raw = process.env.FIXNX_SCAN_AUTH_COOKIES?.trim();
+  const fallbackHeader = getConfiguredAuthCookieHeader();
+  const secure = primaryOrigin.startsWith("https://");
+
+  if (raw?.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(raw) as Array<Partial<Cookie> & { name?: string; value?: string }>;
+      return parsed
+        .filter((cookie) => cookie.name && cookie.value)
+        .map((cookie) => ({
+          name: String(cookie.name),
+          value: String(cookie.value),
+          domain: cookie.domain ?? targetHostname,
+          path: cookie.path ?? "/",
+          expires: cookie.expires ?? -1,
+          httpOnly: cookie.httpOnly ?? false,
+          secure: cookie.secure ?? secure,
+          sameSite: cookie.sameSite ?? "Lax",
+        }));
+    } catch {
+      return [];
+    }
+  }
+
+  const header = fallbackHeader || raw || "";
+  if (!header) {
+    return [];
+  }
+
+  return header
+    .split(";")
+    .map((part) => part.trim())
+    .flatMap((part) => {
+      const separatorIndex = part.indexOf("=");
+      if (separatorIndex <= 0) {
+        return [];
+      }
+
+      return [
+        {
+          name: part.slice(0, separatorIndex).trim(),
+          value: part.slice(separatorIndex + 1).trim(),
+          domain: targetHostname,
+          path: "/",
+          expires: -1,
+          httpOnly: false,
+          secure,
+          sameSite: "Lax" as const,
+        },
+      ];
+    });
+}
+
+function collectBrowserCrawlTargets(
+  primaryPage: PageSnapshot,
+  targetHostname: string,
+) {
+  const origin = new URL(primaryPage.url).origin;
+  const commonAuthRoutes = [
+    "/#/login",
+    "/login",
+    "/signin",
+  ].map((path) => new URL(path, origin).toString());
+
+  return dedupeByUrl(
+    [
+      ...commonAuthRoutes.map((url) => ({ url })),
+      ...primaryPage.links
+        .filter((link) => {
+          if (!link.internal || link.url === primaryPage.url) {
+            return false;
+          }
+
+          try {
+            const parsed = new URL(link.url);
+            return isInternalHostname(parsed.hostname, targetHostname) && looksLikeHtmlPage(link.url);
+          } catch {
+            return false;
+          }
+        })
+        .map((link) => ({ url: link.url })),
+    ],
+  )
+    .filter((target) => target.url !== primaryPage.url)
+    .slice(0, BROWSER_CRAWL_PAGE_LIMIT - 1)
+    .map((target) => target.url);
+}
+
+async function inspectWithBrowser(
+  startUrl: string,
+  targetHostname: string,
+): Promise<{
+  primaryPage: PageSnapshot | null;
+  crawledPages: PageSnapshot[];
+  resourceProbes: UrlProbe[];
+  inspection: BrowserInspection;
+}> {
+  if (process.env.FIXNX_BROWSER_SCAN === "0") {
+    return {
+      primaryPage: null,
+      crawledPages: [],
+      resourceProbes: [],
+      inspection: emptyBrowserInspection,
+    };
+  }
+
+  const startedAt = Date.now();
+  const resources = new Map<string, BrowserNetworkResource>();
+  let browser: Browser | null = null;
+  const primaryOrigin = new URL(startUrl).origin;
+  const authCookies = configuredBrowserCookies(primaryOrigin, targetHostname);
+
+  try {
+    const { chromium } = await import("playwright");
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--disable-dev-shm-usage", "--no-sandbox"],
+    });
+    const context = await browser.newContext({
+      ignoreHTTPSErrors: true,
+      javaScriptEnabled: true,
+      userAgent: "fixnx/1.0 browser-audit (+https://example.invalid/cyberaudit)",
+      viewport: { width: 1365, height: 768 },
+    });
+
+    if (authCookies.length > 0) {
+      await context.addCookies(authCookies);
+    }
+
+    const primaryPage = await renderBrowserPage(context, startUrl, targetHostname, resources);
+    const crawlTargets = primaryPage ? collectBrowserCrawlTargets(primaryPage, targetHostname) : [];
+    const crawledPages: PageSnapshot[] = [];
+
+    for (const crawlTarget of crawlTargets) {
+      const snapshot = await renderBrowserPage(context, crawlTarget, targetHostname, resources).catch(() => null);
+      if (snapshot && snapshot.url !== primaryPage?.url) {
+        crawledPages.push(snapshot);
+      }
+    }
+
+    await context.close().catch(() => undefined);
+
+    const renderedPageCount = (primaryPage ? 1 : 0) + crawledPages.length;
+    return {
+      primaryPage,
+      crawledPages,
+      resourceProbes: [...resources.values()],
+      inspection: {
+        attempted: true,
+        rendered: Boolean(primaryPage),
+        finalUrl: primaryPage?.url ?? null,
+        durationMs: Date.now() - startedAt,
+        error: null,
+        renderedPageCount,
+        networkRequestCount: resources.size,
+        authenticated: authCookies.length > 0,
+      },
+    };
+  } catch (error) {
+    return {
+      primaryPage: null,
+      crawledPages: [],
+      resourceProbes: [],
+      inspection: {
+        attempted: true,
+        rendered: false,
+        finalUrl: null,
+        durationMs: Date.now() - startedAt,
+        error: error instanceof Error ? error.message : "Browser rendering failed.",
+        renderedPageCount: 0,
+        networkRequestCount: resources.size,
+        authenticated: authCookies.length > 0,
+      },
+    };
+  } finally {
+    await browser?.close().catch(() => undefined);
+  }
+}
+
 function detectTechnologies(context: PageContext, primaryPage: PageSnapshot | null) {
   if (!context.primary || !primaryPage) {
     return [];
@@ -862,15 +1392,25 @@ function detectWafCdn(context: PageContext) {
 
 async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts> {
   const context = await loadPageContext(target);
-  const primaryPage = context.primary ? buildPageSnapshot(context.primary, target.targetHostname) : null;
-  const primaryIsInterstitial = isLikelyEdgeInterstitial(context.primary);
+  const fetchedPrimaryPage = context.primary ? buildPageSnapshot(context.primary, target.targetHostname) : null;
+  const browserResult = await inspectWithBrowser(
+    context.primary?.finalUrl ?? target.httpsUrl,
+    target.targetHostname,
+  );
+  const primaryPage = browserResult.primaryPage ?? fetchedPrimaryPage;
+  const primaryIsInterstitial = isLikelyEdgeInterstitial(context.primary) && !browserResult.primaryPage;
+  const browserCrawledUrls = new Set(browserResult.crawledPages.map((page) => page.url));
   const crawlTargets = primaryPage
     ? dedupeByUrl(
         primaryPage.links.filter(
-          (link) => link.internal && looksLikeHtmlPage(link.url) && link.url !== primaryPage.url,
+          (link) =>
+            link.internal &&
+            looksLikeHtmlPage(link.url) &&
+            link.url !== primaryPage.url &&
+            !browserCrawledUrls.has(link.url),
         ),
       )
-        .slice(0, 4)
+        .slice(0, Math.max(0, FETCH_CRAWL_PAGE_LIMIT - browserResult.crawledPages.length))
         .map((link) => link.url)
     : [];
   const scopedCrawlTargets = primaryIsInterstitial ? [] : crawlTargets;
@@ -881,17 +1421,23 @@ async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts>
     }),
   );
 
-  const crawledPages = crawledAttempts
+  const fetchedCrawledPages = crawledAttempts
     .flatMap((attempt) => (attempt ? [buildPageSnapshot(attempt, target.targetHostname)] : []))
     .filter((page): page is PageSnapshot => Boolean(page));
+  const crawledPages = dedupeByUrl([...browserResult.crawledPages, ...fetchedCrawledPages]).filter(
+    (page) => page.url !== primaryPage?.url,
+  );
   const allPages = primaryPage ? [primaryPage, ...crawledPages] : crawledPages;
 
+  const browserProbeUrls = new Set(browserResult.resourceProbes.map((probe) => probe.url));
   const resourceTargets = primaryPage && !primaryIsInterstitial
     ? dedupeByUrl(primaryPage.resources).slice(0, 40)
+        .filter((resource) => !browserProbeUrls.has(resource.url))
     : [];
-  const resourceProbes = await mapWithConcurrency(resourceTargets, 5, async (resource) =>
+  const fetchedResourceProbes = await mapWithConcurrency(resourceTargets, 5, async (resource) =>
     probeUrl(resource.url),
   );
+  const resourceProbes = dedupeByUrl([...browserResult.resourceProbes, ...fetchedResourceProbes]);
 
   const internalLinkTargets = dedupeByUrl(
     allPages.flatMap((page) => page.links.filter((link) => link.internal && looksLikeHtmlPage(link.url))),
@@ -934,6 +1480,7 @@ async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts>
     internalLinkProbes,
     externalLinkProbes,
     tlsInfo,
+    browserInspection: browserResult.inspection,
     technologyHints: detectTechnologies(context, primaryPage),
     wafHints: detectWafCdn(context),
   };

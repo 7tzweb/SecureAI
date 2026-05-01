@@ -11,11 +11,11 @@ const inter = Inter({
 
 export const metadata: Metadata = {
   title: {
-    default: "CyberAudit",
-    template: "%s | CyberAudit",
+    default: "fixnx",
+    template: "%s | fixnx",
   },
   description:
-    "CyberAudit scans websites for security, SEO, and performance issues with a fast async workflow.",
+    "fixnx scans websites for security, SEO, and performance issues with a fast async workflow.",
 };
 
 export default function RootLayout({

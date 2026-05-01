@@ -8,12 +8,13 @@ import {
   type ScanSummaryResponse,
 } from "@/lib/types";
 import { emptyCategoryState } from "@/lib/utils";
-import { notFound, paymentRequired } from "@/server/api/errors";
+import { badRequest, notFound, paymentRequired } from "@/server/api/errors";
 import { getQueueDriver } from "@/server/queue";
 import { getRepository } from "@/server/repository";
 import { validateTarget } from "@/server/scans/helpers";
 
 export const FREE_SCAN_LIMIT = 3;
+export const ANONYMOUS_SCAN_LIMIT = 3;
 export const SCAN_CREDIT_PACK_SIZE = 20;
 export const SCAN_CREDIT_PACK_PRICE_USD = 10;
 const PRIVILEGED_SCAN_EMAIL = "7tzweb@gmail.com";
@@ -124,9 +125,36 @@ async function assertCanCreateScan(userId: string) {
   return quota;
 }
 
-export async function createScan(targetInput: string, userId: string | null) {
+async function assertCanCreateAnonymousScan(anonymousClientId: string) {
+  const usedScans = await getRepository().countAnonymousScans(anonymousClientId);
+  if (usedScans >= ANONYMOUS_SCAN_LIMIT) {
+    throw paymentRequired(
+      `You reached the ${ANONYMOUS_SCAN_LIMIT} free scans available without Google sign-in. Sign in with Google to continue.`,
+      "ANONYMOUS_SCAN_QUOTA_EXCEEDED",
+      {
+        usedScans,
+        freeLimit: ANONYMOUS_SCAN_LIMIT,
+        remainingScans: 0,
+        canCreateScans: false,
+      },
+    );
+  }
+}
+
+export async function createScan(
+  targetInput: string,
+  userId: string | null,
+  anonymousClientId: string | null,
+) {
   if (userId) {
     await assertCanCreateScan(userId);
+  } else if (anonymousClientId) {
+    await assertCanCreateAnonymousScan(anonymousClientId);
+  } else {
+    throw badRequest(
+      "Anonymous scan session is missing.",
+      "ANONYMOUS_SCAN_SESSION_REQUIRED",
+    );
   }
 
   const target = await validateTarget(targetInput);
@@ -138,6 +166,7 @@ export async function createScan(targetInput: string, userId: string | null) {
     normalizedTarget: target.normalizedTarget,
     targetHostname: target.targetHostname,
     createdByUserId: userId,
+    anonymousClientId: userId ? null : anonymousClientId,
     createdAt: now,
     updatedAt: now,
     status: "queued",

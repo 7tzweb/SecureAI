@@ -117,7 +117,7 @@ async function fetchFirebasePublicKeys() {
 
   const response = await fetch(FIREBASE_CERTS_URL, {
     headers: {
-      "user-agent": "CyberAudit/1.0 (+https://example.invalid/cyberaudit)",
+      "user-agent": "fixnx/1.0 (+https://example.invalid/cyberaudit)",
     },
     cache: "no-store",
   });

@@ -27,6 +27,7 @@ export interface Repository {
   listEvents(scanId: string, limit?: number): Promise<ScanEvent[]>;
   listUserScans(userId: string): Promise<ScanRecord[]>;
   countUserScans(userId: string): Promise<number>;
+  countAnonymousScans(anonymousClientId: string): Promise<number>;
   listRecentScans(limit?: number): Promise<ScanRecord[]>;
   claimScan(scanId: string, userId: string): Promise<ScanRecord>;
   unlockScan(scanId: string, userId: string): Promise<ScanRecord>;

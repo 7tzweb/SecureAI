@@ -43,6 +43,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
   const { user, status, isConfigured, signInWithGoogle, ensureServerSession } = useAuth();
   const [target, setTarget] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<string | null>(null);
   const [quota, setQuota] = useState<ScanQuotaSummary | null>(null);
   const [checkoutPending, setCheckoutPending] = useState(false);
   const [paypalOpen, setPaypalOpen] = useState(false);
@@ -104,6 +105,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
 
   const handleUpgrade = async () => {
     setError(null);
+    setErrorCode(null);
 
     if (!isConfigured) {
       setError("Google login must be configured before billing can start.");
@@ -126,14 +128,41 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
     }
   };
 
+  const handleSignInToContinue = async () => {
+    setError(null);
+
+    if (!isConfigured) {
+      setError("Google login must be configured before more scans can start.");
+      return;
+    }
+
+    setCheckoutPending(true);
+    try {
+      if (status === "signed-in" && user) {
+        await ensureServerSession();
+      } else {
+        await signInWithGoogle();
+      }
+
+      setErrorCode(null);
+      dispatchQuotaRefresh();
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Unable to sign in with Google.");
+    } finally {
+      setCheckoutPending(false);
+    }
+  };
+
   const handleSubmit = () => {
     const value = target.trim();
     if (!value) {
       setError("Enter a domain to start the scan.");
+      setErrorCode(null);
       return;
     }
 
     setError(null);
+    setErrorCode(null);
 
     startTransition(async () => {
       try {
@@ -155,6 +184,9 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
         router.push(`/scans/${payload.scan.id}`);
       } catch (nextError) {
         const resolvedError = nextError as FormError;
+        const nextCode = typeof resolvedError.code === "string" ? resolvedError.code : null;
+        setErrorCode(nextCode);
+
         if (resolvedError.code === "SCAN_QUOTA_EXCEEDED") {
           if (
             resolvedError.details &&
@@ -163,6 +195,8 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
             setQuota(resolvedError.details as ScanQuotaSummary);
             setPaypalOpen(true);
           }
+        } else if (resolvedError.code === "ANONYMOUS_SCAN_QUOTA_EXCEEDED") {
+          setQuota(null);
         }
 
         setError(nextError instanceof Error ? nextError.message : "Network error while creating the scan.");
@@ -170,13 +204,16 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
     });
   };
 
+  const showAnonymousLimitCta = errorCode === "ANONYMOUS_SCAN_QUOTA_EXCEEDED";
+  const showPaidQuotaCta = Boolean(quota?.requiresUpgrade || errorCode === "SCAN_QUOTA_EXCEEDED");
+
   return (
     <div className={cn("w-full", variant === "header" && "relative", className)}>
       <div
         className={cn(
           "glass-panel flex w-full flex-col gap-3 shadow-xl ring-1 ring-black/5 md:flex-row md:items-center",
           variant === "hero"
-            ? "mx-auto max-w-[580px] rounded-full p-2"
+            ? "mx-auto max-w-[580px] rounded-[2rem] p-3 sm:p-2 md:rounded-full"
             : variant === "header"
               ? "rounded-full border border-white/60 bg-white/80 p-1.5 shadow-[0_10px_28px_rgba(15,23,42,0.08)]"
               : "rounded-[1.7rem] p-3",
@@ -214,7 +251,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
           className={cn(
             "inline-flex h-12 shrink-0 items-center justify-center gap-2 rounded-full bg-[var(--primary)] px-6 text-sm font-semibold !text-white transition-all hover:bg-[#004ca1] active:scale-[0.98]",
             variant === "hero"
-              ? "md:px-8"
+              ? "w-full md:w-auto md:px-8"
               : variant === "header"
                 ? "h-10 px-5 md:min-w-[140px]"
                 : "md:min-w-[180px]",
@@ -256,6 +293,23 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
                 </button>
               </div>
             ) : null}
+            {showAnonymousLimitCta ? (
+              <button
+                type="button"
+                onClick={() => void handleSignInToContinue()}
+                disabled={!isConfigured || checkoutPending}
+                className="mt-3 inline-flex items-center gap-2 self-start rounded-full border border-slate-200 bg-white px-5 py-2.5 text-sm font-semibold text-slate-800 shadow-sm transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {checkoutPending ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Opening Google...
+                  </>
+                ) : (
+                  "Sign in with Google to continue"
+                )}
+              </button>
+            ) : null}
           </div>
         ) : null
       ) : (
@@ -274,7 +328,23 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
 
           {error ? <p className="text-sm font-medium text-[var(--danger)]">{error}</p> : null}
 
-          {(quota?.requiresUpgrade || error?.includes("free scans")) ? (
+          {showAnonymousLimitCta ? (
+            <button
+              type="button"
+              onClick={() => void handleSignInToContinue()}
+              disabled={!isConfigured || checkoutPending}
+              className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-5 py-2.5 text-sm font-semibold text-slate-800 shadow-sm transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {checkoutPending ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Opening Google...
+                </>
+              ) : (
+                "Sign in with Google to continue"
+              )}
+            </button>
+          ) : showPaidQuotaCta ? (
             <button
               type="button"
               onClick={() => void handleUpgrade()}

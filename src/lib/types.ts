@@ -45,6 +45,7 @@ export interface ScanRecord {
   normalizedTarget: string;
   targetHostname: string;
   createdByUserId: string | null;
+  anonymousClientId: string | null;
   createdAt: string;
   updatedAt: string;
   status: ScanStatus;

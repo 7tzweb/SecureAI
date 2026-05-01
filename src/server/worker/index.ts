@@ -29,7 +29,7 @@ async function main() {
     console.error(`Failed ${job?.name ?? "unknown job"}:`, error);
   });
 
-  console.log("CyberAudit BullMQ worker is listening for jobs.");
+  console.log("fixnx BullMQ worker is listening for jobs.");
 }
 
 void main();

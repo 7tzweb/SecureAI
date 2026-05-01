@@ -3,7 +3,7 @@
 import type { CSSProperties } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { startTransition, useEffect, useMemo, useState } from "react";
-import { Clock3, Download, FileText, History, Shield, Wrench, X } from "lucide-react";
+import { CheckCircle2, Clock3, Download, FileText, History, Shield, Wrench, X } from "lucide-react";
 import { PaypalCreditsDialog } from "@/components/billing/paypal-credits-dialog";
 import { FindingCard } from "@/components/results/finding-card";
 import { useAuth } from "@/components/providers/auth-provider";
@@ -32,6 +32,11 @@ type SidebarScan = Pick<
   ScanRecord,
   "id" | "targetHostname" | "createdAt" | "status" | "overallScore" | "progress"
 >;
+
+type ProgressSessionState = {
+  scanId: string | null;
+  sawLiveState: boolean;
+};
 
 type ViewState = {
   scan: ScanRecord | null;
@@ -65,6 +70,28 @@ function sanitizeFilename(value: string) {
 function buildPdfFilename(scan: ScanRecord) {
   const stamp = new Date(scan.updatedAt).toISOString().slice(0, 10);
   return `${sanitizeFilename(scan.targetHostname)}-${stamp}.pdf`;
+}
+
+function formatScorePercent(score: number | null) {
+  return score === null ? "--" : `${formatScore(score)}%`;
+}
+
+function summarizeFindingCounts(findings: ScanFinding[]) {
+  return findings.reduce(
+    (summary, finding) => {
+      const status = deriveFindingStatus(finding);
+      if (status === "pass" || status === "info") {
+        summary.passCount += 1;
+      } else {
+        summary.failCount += 1;
+      }
+      return summary;
+    },
+    {
+      passCount: 0,
+      failCount: 0,
+    },
+  );
 }
 
 function findingAccentTone(finding: ScanFinding) {
@@ -305,26 +332,81 @@ async function downloadReportPdf(
 
     cursorY += gapAfter;
   };
+  const compactPdfValue = (value: unknown, maxLength = 130) => {
+    if (value === null || value === undefined || value === "") {
+      return "";
+    }
+
+    const raw =
+      typeof value === "string" || typeof value === "number" || typeof value === "boolean"
+        ? String(value)
+        : JSON.stringify(value);
+    const compact = raw.replace(/\s+/g, " ").trim();
+    return compact.length > maxLength ? `${compact.slice(0, maxLength - 1).trimEnd()}...` : compact;
+  };
+  const evidenceLinesForPdf = (finding: ScanFinding) => {
+    if (finding.locked) {
+      return [];
+    }
+
+    const evidence = finding.evidence ?? {};
+    const lines = [
+      typeof evidence.summary === "string" ? `Proof: ${evidence.summary}` : "",
+      Array.isArray(evidence.probePayloads)
+        ? `Payloads: ${evidence.probePayloads.map((payload) => compactPdfValue(payload, 42)).filter(Boolean).join(", ")}`
+        : typeof evidence.probePayload === "string"
+          ? `Payload: ${compactPdfValue(evidence.probePayload, 80)}`
+          : "",
+    ].filter(Boolean);
+
+    const resultItems = Array.isArray(evidence.results)
+      ? evidence.results.slice(0, 3)
+      : Array.isArray(evidence.activeProbes)
+        ? evidence.activeProbes.slice(0, 3)
+        : [];
+    resultItems.forEach((item, index) => {
+      if (!item || typeof item !== "object") {
+        return;
+      }
+
+      const row = item as Record<string, unknown>;
+      const proofParts = [
+        compactPdfValue(row.parameter ? `param=${row.parameter}` : row.mutatedUrl ? `mutated=${row.mutatedUrl}` : "", 90),
+        compactPdfValue(row.status ? `status=${row.status}` : "", 30),
+        row.sqlError ? "sql-error=true" : "",
+        row.recordExpansion ? "record-expansion=true" : "",
+        row.context ? compactPdfValue(`context=${row.context}`, 50) : "",
+      ].filter(Boolean);
+      lines.push(`Result ${index + 1}: ${proofParts.join(", ") || compactPdfValue(row, 120)}`);
+    });
+
+    if (typeof evidence.checkedUrl === "string" && lines.length < 4) {
+      lines.push(`Checked: ${compactPdfValue(evidence.checkedUrl, 160)}`);
+    }
+
+    return lines.slice(0, 5);
+  };
 
   const drawMetricCard = ({
     x,
     label,
-    value,
     score,
+    passCount,
+    failCount,
   }: {
     x: number;
     label: string;
-    value: string;
     score: number | null;
+    passCount: number;
+    failCount: number;
   }) => {
     const cardWidth = (contentWidth - 24) / 4;
     const y = cursorY;
     const tone = colorFromHex(getScoreTone(score));
-    const progressWidth = Math.max(0, Math.min(1, (score ?? 0) / 100)) * (cardWidth - 28);
 
     doc.setFillColor(...palette.white);
     doc.setDrawColor(...palette.border);
-    doc.roundedRect(x, y, cardWidth, 72, 16, 16, "FD");
+    doc.roundedRect(x, y, cardWidth, 90, 16, 16, "FD");
 
     doc.setFont("helvetica", "bold");
     doc.setFontSize(9);
@@ -332,17 +414,27 @@ async function downloadReportPdf(
     doc.text(label.toUpperCase(), x + 14, y + 22);
 
     doc.setFont("helvetica", "bold");
-    doc.setFontSize(24);
-    doc.setTextColor(...tone);
-    doc.text(value, x + 14, y + 52);
+    doc.setFontSize(18);
+    doc.setTextColor(6, 95, 70);
+    doc.text(String(passCount), x + 14, y + 50);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(...palette.muted);
+    doc.text("PASSED", x + 14, y + 64);
 
-    doc.setDrawColor(...palette.border);
-    doc.setLineWidth(3);
-    doc.line(x + 14, y + 60, x + cardWidth - 14, y + 60);
-    if (progressWidth > 0) {
-      doc.setDrawColor(...tone);
-      doc.line(x + 14, y + 60, x + 14 + progressWidth, y + 60);
-    }
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(18);
+    doc.setTextColor(185, 28, 28);
+    doc.text(String(failCount), x + cardWidth / 2 + 6, y + 50);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(...palette.muted);
+    doc.text("FAILED", x + cardWidth / 2 + 6, y + 64);
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(9);
+    doc.setTextColor(...tone);
+    doc.text(`SCORE ${formatScorePercent(score)}`, x + 14, y + 80);
   };
 
   const drawFindingCard = (finding: ScanFinding) => {
@@ -378,10 +470,14 @@ async function downloadReportPdf(
     const recommendationLines = finding.locked
       ? []
       : splitLines(finding.recommendation, 10, detailPanelTextWidth);
+    const evidenceLines = evidenceLinesForPdf(finding).flatMap((line) =>
+      splitLines(line, 9, innerWidth - 28),
+    );
     const titleHeight = titleLines.length * lineHeightFor(16);
     const summaryHeight = summaryLines.length * lineHeightFor(11);
     const whyHeight = whyLines.length * lineHeightFor(10);
     const recommendationHeight = recommendationLines.length * lineHeightFor(10);
+    const evidenceHeight = evidenceLines.length * lineHeightFor(9);
     const headerHeight = Math.max(titleHeight, chipHeight);
     const panelHeadingHeight = lineHeightFor(9);
     const whyPanelHeight = 14 + panelHeadingHeight + 6 + whyHeight + 14;
@@ -391,6 +487,9 @@ async function downloadReportPdf(
     const detailPanelsHeight = finding.locked
       ? whyPanelHeight
       : Math.max(whyPanelHeight, recommendationPanelHeight);
+    const evidencePanelHeight = evidenceLines.length
+      ? 12 + panelHeadingHeight + 6 + evidenceHeight + 12
+      : 0;
     const cardHeight =
       18 +
       headerHeight +
@@ -399,6 +498,7 @@ async function downloadReportPdf(
       summaryHeight +
       16 +
       detailPanelsHeight +
+      (evidencePanelHeight ? 12 + evidencePanelHeight : 0) +
       18;
 
     if (cursorY !== marginY) {
@@ -513,17 +613,43 @@ async function downloadReportPdf(
       });
     }
 
+    if (evidenceLines.length > 0) {
+      let evidenceY = detailStartY + detailPanelsHeight + 12;
+      doc.setFillColor(...palette.surface);
+      doc.setDrawColor(...palette.border);
+      doc.roundedRect(innerX, evidenceY, innerWidth, evidencePanelHeight, 14, 14, "FD");
+      evidenceY += 12;
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(9);
+      doc.setTextColor(...palette.primary);
+      doc.text("EVIDENCE", innerX + 14, evidenceY);
+      evidenceY += panelHeadingHeight + 6;
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      doc.setTextColor(...palette.ink);
+      evidenceLines.forEach((line) => {
+        doc.text(line, innerX + 14, evidenceY);
+        evidenceY += lineHeightFor(9);
+      });
+    }
+
     cursorY += cardHeight + 12;
   };
 
-  const headerBadgeRadius = 30;
+  const pdfAllFindings = categoryKeys.flatMap((category) => findings[category]);
+  const pdfOverallCounts = summarizeFindingCounts(pdfAllFindings);
+  const pdfCategoryCounts = Object.fromEntries(
+    categoryKeys.map((category) => [category, summarizeFindingCounts(findings[category])]),
+  ) as Record<CategoryKey, ReturnType<typeof summarizeFindingCounts>>;
+
+  const headerBadgeRadius = 34;
   const headerRightX = pageWidth - marginX - 68;
   const headerBadgeCenterY = marginY + 40;
 
   doc.setFont("helvetica", "bold");
   doc.setFontSize(10);
   doc.setTextColor(...palette.primary);
-  doc.text("CYBERAUDIT FULL REPORT", marginX, cursorY);
+  doc.text("FIXNX FULL REPORT", marginX, cursorY);
 
   cursorY += 24;
   doc.setFont("helvetica", "bold");
@@ -556,43 +682,47 @@ async function downloadReportPdf(
   doc.setLineWidth(6);
   doc.circle(headerRightX, headerBadgeCenterY, headerBadgeRadius, "S");
   doc.setFont("helvetica", "bold");
-  doc.setFontSize(24);
+  doc.setFontSize(22);
   doc.setTextColor(...overallTone);
-  doc.text(formatScore(scan.overallScore), headerRightX, headerBadgeCenterY + 4, {
+  doc.text(formatScorePercent(scan.overallScore), headerRightX, headerBadgeCenterY + 2, {
     align: "center",
   });
   doc.setFont("helvetica", "bold");
   doc.setFontSize(7);
   doc.setTextColor(...palette.muted);
-  doc.text("OVERALL", headerRightX, headerBadgeCenterY + 16, { align: "center" });
+  doc.text("OVERALL", headerRightX, headerBadgeCenterY + 17, { align: "center" });
 
-  ensureSpace(84);
+  ensureSpace(104);
   const metricWidth = (contentWidth - 24) / 4;
   drawMetricCard({
     x: marginX,
-    label: "Overall Score",
-    value: formatScore(scan.overallScore),
+    label: "Overall",
     score: scan.overallScore,
+    passCount: pdfOverallCounts.passCount,
+    failCount: pdfOverallCounts.failCount,
   });
   drawMetricCard({
     x: marginX + metricWidth + 8,
     label: "Security",
-    value: formatScore(scan.securityScore),
     score: scan.securityScore,
+    passCount: pdfCategoryCounts.security.passCount,
+    failCount: pdfCategoryCounts.security.failCount,
   });
   drawMetricCard({
     x: marginX + (metricWidth + 8) * 2,
     label: "SEO",
-    value: formatScore(scan.seoScore),
     score: scan.seoScore,
+    passCount: pdfCategoryCounts.seo.passCount,
+    failCount: pdfCategoryCounts.seo.failCount,
   });
   drawMetricCard({
     x: marginX + (metricWidth + 8) * 3,
     label: "Performance",
-    value: formatScore(scan.performanceScore),
     score: scan.performanceScore,
+    passCount: pdfCategoryCounts.performance.passCount,
+    failCount: pdfCategoryCounts.performance.failCount,
   });
-  cursorY += 96;
+  cursorY += 114;
 
   categoryKeys.forEach((category) => {
     ensureSpace(40);
@@ -708,6 +838,10 @@ export function ResultsClient({ scanId }: { scanId: string }) {
   const [quota, setQuota] = useState<ScanQuotaSummary | null>(null);
   const [paypalOpen, setPaypalOpen] = useState(false);
   const [displayProgress, setDisplayProgress] = useState(0);
+  const [progressSession, setProgressSession] = useState<ProgressSessionState>({
+    scanId: null,
+    sawLiveState: false,
+  });
 
   const requestedTab = (searchParams.get("tab") as CategoryKey | null) ?? "security";
   const activeTab = categoryKeys.includes(requestedTab) ? requestedTab : "security";
@@ -749,46 +883,125 @@ export function ResultsClient({ scanId }: { scanId: string }) {
 
   const scan = state.scan;
   const progressTarget = scan ? Math.max(0, Math.min(100, scan.progress)) : 0;
-  const shouldAnimateProgress = scan ? scan.status === "queued" || scan.status === "running" : false;
+  const allResultsReady = scan
+    ? categoryKeys.every((category) => {
+        const snapshot = scan.categoryStatus[category];
+        const statusIsFinal = snapshot.status === "completed" || snapshot.status === "failed";
+        const findingsAreLoaded =
+          snapshot.status !== "completed" ||
+          state.findings[category].length >= snapshot.findingCount;
 
-  useEffect(() => {
-    setDisplayProgress(0);
-  }, [scanId]);
+        return statusIsFinal && findingsAreLoaded;
+      })
+    : false;
+  const displayProgressCap = allResultsReady ? 100 : 99;
+  const progressTargetForDisplay = allResultsReady ? 100 : Math.min(progressTarget, 99);
+  const isLiveProgressState = scan ? !allResultsReady : false;
+  const isFinishedProgressState = allResultsReady;
+  const isNewProgressSession = scan ? progressSession.scanId !== scan.id : false;
+  const openedFinishedScan = scan
+    ? isFinishedProgressState && (isNewProgressSession || !progressSession.sawLiveState)
+    : false;
+  const visibleProgress = scan
+    ? openedFinishedScan
+      ? 100
+      : isNewProgressSession
+        ? Math.min(progressTargetForDisplay, 15)
+        : Math.min(displayProgress, displayProgressCap)
+    : displayProgress;
+  const showCompletionAnimation = allResultsReady && visibleProgress >= 100;
 
   useEffect(() => {
     if (!scan) {
       return;
     }
 
-    if (!shouldAnimateProgress) {
-      setDisplayProgress(progressTarget);
+    if (progressSession.scanId !== scan.id) {
+      const initialProgress = isFinishedProgressState ? 100 : Math.min(progressTargetForDisplay, 15);
+      const timer = window.setTimeout(() => {
+        setProgressSession({
+          scanId: scan.id,
+          sawLiveState: isLiveProgressState,
+        });
+        setDisplayProgress(initialProgress);
+      }, 0);
+
+      return () => {
+        window.clearTimeout(timer);
+      };
+    }
+
+    if (isLiveProgressState && !progressSession.sawLiveState) {
+      const timer = window.setTimeout(() => {
+        setProgressSession((current) =>
+          current.scanId === scan.id ? { ...current, sawLiveState: true } : current,
+        );
+      }, 0);
+
+      return () => {
+        window.clearTimeout(timer);
+      };
+    }
+  }, [
+    isFinishedProgressState,
+    isLiveProgressState,
+    progressSession.scanId,
+    progressSession.sawLiveState,
+    progressTargetForDisplay,
+    scan,
+  ]);
+
+  useEffect(() => {
+    if (!scan) {
       return;
     }
 
-    if (displayProgress > progressTarget) {
-      setDisplayProgress(progressTarget);
+    const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const openedCompletedReport =
+      isFinishedProgressState && !progressSession.sawLiveState;
+
+    if (openedCompletedReport || prefersReducedMotion) {
+      const immediateProgress = isFinishedProgressState ? 100 : progressTargetForDisplay;
+      const timer = window.setTimeout(() => {
+        setDisplayProgress(immediateProgress);
+      }, 0);
+
+      return () => {
+        window.clearTimeout(timer);
+      };
+    }
+
+    if (displayProgress >= displayProgressCap) {
       return;
     }
 
-    if (displayProgress === progressTarget) {
-      return;
-    }
-
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-      setDisplayProgress(progressTarget);
-      return;
-    }
-
-    const remaining = progressTarget - displayProgress;
-    const delay = remaining > 40 ? 16 : remaining > 15 ? 24 : 36;
+    const delay = displayProgress < 70 ? 85 : displayProgress < 90 ? 145 : 220;
     const timer = window.setTimeout(() => {
-      setDisplayProgress((current) => Math.min(current + 1, progressTarget));
+      setDisplayProgress((current) => {
+        if (progressSession.scanId !== scan.id) {
+          return current;
+        }
+
+        if (isFinishedProgressState) {
+          return Math.min(100, current + 1);
+        }
+
+        return Math.min(99, current + 1);
+      });
     }, delay);
 
     return () => {
       window.clearTimeout(timer);
     };
-  }, [displayProgress, progressTarget, scan, shouldAnimateProgress]);
+  }, [
+    displayProgress,
+    displayProgressCap,
+    isFinishedProgressState,
+    progressSession.scanId,
+    progressSession.sawLiveState,
+    progressTargetForDisplay,
+    scan,
+  ]);
 
   const categoryCards = useMemo(
     () =>
@@ -796,10 +1009,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
         const snapshot = scan?.categoryStatus[category];
         const findings = state.findings[category];
         const count = snapshot?.findingCount ?? findings.length;
-        const passCount = findings.filter((finding) => {
-          const status = deriveFindingStatus(finding);
-          return status === "pass" || status === "info";
-        }).length;
+        const { passCount, failCount } = summarizeFindingCounts(findings);
         const score =
           category === "security"
             ? scan?.securityScore ?? null
@@ -812,7 +1022,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
           status: snapshot?.status ?? "queued",
           count,
           passCount,
-          failCount: Math.max(count - passCount, 0),
+          failCount,
           score,
         };
       }),
@@ -837,6 +1047,23 @@ export function ResultsClient({ scanId }: { scanId: string }) {
     () => allFindings.filter((finding) => deriveFindingStatus(finding) === "fail").length,
     [allFindings],
   );
+  const overallCounts = useMemo(() => summarizeFindingCounts(allFindings), [allFindings]);
+  const reportMetricCards = [
+    {
+      label: "Overall",
+      score: scan?.overallScore ?? null,
+      count: allFindings.length,
+      passCount: overallCounts.passCount,
+      failCount: overallCounts.failCount,
+    },
+    ...categoryCards.map((item) => ({
+      label: titleCaseCategory(item.category),
+      score: item.score,
+      count: item.count,
+      passCount: item.passCount,
+      failCount: item.failCount,
+    })),
+  ];
 
   const handleChangeTab = (tab: CategoryKey) => {
     const nextParams = new URLSearchParams(searchParams.toString());
@@ -959,7 +1186,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
       <div className="mx-auto flex max-w-[1440px] pt-16">
         <aside className="soft-scrollbar sticky top-16 hidden h-[calc(100vh-64px)] w-72 shrink-0 flex-col overflow-y-auto border-r border-white/20 bg-white/40 px-6 py-8 shadow-[10px_0_40px_rgba(0,0,0,0.02)] backdrop-blur-[30px] lg:flex">
           <div className="mb-8">
-            <h3 className="text-lg font-black text-blue-600">CyberAudit</h3>
+            <h3 className="text-lg font-black text-blue-600">fixnx</h3>
             <p className="mt-1 text-xs font-medium text-slate-500">
               Live website scan workspace
             </p>
@@ -1061,9 +1288,16 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                     </p>
                   </div>
                   <div className="text-right">
-                    <span className="text-3xl font-semibold text-[var(--primary)]">
-                      {displayProgress}%
-                    </span>
+                    <div className="flex items-center justify-end gap-2">
+                      {showCompletionAnimation ? (
+                        <span className="scan-complete-check inline-flex h-7 w-7 items-center justify-center rounded-full bg-emerald-50 text-emerald-600 ring-1 ring-emerald-200">
+                          <CheckCircle2 className="h-4 w-4" />
+                        </span>
+                      ) : null}
+                      <span className="text-3xl font-semibold text-[var(--primary)]">
+                        {visibleProgress}%
+                      </span>
+                    </div>
                     <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
                       Audited
                     </p>
@@ -1074,8 +1308,9 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                     className={cn(
                       "progress-stripes h-full rounded-full bg-[var(--primary)] shadow-[0_0_20px_rgba(0,88,188,0.35)] transition-all duration-700",
                       scan.status === "completed" && "after:hidden",
+                      showCompletionAnimation && "completion-bar-finish",
                     )}
-                    style={{ width: `${displayProgress}%` }}
+                    style={{ width: `${visibleProgress}%` }}
                   />
                 </div>
                 <p className="mt-4 text-sm text-slate-500">
@@ -1083,19 +1318,19 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                 </p>
                 <div className="mt-6 grid gap-3 md:grid-cols-3">
                   {categoryCards.map((item) => (
-                    <div key={item.category} className="rounded-[1.3rem] bg-white/55 px-4 py-4">
+                    <div key={item.category} className="rounded-[1.3rem] bg-white/55 p-4">
                       <div className="flex items-center justify-between gap-3">
-                        <div>
-                          <p className="text-xs font-bold uppercase tracking-[0.18em] text-slate-400">
+                        <div className="min-w-0">
+                          <p className="text-xs font-bold uppercase text-slate-500">
                             {titleCaseCategory(item.category)}
                           </p>
-                          <p className="mt-2 text-lg font-semibold text-slate-900">
-                            {formatScore(item.score)}
+                          <p className="mt-1 text-xs font-semibold text-slate-500">
+                            Score {formatScorePercent(item.score)}
                           </p>
                         </div>
                         <span
                           className={cn(
-                            "rounded-full px-3 py-1 text-[10px] font-bold uppercase tracking-[0.16em]",
+                            "shrink-0 rounded-full px-3 py-1 text-[10px] font-bold uppercase",
                             item.status === "completed" && "bg-emerald-50 text-emerald-700",
                             item.status === "running" && "bg-blue-50 text-blue-700",
                             item.status === "failed" && "bg-red-50 text-red-700",
@@ -1105,23 +1340,25 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                           {item.status}
                         </span>
                       </div>
-                      <p className="mt-2 text-xs text-slate-500">{item.count} checks</p>
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-700">
-                          {item.passCount} passed
-                        </span>
-                        <span className="rounded-full bg-rose-50 px-2.5 py-1 text-[11px] font-semibold text-rose-700">
-                          {item.failCount} failed
-                        </span>
+                      <div className="mt-4 grid grid-cols-2 gap-2">
+                        <div className="rounded-[1rem] bg-emerald-50 px-3 py-2">
+                          <p className="text-lg font-bold text-emerald-700">{item.passCount}</p>
+                          <p className="text-[11px] font-semibold text-emerald-700">passed</p>
+                        </div>
+                        <div className="rounded-[1rem] bg-rose-50 px-3 py-2">
+                          <p className="text-lg font-bold text-rose-700">{item.failCount}</p>
+                          <p className="text-[11px] font-semibold text-rose-700">failed</p>
+                        </div>
                       </div>
+                      <p className="mt-3 text-xs text-slate-500">{item.count} total checks</p>
                     </div>
                   ))}
                 </div>
               </div>
 
-              <div className="glass-panel flex flex-col items-center justify-center rounded-[2rem] bg-white/70 p-6">
+              <div className="glass-panel flex flex-col items-center justify-center rounded-[2rem] bg-white/70 p-5 sm:p-6">
                 <div
-                  className="score-ring-modern h-40 w-40"
+                  className="score-ring-modern h-36 w-36 sm:h-40 sm:w-40"
                   style={
                     {
                       "--score": scan.overallScore ?? scan.progress,
@@ -1130,17 +1367,27 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                   }
                 >
                   <div className="relative z-10 flex flex-col items-center">
-                    <span className="text-5xl font-semibold text-slate-900">
-                      {formatScore(scan.overallScore ?? null)}
+                    <span className="text-4xl font-semibold text-slate-900 sm:text-5xl">
+                      {formatScorePercent(scan.overallScore ?? null)}
                     </span>
-                    <span className="mt-2 text-xs font-semibold uppercase tracking-[0.24em] text-slate-400">
-                      Overall score
+                    <span className="mt-1 text-xs font-semibold uppercase text-slate-400">
+                      Overall
                     </span>
                   </div>
                 </div>
                 <p className="mt-5 text-sm text-slate-500">
                   Updated {formatRelative(scan.updatedAt)}
                 </p>
+                <div className="mt-4 grid w-full grid-cols-2 gap-2 text-center">
+                  <div className="rounded-[1rem] bg-emerald-50 px-3 py-2">
+                    <p className="text-base font-bold text-emerald-700">{overallCounts.passCount}</p>
+                    <p className="text-[11px] font-semibold text-emerald-700">passed</p>
+                  </div>
+                  <div className="rounded-[1rem] bg-rose-50 px-3 py-2">
+                    <p className="text-base font-bold text-rose-700">{overallCounts.failCount}</p>
+                    <p className="text-[11px] font-semibold text-rose-700">failed</p>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -1163,11 +1410,11 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                 </button>
               ))}
             </div>
-            <div className="flex flex-wrap items-center gap-3">
+            <div className="grid w-full grid-cols-2 gap-3 sm:flex sm:w-auto sm:flex-wrap sm:items-center">
               <button
                 type="button"
                 onClick={() => setReportOpen(true)}
-                className="inline-flex items-center gap-2 rounded-full border border-white/50 bg-white px-6 py-3 text-sm font-semibold text-slate-700 shadow-sm transition-all hover:shadow-md"
+                className="inline-flex min-w-0 items-center justify-center gap-2 rounded-full border border-white/50 bg-white px-3 py-3 text-xs font-semibold text-slate-700 shadow-sm transition-all hover:shadow-md sm:px-6 sm:text-sm"
               >
                 <FileText className="h-4 w-4 text-[var(--primary)]" />
                 Full Report
@@ -1176,7 +1423,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                 type="button"
                 onClick={() => void handleContinueWithGoogle()}
                 disabled={actionPending || state.viewerCanAccessFixes || !isConfigured}
-                className="inline-flex items-center gap-2 rounded-full border border-white/50 bg-white px-6 py-3 text-sm font-semibold text-slate-700 shadow-sm transition-all hover:shadow-md disabled:cursor-not-allowed disabled:opacity-60"
+                className="inline-flex min-w-0 items-center justify-center gap-2 rounded-full border border-white/50 bg-white px-3 py-3 text-xs font-semibold text-slate-700 shadow-sm transition-all hover:shadow-md disabled:cursor-not-allowed disabled:opacity-60 sm:px-6 sm:text-sm"
               >
                 <Wrench className="h-4 w-4 text-[var(--primary)]" />
                 {!isConfigured
@@ -1237,27 +1484,27 @@ export function ResultsClient({ scanId }: { scanId: string }) {
       {reportOpen && scan ? (
         <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/45 px-4 py-8 backdrop-blur-[6px]">
           <div className="relative flex h-[min(860px,92vh)] w-full max-w-[1140px] flex-col overflow-hidden rounded-[2.2rem] border border-white/60 bg-[linear-gradient(180deg,rgba(255,255,255,0.98),rgba(248,250,252,0.96))] shadow-[0_30px_120px_rgba(15,23,42,0.24)]">
-            <div className="flex items-start justify-between gap-4 border-b border-slate-200/80 bg-white/75 px-6 py-5 backdrop-blur-xl">
+            <div className="flex flex-col gap-4 border-b border-slate-200/80 bg-white/75 px-5 py-5 backdrop-blur-xl sm:flex-row sm:items-start sm:justify-between sm:px-6">
               <div>
-                <p className="text-xs font-bold uppercase tracking-[0.22em] text-[var(--primary)]">
+                <p className="text-xs font-bold uppercase text-[var(--primary)]">
                   Full Report
                 </p>
-                <h2 className="mt-2 text-3xl font-semibold tracking-[-0.03em] text-slate-900">
+                <h2 className="mt-2 break-words text-2xl font-semibold text-slate-900 sm:text-3xl">
                   {scan.targetHostname}
                 </h2>
                 <div className="mt-3 flex flex-wrap items-center gap-2">
                   {criticalIssueCount > 0 ? (
-                    <span className="rounded-full border border-red-200 bg-red-50 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.14em] text-red-700">
+                    <span className="rounded-full border border-red-200 bg-red-50 px-3 py-1 text-[10px] font-bold uppercase text-red-700">
                       {criticalIssueCount} Critical Issues Found
                     </span>
                   ) : null}
                   {failingIssueCount > 0 && criticalIssueCount === 0 ? (
-                    <span className="rounded-full border border-rose-200 bg-rose-50 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.14em] text-rose-700">
+                    <span className="rounded-full border border-rose-200 bg-rose-50 px-3 py-1 text-[10px] font-bold uppercase text-rose-700">
                       {failingIssueCount} Failing Checks
                     </span>
                   ) : null}
                   {warningIssueCount > 0 ? (
-                    <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.14em] text-amber-700">
+                    <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-[10px] font-bold uppercase text-amber-700">
                       {warningIssueCount} Warnings
                     </span>
                   ) : null}
@@ -1266,12 +1513,12 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                   Updated {formatRelative(scan.updatedAt)} • {scan.status}
                 </p>
               </div>
-              <div className="flex items-center gap-3">
+              <div className="flex w-full items-center justify-between gap-3 sm:w-auto sm:justify-end">
                 <button
                   type="button"
                   onClick={handleDownloadPdf}
                   disabled={downloadPending}
-                  className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-5 py-2.5 text-sm font-semibold text-slate-800 shadow-sm transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                  className="inline-flex min-w-0 flex-1 items-center justify-center gap-2 rounded-full border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-800 shadow-sm transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 sm:flex-none sm:px-5"
                 >
                   <Download className="h-4 w-4 text-[var(--primary)]" />
                   {downloadPending ? "Preparing PDF..." : "Download PDF"}
@@ -1288,58 +1535,38 @@ export function ResultsClient({ scanId }: { scanId: string }) {
 
             <div className="overflow-y-auto px-6 py-6">
               <div className="rounded-[2rem] border border-white/70 bg-[linear-gradient(180deg,rgba(255,255,255,0.95),rgba(244,247,255,0.88))] p-5 shadow-[0_12px_48px_rgba(15,23,42,0.06)]">
-                <div className="grid gap-4 md:grid-cols-4">
-                  {[
-                    {
-                      label: "Overall Score",
-                      value: scan.overallScore,
-                      countLabel:
-                        criticalIssueCount > 0
-                          ? `${criticalIssueCount} critical issues`
-                          : `${failingIssueCount} failing checks`,
-                    },
-                    {
-                      label: "Security",
-                      value: scan.securityScore,
-                      countLabel: `${state.findings.security.length} checks`,
-                    },
-                    {
-                      label: "SEO",
-                      value: scan.seoScore,
-                      countLabel: `${state.findings.seo.length} checks`,
-                    },
-                    {
-                      label: "Performance",
-                      value: scan.performanceScore,
-                      countLabel: `${state.findings.performance.length} checks`,
-                    },
-                  ].map((metric) => (
+                <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                  {reportMetricCards.map((metric) => (
                     <div
                       key={`report-metric-${metric.label}`}
                       className="rounded-[1.5rem] border border-white/80 bg-white/80 p-4 shadow-[0_10px_28px_rgba(148,163,184,0.08)]"
                     >
-                      <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-slate-400">
+                      <p className="text-[11px] font-bold uppercase text-slate-500">
                         {metric.label}
                       </p>
-                      <div className="mt-3 flex items-end gap-2">
-                        <p
-                          className="text-4xl font-semibold tracking-[-0.03em]"
-                          style={{ color: getScoreTone(metric.value) }}
-                        >
-                          {formatScore(metric.value)}
-                        </p>
-                        <span className="pb-1 text-xs font-semibold text-slate-400">/100</span>
+                      <div className="mt-3 grid grid-cols-2 gap-2">
+                        <div className="rounded-[1rem] bg-emerald-50 px-3 py-2">
+                          <p className="text-2xl font-bold text-emerald-700">{metric.passCount}</p>
+                          <p className="text-[11px] font-semibold text-emerald-700">passed</p>
+                        </div>
+                        <div className="rounded-[1rem] bg-rose-50 px-3 py-2">
+                          <p className="text-2xl font-bold text-rose-700">{metric.failCount}</p>
+                          <p className="text-[11px] font-semibold text-rose-700">failed</p>
+                        </div>
                       </div>
+                      <p className="mt-3 text-sm font-semibold" style={{ color: getScoreTone(metric.score) }}>
+                        Score {formatScorePercent(metric.score)}
+                      </p>
                       <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-slate-200">
                         <div
                           className="h-full rounded-full"
                           style={{
-                            width: `${Math.max(0, Math.min(100, metric.value ?? 0))}%`,
-                            backgroundColor: getScoreTone(metric.value),
+                            width: `${Math.max(0, Math.min(100, metric.score ?? 0))}%`,
+                            backgroundColor: getScoreTone(metric.score),
                           }}
                         />
                       </div>
-                      <p className="mt-3 text-xs font-medium text-slate-500">{metric.countLabel}</p>
+                      <p className="mt-3 text-xs font-medium text-slate-500">{metric.count} total checks</p>
                     </div>
                   ))}
                 </div>

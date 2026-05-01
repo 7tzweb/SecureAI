@@ -140,7 +140,7 @@ async function safeFetchInternal(
   const headers = new Headers(init.headers);
   headers.set(
     "user-agent",
-    "CyberAudit/1.0 (+https://example.invalid/cyberaudit)",
+    "fixnx/1.0 (+https://example.invalid/cyberaudit)",
   );
   headers.set(
     "accept",

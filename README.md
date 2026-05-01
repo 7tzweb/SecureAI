@@ -1,6 +1,6 @@
-# CyberAudit
+# fixnx
 
-CyberAudit is a production-oriented Next.js application for website auditing across security, SEO, and performance. It creates scans immediately, processes categories asynchronously, streams partial results to the report page, keeps fix details behind Google sign-in, and enforces 3 free scans per signed-in account with optional 30-scan PayPal credit packs.
+fixnx is a production-oriented Next.js application for website auditing across security, SEO, and performance. It creates scans immediately, processes categories asynchronously, streams partial results to the report page, keeps fix details behind Google sign-in, and enforces 3 free scans per signed-in account with optional 30-scan PayPal credit packs.
 
 ## Stack
 

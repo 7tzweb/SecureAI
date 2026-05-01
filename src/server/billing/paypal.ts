@@ -238,7 +238,7 @@ export async function createPayPalScanCreditOrder(
       purchase_units: [
         {
           custom_id: userId,
-          description: `${requestedCredits} CyberAudit scan credits`,
+          description: `${requestedCredits} fixnx scan credits`,
           amount: {
             currency_code: "USD",
             value: price,
@@ -251,7 +251,7 @@ export async function createPayPalScanCreditOrder(
           },
           items: [
             {
-              name: "CyberAudit scan credit",
+              name: "fixnx scan credit",
               quantity: String(requestedCredits),
               unit_amount: {
                 currency_code: "USD",

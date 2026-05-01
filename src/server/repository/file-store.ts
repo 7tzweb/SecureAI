@@ -197,6 +197,15 @@ export function createFileRepository(): Repository {
       });
     },
 
+    async countAnonymousScans(anonymousClientId) {
+      return withStoreLock(async () => {
+        const store = await readStore();
+        return Object.values(store.scans).filter(
+          (scan) => scan.anonymousClientId === anonymousClientId,
+        ).length;
+      });
+    },
+
     async listRecentScans(limit = 8) {
       return withStoreLock(async () => {
         const store = await readStore();

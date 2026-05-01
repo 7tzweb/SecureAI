@@ -103,7 +103,7 @@ async function fetchBinarySample(url: string, maxBytes = 64_000) {
     const timeout = setTimeout(() => controller.abort(), 8_000);
     const response = await fetch(url, {
       headers: {
-        "user-agent": "CyberAudit/1.0 (+https://example.invalid/cyberaudit)",
+        "user-agent": "fixnx/1.0 (+https://example.invalid/cyberaudit)",
         range: `bytes=0-${maxBytes - 1}`,
       },
       redirect: "follow",
@@ -224,7 +224,7 @@ export async function runPerformanceScan(
   const primaryAttempt = artifacts.context.primary;
   const primaryPage = artifacts.primaryPage;
 
-  if (primaryAttempt && isLikelyEdgeInterstitial(primaryAttempt)) {
+  if (primaryAttempt && isLikelyEdgeInterstitial(primaryAttempt) && !artifacts.browserInspection.rendered) {
     const findings = limitedPerformanceChecks.map(([checkKey, title]) =>
       buildPerformanceCheck({
         checkKey,
@@ -354,7 +354,9 @@ export async function runPerformanceScan(
       evidence: {
         checkedUrl: primaryPage.url,
         expectedLocation: "HTML-discovered scripts, stylesheets, images, iframes, and forms",
-        summary: "Counted from the primary page markup without executing client-side JavaScript.",
+        summary: artifacts.browserInspection.rendered
+          ? "Counted from the browser-rendered DOM and captured network resources."
+          : "Counted from the primary page markup without executing client-side JavaScript.",
         requestCount,
       },
     }),
@@ -399,7 +401,9 @@ export async function runPerformanceScan(
       evidence: {
         checkedUrl: primaryPage.url,
         expectedLocation: "script[src] resources from the initial HTML",
-        summary: "Calculated from sampled script asset sizes exposed by the server.",
+        summary: artifacts.browserInspection.rendered
+          ? "Calculated from browser-discovered script resources and sampled response sizes."
+          : "Calculated from sampled script asset sizes exposed by the server.",
         totalJsBytes,
         scriptCount: scripts.length,
       },

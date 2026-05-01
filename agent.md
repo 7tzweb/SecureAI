@@ -9,7 +9,7 @@ Historical detail belongs in the archive under `docs/archive/`.
 
 ## Product
 
-CyberAudit is a Next.js web app that scans a public website and shows a live audit across:
+fixnx is a Next.js web app that scans a public website and shows a live audit across:
 
 - Security
 - SEO

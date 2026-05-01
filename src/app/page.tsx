@@ -102,14 +102,14 @@ export default function HomePage() {
               </div>
             </div>
 
-            <div className="glass-panel rounded-[2rem] border-none bg-[var(--primary)] p-8 text-white md:col-span-4">
-              <SearchCode className="mb-8 h-10 w-10" />
-              <h3 className="text-2xl font-semibold tracking-[-0.02em]">Security Insights</h3>
-              <p className="mt-3 text-sm leading-7 text-white/80">
-                AI-shaped summaries point to missing headers, exposed assets, indexing gaps, and performance regressions before they turn costly.
+            <div className="glass-panel rounded-[2rem] p-8 md:col-span-4">
+              <SearchCode className="mb-8 h-10 w-10 text-[var(--primary)]" />
+              <h3 className="text-2xl font-semibold tracking-[-0.02em] text-slate-950">100+ checks in seconds</h3>
+              <p className="mt-3 text-sm leading-7 text-slate-600">
+                fixnx runs more than 100 website checks in seconds across security, SEO, speed, headers, cookies, metadata, and heavy assets.
               </p>
-              <button className="mt-10 rounded-full bg-white/20 px-5 py-3 text-sm font-semibold backdrop-blur-md transition-all hover:bg-white/30">
-                Explore trends
+              <button className="mt-10 rounded-full bg-[var(--primary)] px-5 py-3 text-sm font-semibold !text-white shadow-sm transition-all hover:bg-[#004ca1]">
+                Run site checks
               </button>
             </div>
 

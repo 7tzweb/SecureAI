@@ -5,6 +5,7 @@ import {
   type PageFormSnapshot,
   type PageResource,
   getPrimaryOrigin,
+  getConfiguredAuthCookieHeader,
   loadAuditArtifacts,
 } from "@/server/scans/artifacts";
 import {
@@ -158,6 +159,21 @@ function looksLikeSensitiveApiPayload(bodyText: string) {
   return /"(?:email|token|accessToken|session|userId|invoice|account|customerId)"\s*:/i.test(bodyText);
 }
 
+function looksLikeAuthSuccessResponse(attempt: HttpAttempt) {
+  const tokenLikeResponse =
+    attempt.status >= 200 &&
+    attempt.status < 300 &&
+    (/"(?:authentication|token|accessToken|refreshToken|id_token|jwt)"\s*:\s*"[^"]{12,}"/i.test(attempt.bodyText) ||
+      /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9._-]{10,}\b/.test(attempt.bodyText));
+  const sessionCookie = attempt.setCookies.some((cookie) => isSensitiveCookie(cookieName(cookie)));
+
+  return {
+    authSuccess: tokenLikeResponse || (attempt.status < 400 && sessionCookie),
+    tokenLikeResponse,
+    sessionCookie,
+  };
+}
+
 type ProbeMatch = {
   url: string;
   status: number;
@@ -172,6 +188,45 @@ type ReflectionResult = {
   parameter: string;
   context: "text" | "html" | "attribute" | "url-attribute" | "script";
   reflectedValue: string;
+};
+
+type ActiveXssProbeResult = {
+  url: string;
+  parameter: string;
+  status: number;
+  rawPayloadReflected: boolean;
+  context: ReflectionResult["context"] | null;
+};
+
+type ActiveSqlProbeResult = {
+  url: string;
+  parameter: string;
+  payload: string;
+  status: number;
+  baselineStatus: number | null;
+  sqlError: boolean;
+  serverError: boolean;
+  baselineRecordCount: number | null;
+  probeRecordCount: number | null;
+  recordExpansion: boolean;
+};
+
+type IdorProbeResult = {
+  originalUrl: string;
+  mutatedUrl: string;
+  status: number;
+  originalStatus: number | null;
+  contentType: string | null;
+  comparableResponse: boolean;
+};
+
+type AuthBypassProbeResult = {
+  url: string;
+  payload: string;
+  status: number;
+  authSuccess: boolean;
+  tokenLikeResponse: boolean;
+  sessionCookie: boolean;
 };
 
 const csrfTokenNamePattern = /(csrf|xsrf|authenticity|requestverification|form[_-]?token|nonce)/i;
@@ -283,18 +338,19 @@ function resolveHttpUrl(rawValue: string | null | undefined, baseUrl: string) {
     return null;
   }
 
+  const trimmedValue = rawValue.trim();
   if (
-    rawValue.startsWith("#") ||
-    rawValue.startsWith("javascript:") ||
-    rawValue.startsWith("mailto:") ||
-    rawValue.startsWith("tel:") ||
-    rawValue.startsWith("data:")
+    (trimmedValue.startsWith("#") && !/^#(?:!\/?|\/)/.test(trimmedValue)) ||
+    trimmedValue.startsWith("javascript:") ||
+    trimmedValue.startsWith("mailto:") ||
+    trimmedValue.startsWith("tel:") ||
+    trimmedValue.startsWith("data:")
   ) {
     return null;
   }
 
   try {
-    const resolved = new URL(rawValue, baseUrl);
+    const resolved = new URL(trimmedValue, baseUrl);
     if (!["http:", "https:"].includes(resolved.protocol)) {
       return null;
     }
@@ -442,6 +498,85 @@ function looksLikeVerboseError(bodyText: string) {
   }
 
   return errorLabelPattern.test(bodyText) && (sourcePathPattern.test(bodyText) || stackFramePattern.test(bodyText));
+}
+
+function countStructuredRecords(bodyText: string): number | null {
+  const trimmed = bodyText.trim();
+  if (!trimmed || !/^[{[]/.test(trimmed)) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed.length;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+
+    const record = parsed as Record<string, unknown>;
+    const candidateKeys = ["data", "items", "results", "products", "orders", "users", "rows"];
+    for (const key of candidateKeys) {
+      const value = record[key];
+      if (Array.isArray(value)) {
+        return value.length;
+      }
+      if (value && typeof value === "object") {
+        const nested = value as Record<string, unknown>;
+        for (const nestedValue of Object.values(nested)) {
+          if (Array.isArray(nestedValue)) {
+            return nestedValue.length;
+          }
+        }
+      }
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function mutationWithNextIdentifier(url: string) {
+  const parsed = new URL(url);
+  let changed = false;
+
+  for (const [key, value] of parsed.searchParams.entries()) {
+    if (!/(^id$|Id$|_id$|user|account|invoice|order|download|file|document|report)/i.test(key)) {
+      continue;
+    }
+    if (/^\d+$/.test(value)) {
+      parsed.searchParams.set(key, String(Number(value) + 1));
+      changed = true;
+      break;
+    }
+    if (/^[0-9a-f]{8,}$/i.test(value)) {
+      parsed.searchParams.set(key, `${value.slice(0, -1)}${value.endsWith("0") ? "1" : "0"}`);
+      changed = true;
+      break;
+    }
+  }
+
+  if (!changed) {
+    const pathSegments = parsed.pathname.split("/");
+    for (let index = pathSegments.length - 1; index >= 0; index -= 1) {
+      const segment = pathSegments[index];
+      if (/^\d+$/.test(segment)) {
+        pathSegments[index] = String(Number(segment) + 1);
+        changed = true;
+        break;
+      }
+      if (/^[0-9a-f]{8,}$/i.test(segment)) {
+        pathSegments[index] = `${segment.slice(0, -1)}${segment.endsWith("0") ? "1" : "0"}`;
+        changed = true;
+        break;
+      }
+    }
+    parsed.pathname = pathSegments.join("/");
+  }
+
+  return changed ? parsed.toString() : null;
 }
 
 function extractComparableHtmlTitle(bodyText: string) {
@@ -712,9 +847,25 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   }
 
   const findings = [];
+  const configuredAuthCookie = getConfiguredAuthCookieHeader();
+  const authHeadersFor = (url: string): HeadersInit | undefined => {
+    if (!configuredAuthCookie) {
+      return undefined;
+    }
+
+    try {
+      const parsed = new URL(url);
+      return isInternalHostMatch(parsed.hostname, target.targetHostname)
+        ? { cookie: configuredAuthCookie }
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  };
   const httpsDirectAttempt = artifacts.context.https;
   const tlsInfo = artifacts.tlsInfo;
-  const primaryAttemptIsInterstitial = isLikelyEdgeInterstitial(primaryAttempt);
+  const primaryAttemptIsInterstitial =
+    isLikelyEdgeInterstitial(primaryAttempt) && !artifacts.browserInspection.rendered;
   const httpDirectAttempt = await loadAttempt(target.httpUrl, {
     includeBody: false,
     followRedirects: false,
@@ -751,12 +902,27 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       location: PageResource["location"];
     } => Boolean(sample),
   );
+  const browserDiscoveredApiEndpoints = primaryAttemptIsInterstitial
+    ? []
+    : primaryPage.resources
+        .filter((resource) => resource.internal && resource.kind === "fetch")
+        .map((resource) => resource.url)
+        .filter((url) => {
+          try {
+            return apiPathPattern.test(new URL(url).pathname);
+          } catch {
+            return false;
+          }
+        });
   const discoveredApiEndpoints = primaryAttemptIsInterstitial
     ? []
-    : extractEndpointCandidatesFromContent(primaryOrigin, [
-        primaryAttempt.bodyText,
-        ...primaryPage.inlineScripts.map((script) => script.content),
-        ...firstPartyScriptSamples.map((sample) => sample.bodyText),
+    : uniqueUrls([
+        ...extractEndpointCandidatesFromContent(primaryOrigin, [
+          primaryAttempt.bodyText,
+          ...primaryPage.inlineScripts.map((script) => script.content),
+          ...firstPartyScriptSamples.map((sample) => sample.bodyText),
+        ]),
+        ...browserDiscoveredApiEndpoints,
       ]);
   const sensitiveEndpointCandidates = mergeSensitiveEndpointCandidates([
     ...collectSensitiveEndpointCandidates(primaryOrigin, primaryPage.links, pageForms),
@@ -819,6 +985,39 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     httpsDirectAttempt &&
       ([401, 403, 405].includes(httpsDirectAttempt.status) || isLikelyEdgeInterstitial(httpsDirectAttempt)),
   );
+  const browserCoverageStatus = artifacts.browserInspection.rendered
+    ? { status: "pass" as const, severity: "info" as const }
+    : artifacts.browserInspection.attempted
+      ? { status: "warning" as const, severity: "low" as const }
+      : { status: "info" as const, severity: "info" as const };
+  findings.push(
+    buildSecurityCheck({
+      checkKey: "browser-rendered-crawl-coverage",
+      title: "Browser-rendered crawl coverage",
+      scoreWeight: 0.35,
+      ...browserCoverageStatus,
+      shortDescription: artifacts.browserInspection.rendered
+        ? `Rendered ${artifacts.browserInspection.renderedPageCount} page(s) with JavaScript and observed ${artifacts.browserInspection.networkRequestCount} browser network request(s).`
+        : artifacts.browserInspection.attempted
+          ? "Browser rendering was attempted but did not produce a rendered page snapshot."
+          : "Browser rendering is disabled for this scan environment.",
+      whyItMatters:
+        "Modern SPA applications often expose login routes, forms, links, and API calls only after JavaScript executes.",
+      recommendation: artifacts.browserInspection.rendered
+        ? "Keep JavaScript rendering enabled for production scans and add authenticated cookies when private routes need coverage."
+        : "Install Playwright browser binaries or enable browser rendering so SPA routes and client-side API calls are included.",
+      evidence: {
+        checkedUrl: primaryAttempt.finalUrl,
+        expectedLocation: "Rendered DOM, same-origin links, forms, scripts, and browser network requests",
+        summary: artifacts.browserInspection.rendered
+          ? "The scanner used a browser-rendered DOM snapshot for route and resource discovery."
+          : "The scan fell back to fetch-only artifacts for JavaScript-dependent coverage.",
+        browser: artifacts.browserInspection,
+        crawledPages: artifacts.crawledPages.map((page) => page.url),
+      },
+    }),
+  );
+
   findings.push(
     buildSecurityCheck({
       checkKey: "https-enabled",
@@ -1599,6 +1798,14 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     ...primaryPage.links
       .filter((link) => link.internal && (new URL(link.url).search.length > 0 || sensitivePathPattern.test(new URL(link.url).pathname)))
       .map((link) => link.url),
+    ...discoveredApiEndpoints.filter((url) => {
+      try {
+        const parsed = new URL(url);
+        return parsed.search.length > 0 || apiPathPattern.test(parsed.pathname);
+      } catch {
+        return false;
+      }
+    }),
     ...allKnownForms
       .filter((form) => form.method === "GET" || form.sensitiveKinds.includes("search"))
       .map((form) => form.url),
@@ -1612,13 +1819,21 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
             .filter((param) => riskyInputParamPattern.test(param))
             .map((param) => `${link.url}::${param}`),
         ),
+      ...discoveredApiEndpoints.flatMap((url) =>
+        [...new URL(url).searchParams.keys()]
+          .filter((param) => riskyInputParamPattern.test(param))
+          .map((param) => `${url}::${param}`),
+      ),
       ...allKnownForms.flatMap((form) =>
         form.fieldNames
           .filter((name) => riskyInputParamPattern.test(name))
           .map((name) => `${form.url}::${name}`),
       ),
+      ...["/search", "/api/search", "/api/products", "/rest/products/search"].map(
+        (path) => `${primaryOrigin}${path}::q`,
+      ),
       ...inputProbeTargets.slice(0, 2).map((url) => `${url}::q`),
-    ].slice(0, 8),
+    ].slice(0, 14),
   ).map((entry) => {
     const [url, parameter] = entry.split("::");
     return { url, parameter };
@@ -1631,6 +1846,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       const attempt = await loadAttempt(url.toString(), {
         timeoutMs: 8_000,
         followRedirects: false,
+        headers: authHeadersFor(url.toString()),
       });
       if (!attempt || attempt.status >= 500 || !attempt.bodyText.includes(reflectionToken)) {
         return null;
@@ -1689,6 +1905,74 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     }),
   );
 
+  const activeXssPayload = `"><svg data-fixnx-xss="1">`;
+  const activeXssResults = (
+    await mapLimited(inputProbeConfigs.slice(0, 8), 3, async (config) => {
+      const url = new URL(config.url);
+      url.searchParams.set(config.parameter, activeXssPayload);
+      const attempt = await loadAttempt(url.toString(), {
+        timeoutMs: 8_000,
+        followRedirects: false,
+        headers: authHeadersFor(url.toString()),
+      });
+      if (!attempt || attempt.status >= 500) {
+        return null;
+      }
+
+      const rawPayloadReflected = attempt.bodyText.includes(activeXssPayload);
+      if (!rawPayloadReflected) {
+        return null;
+      }
+
+      return {
+        url: attempt.finalUrl,
+        parameter: config.parameter,
+        status: attempt.status,
+        rawPayloadReflected,
+        context: classifyReflectionContext(attempt.bodyText, activeXssPayload),
+      } satisfies ActiveXssProbeResult;
+    })
+  ).filter(isPresent);
+  const activeXssFailure = activeXssResults.find(
+    (result) => result.context && ["html", "attribute", "url-attribute", "script"].includes(result.context),
+  );
+  findings.push(
+    buildSecurityCheck({
+      checkKey: "active-xss-payload-reflection",
+      title: "Active XSS payload reflection",
+      scoreWeight: 1.4,
+      status: activeXssFailure ? "fail" : activeXssResults.length > 0 ? "warning" : "pass",
+      severity: activeXssFailure ? "high" : activeXssResults.length > 0 ? "medium" : "info",
+      shortDescription: activeXssFailure
+        ? `A sampled parameter reflected an HTML payload without clear output encoding on ${activeXssFailure.url}.`
+        : activeXssResults.length > 0
+          ? "A sampled XSS payload was reflected and should be reviewed for output encoding."
+          : "Sampled XSS payloads were not reflected raw in tested responses.",
+      whyItMatters:
+        "A raw HTML payload reflected into markup, attributes, URLs, or script context is a concrete signal that XSS may be exploitable.",
+      recommendation:
+        activeXssResults.length === 0
+          ? "Keep context-aware output encoding in place for all user-controlled input."
+          : "Encode reflected values by output context, validate rich-text paths strictly, and add regression tests for the affected parameters.",
+      evidence: {
+        checkedUrl: inputProbeConfigs.slice(0, 8).map((config) => config.url).join(", "),
+        expectedLocation: "Injected HTML payload should be encoded before rendering",
+        summary: activeXssFailure
+          ? "A raw HTML payload came back in an executable-capable context."
+          : activeXssResults.length > 0
+            ? "The payload was reflected raw, but the context needs manual confirmation."
+            : "No raw active XSS payload reflection was detected.",
+        probePayload: redactValue(activeXssPayload),
+        results: activeXssResults.map((result) => ({
+          url: result.url,
+          parameter: result.parameter,
+          status: result.status,
+          context: result.context,
+        })),
+      },
+    }),
+  );
+
   const dangerousDomSinks = [
     ...primaryPage.inlineScripts.flatMap((script) => detectDangerousDomSinks(script.content).map((sink) => ({
       source: primaryPage.url,
@@ -1706,8 +1990,11 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const elevatedReflectionDetected = reflectionResults.some(
     (result) => result.context === "html" || result.context === "attribute",
   );
+  const activeXssDetected = Boolean(activeXssFailure);
   const xssStatus =
-    dangerousReflectionDetected && !hasAnyCspPolicy
+    activeXssDetected
+      ? { status: "fail" as const, severity: "high" as const }
+    : dangerousReflectionDetected && !hasAnyCspPolicy
       ? { status: "fail" as const, severity: "high" as const }
       : dangerousReflectionDetected || elevatedReflectionDetected || dangerousDomSinks.length > 0
         ? { status: "warning" as const, severity: "medium" as const }
@@ -1742,6 +2029,11 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           parameter: result.parameter,
           context: result.context,
         })),
+        activePayloadReflections: activeXssResults.map((result) => ({
+          url: result.url,
+          parameter: result.parameter,
+          context: result.context,
+        })),
         dangerousDomSinks: dangerousDomSinks.slice(0, 8).map((entry) => ({
           source: entry.source,
           sink: entry.sink,
@@ -1751,33 +2043,60 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     }),
   );
 
-  const sqlProbeToken = "cyberaudit-sql-'test";
+  const sqlProbeToken = "cyberaudit-sql-baseline";
+  const sqlProbePayloads = ["'", "' OR '1'='1'--", "')) OR 1=1--"];
   const sqlProbeConfigs = inputProbeConfigs
     .filter((config) => riskyInputParamPattern.test(config.parameter))
-    .slice(0, 5);
+    .slice(0, 6);
   const sqlProbeResults = (
-    await mapLimited(sqlProbeConfigs, 3, async (config) => {
-      const url = new URL(config.url);
-      url.searchParams.set(config.parameter, sqlProbeToken);
-      const attempt = await loadAttempt(url.toString(), {
+    await mapLimited(sqlProbeConfigs, 2, async (config) => {
+      const baselineUrl = new URL(config.url);
+      baselineUrl.searchParams.set(config.parameter, sqlProbeToken);
+      const baselineAttempt = await loadAttempt(baselineUrl.toString(), {
         timeoutMs: 8_000,
         followRedirects: false,
+        headers: authHeadersFor(baselineUrl.toString()),
       });
-      if (!attempt) {
-        return null;
-      }
+      const baselineRecordCount = baselineAttempt ? countStructuredRecords(baselineAttempt.bodyText) : null;
 
-      return {
-        url: attempt.finalUrl,
-        parameter: config.parameter,
-        status: attempt.status,
-        bodyText: attempt.bodyText,
-        sqlError: looksLikeSqlError(attempt.bodyText),
-      };
+      return (
+        await mapLimited(sqlProbePayloads, 1, async (payload) => {
+          const url = new URL(config.url);
+          url.searchParams.set(config.parameter, payload);
+          const attempt = await loadAttempt(url.toString(), {
+            timeoutMs: 8_000,
+            followRedirects: false,
+            headers: authHeadersFor(url.toString()),
+          });
+          if (!attempt) {
+            return null;
+          }
+
+          const probeRecordCount = countStructuredRecords(attempt.bodyText);
+          const recordExpansion =
+            baselineRecordCount !== null &&
+            probeRecordCount !== null &&
+            probeRecordCount > baselineRecordCount &&
+            probeRecordCount >= Math.max(3, baselineRecordCount + 3);
+
+          return {
+            url: attempt.finalUrl,
+            parameter: config.parameter,
+            payload,
+            status: attempt.status,
+            baselineStatus: baselineAttempt?.status ?? null,
+            sqlError: looksLikeSqlError(attempt.bodyText),
+            serverError: attempt.status >= 500 && (baselineAttempt?.status ?? 200) < 500,
+            baselineRecordCount,
+            probeRecordCount,
+            recordExpansion,
+          } satisfies ActiveSqlProbeResult;
+        })
+      ).filter(isPresent);
     })
-  ).filter(isPresent);
-  const sqlErrorResult = sqlProbeResults.find((result) => result.sqlError);
-  const anomalousSqlResult = sqlProbeResults.find((result) => result.status >= 500);
+  ).flat();
+  const sqlErrorResult = sqlProbeResults.find((result) => result.sqlError || result.recordExpansion);
+  const anomalousSqlResult = sqlProbeResults.find((result) => result.serverError);
   const sqlStatus = sqlErrorResult
     ? { status: "fail" as const, severity: "critical" as const }
     : anomalousSqlResult
@@ -1790,7 +2109,9 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       scoreWeight: 1.6,
       ...sqlStatus,
       shortDescription: sqlErrorResult
-        ? `A sampled parameter on ${sqlErrorResult.url} triggered a database-like error response.`
+        ? sqlErrorResult.sqlError
+          ? `A sampled parameter on ${sqlErrorResult.url} triggered a database-like error response.`
+          : `A SQL-style payload on ${sqlErrorResult.url} expanded the structured response from ${sqlErrorResult.baselineRecordCount ?? 0} to ${sqlErrorResult.probeRecordCount ?? 0} records.`
         : anomalousSqlResult
           ? `A sampled parameter on ${anomalousSqlResult.url} triggered an unexpected server error.`
           : "Sampled input probes did not expose SQL injection indicators.",
@@ -1807,18 +2128,25 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           sqlStatus.status === "pass"
             ? "No SQL-like error patterns were detected in the sampled responses."
             : "At least one sampled response behaved like a SQL or backend query handling issue.",
-        probePayload: redactValue(sqlProbeToken),
+        probePayloads: sqlProbePayloads.map((payload) => redactValue(payload)),
         results: sqlProbeResults.map((result) => ({
           url: result.url,
           parameter: result.parameter,
+          payload: redactValue(result.payload),
           status: result.status,
+          baselineStatus: result.baselineStatus,
           sqlError: result.sqlError,
+          serverError: result.serverError,
+          baselineRecordCount: result.baselineRecordCount,
+          probeRecordCount: result.probeRecordCount,
+          recordExpansion: result.recordExpansion,
         })),
       },
     }),
   );
 
-  const dbDisclosureStatus = sqlErrorResult
+  const dbDisclosureResult = sqlProbeResults.find((result) => result.sqlError);
+  const dbDisclosureStatus = dbDisclosureResult
     ? { status: "fail" as const, severity: "high" as const }
     : { status: "pass" as const, severity: "info" as const };
   findings.push(
@@ -1827,7 +2155,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       title: "Database error disclosure",
       scoreWeight: 1.35,
       ...dbDisclosureStatus,
-      shortDescription: sqlErrorResult
+      shortDescription: dbDisclosureResult
         ? "A sampled response exposed a SQL or database-style error message."
         : "Sampled responses did not expose SQL or database error details.",
       whyItMatters:
@@ -1837,7 +2165,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           ? "Keep backend errors generic and avoid exposing stack traces or query details to the browser."
           : "Replace detailed database error responses with generic user-safe errors, and log the technical details only on the server.",
       evidence: {
-        checkedUrl: sqlErrorResult?.url ?? inputProbeConfigs.map((config) => config.url).join(", "),
+        checkedUrl: dbDisclosureResult?.url ?? inputProbeConfigs.map((config) => config.url).join(", "),
         expectedLocation: "Browser responses should not expose SQL, ORM, or database exception details",
         summary:
           dbDisclosureStatus.status === "pass"
@@ -1847,10 +2175,108 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     }),
   );
 
+  const authBypassPayloads = ["' OR '1'='1'--", "admin'--"];
+  const authBypassTargets = uniqueUrls([
+    ...authSurfaceAttempts.map((attempt) => attempt.finalUrl),
+    ...discoveredApiEndpoints.filter((url) => /(login|signin|auth|session|user)/i.test(new URL(url).pathname)),
+    `${primaryOrigin}/rest/user/login`,
+    `${primaryOrigin}/api/login`,
+    `${primaryOrigin}/login`,
+  ]).slice(0, 4);
+  const authBypassProbeResults = (
+    await mapLimited(authBypassTargets, 2, async (targetUrl) => {
+      return (
+        await mapLimited(authBypassPayloads, 1, async (payload) => {
+          const parsed = new URL(targetUrl);
+          const apiLike = apiPathPattern.test(parsed.pathname) || /\/rest\//i.test(parsed.pathname);
+          const body = apiLike
+            ? JSON.stringify({
+                email: payload,
+                username: payload,
+                password: "fixnx-auth-probe",
+              })
+            : new URLSearchParams({
+                email: payload,
+                username: payload,
+                password: "fixnx-auth-probe",
+              }).toString();
+          const attempt = await loadAttempt(targetUrl, {
+            method: "POST",
+            timeoutMs: 8_000,
+            followRedirects: false,
+            headers: {
+              "content-type": apiLike ? "application/json" : "application/x-www-form-urlencoded",
+            },
+            body,
+          });
+          if (!attempt) {
+            return null;
+          }
+
+          const authSuccess = looksLikeAuthSuccessResponse(attempt);
+          return {
+            url: attempt.finalUrl,
+            payload,
+            status: attempt.status,
+            ...authSuccess,
+          } satisfies AuthBypassProbeResult;
+        })
+      ).filter(isPresent);
+    })
+  ).flat();
+  const successfulAuthBypass = authBypassProbeResults.find((result) => result.authSuccess);
+  const authBypassReachable = authBypassProbeResults.some((result) => result.status !== 404 && result.status < 500);
+  findings.push(
+    buildSecurityCheck({
+      checkKey: "authentication-bypass-active-probe",
+      title: "Authentication bypass active probe",
+      scoreWeight: 1.55,
+      status: successfulAuthBypass ? "fail" : authBypassReachable ? "pass" : "info",
+      severity: successfulAuthBypass ? "critical" : "info",
+      shortDescription: successfulAuthBypass
+        ? `A sampled login endpoint returned an authentication success signal for a SQL-style bypass payload.`
+        : authBypassReachable
+          ? "Sampled login endpoints did not return token or session success signals for bypass payloads."
+          : "No login endpoint was available for a cautious authentication bypass probe.",
+      whyItMatters:
+        "Authentication bypass lets an attacker access accounts without knowing a valid password and is usually a critical application flaw.",
+      recommendation: successfulAuthBypass
+        ? "Treat the affected login path as compromised: parameterize authentication queries, normalize credential handling, and add regression tests for SQL-style bypass payloads."
+        : "Keep login handlers parameterized, rate-limited, and covered by negative tests for authentication bypass payloads.",
+      evidence: {
+        checkedUrl: authBypassTargets.join(", "),
+        expectedLocation: "Login endpoints should reject SQL-style username/email bypass payloads",
+        summary: successfulAuthBypass
+          ? "A login probe returned a token-like body or session cookie after a bypass payload."
+          : authBypassReachable
+            ? "No sampled login endpoint returned an authentication success signal."
+            : "No login endpoint candidate was found.",
+        probePayloads: authBypassPayloads.map((payload) => redactValue(payload)),
+        results: authBypassProbeResults.map((result) => ({
+          url: result.url,
+          payload: redactValue(result.payload),
+          status: result.status,
+          authSuccess: result.authSuccess,
+          tokenLikeResponse: result.tokenLikeResponse,
+          sessionCookie: result.sessionCookie,
+        })),
+      },
+    }),
+  );
+
   const idorCandidates = uniqueUrls(
-    [...primaryPage.links, ...artifacts.crawledPages.flatMap((page) => page.links)]
-      .filter((link) => link.internal)
-      .map((link) => link.url),
+    [
+      ...primaryPage.links
+        .filter((link) => link.internal)
+        .map((link) => link.url),
+      ...artifacts.crawledPages.flatMap((page) =>
+        page.links.filter((link) => link.internal).map((link) => link.url),
+      ),
+      ...primaryPage.resources
+        .filter((resource) => resource.internal && resource.kind === "fetch")
+        .map((resource) => resource.url),
+      ...discoveredApiEndpoints,
+    ],
   )
     .map((url) => {
       const parsed = new URL(url);
@@ -1869,8 +2295,57 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     })
     .filter((candidate) => candidate.hasPredictableId)
     .slice(0, 8);
+  const idorProbeResults = (
+    await mapLimited(idorCandidates.slice(0, 4), 2, async (candidate) => {
+      const mutatedUrl = mutationWithNextIdentifier(candidate.url);
+      if (!mutatedUrl || mutatedUrl === candidate.url) {
+        return null;
+      }
+
+      const [originalAttempt, mutatedAttempt] = await Promise.all([
+        loadAttempt(candidate.url, {
+          timeoutMs: 8_000,
+          followRedirects: false,
+          headers: authHeadersFor(candidate.url),
+        }),
+        loadAttempt(mutatedUrl, {
+          timeoutMs: 8_000,
+          followRedirects: false,
+          headers: authHeadersFor(mutatedUrl),
+        }),
+      ]);
+      if (!mutatedAttempt) {
+        return null;
+      }
+
+      const originalContentType = originalAttempt?.headers["content-type"] ?? "";
+      const mutatedContentType = mutatedAttempt.headers["content-type"] ?? "";
+      const comparableResponse =
+        mutatedAttempt.status >= 200 &&
+        mutatedAttempt.status < 300 &&
+        !isLikelyEdgeInterstitial(mutatedAttempt) &&
+        (originalAttempt === null ||
+          originalAttempt.status === mutatedAttempt.status ||
+          (originalAttempt.status >= 200 && originalAttempt.status < 300)) &&
+        (!originalContentType ||
+          !mutatedContentType ||
+          originalContentType.split(";")[0] === mutatedContentType.split(";")[0]);
+
+      return {
+        originalUrl: candidate.url,
+        mutatedUrl: mutatedAttempt.finalUrl,
+        status: mutatedAttempt.status,
+        originalStatus: originalAttempt?.status ?? null,
+        contentType: mutatedAttempt.headers["content-type"] ?? null,
+        comparableResponse,
+      } satisfies IdorProbeResult;
+    })
+  ).filter(isPresent);
+  const exposedIdorProbe = idorProbeResults.find((result) => result.comparableResponse);
   const idorStatus =
-    idorCandidates.length === 0
+    exposedIdorProbe
+      ? { status: "warning" as const, severity: "high" as const }
+    : idorCandidates.length === 0
       ? { status: "pass" as const, severity: "info" as const }
       : idorCandidates.some((candidate) => candidate.hasSensitivePath)
         ? { status: "warning" as const, severity: "medium" as const }
@@ -1882,7 +2357,9 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       scoreWeight: 1.3,
       ...idorStatus,
       shortDescription:
-        idorCandidates.length === 0
+        exposedIdorProbe
+          ? `Changing an object identifier returned a comparable successful response on ${exposedIdorProbe.mutatedUrl}.`
+        : idorCandidates.length === 0
           ? "No obvious object-ID style URLs were detected in the sampled internal surface."
           : `${idorCandidates.length} sampled internal URLs look object-ID driven and may deserve an authorization review.`,
       whyItMatters:
@@ -1895,10 +2372,13 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         checkedUrl: idorCandidates.map((candidate) => candidate.url).join(", "),
         expectedLocation: "ID-based internal URLs should enforce object-level authorization",
         summary:
-          idorCandidates.length === 0
+          exposedIdorProbe
+            ? "A sampled object identifier could be changed and still returned a comparable successful response."
+          : idorCandidates.length === 0
             ? "No strong IDOR-style URL patterns were found in the sampled links."
             : "ID-based internal URLs were found and should be reviewed for object-level access control.",
         candidates: idorCandidates,
+        activeProbes: idorProbeResults,
       },
     }),
   );

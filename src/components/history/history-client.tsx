@@ -71,7 +71,7 @@ export function HistoryClient() {
       <div className="mx-auto flex max-w-[1440px] pt-16">
         <aside className="hidden h-[calc(100vh-64px)] w-72 shrink-0 border-r border-white/20 bg-white/40 px-6 py-8 shadow-[10px_0_40px_rgba(0,0,0,0.02)] backdrop-blur-[30px] lg:block">
           <div className="mb-8">
-            <h3 className="text-lg font-black text-blue-600">CyberAudit</h3>
+            <h3 className="text-lg font-black text-blue-600">fixnx</h3>
             <p className="mt-1 text-xs font-medium text-slate-500">Saved reports workspace</p>
           </div>
           <div className="space-y-2">

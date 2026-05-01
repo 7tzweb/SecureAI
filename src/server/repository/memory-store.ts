@@ -103,6 +103,12 @@ export function createMemoryRepository(): Repository {
       return [...state.scans.values()].filter((scan) => scan.createdByUserId === userId).length;
     },
 
+    async countAnonymousScans(anonymousClientId) {
+      return [...state.scans.values()].filter(
+        (scan) => scan.anonymousClientId === anonymousClientId,
+      ).length;
+    },
+
     async listRecentScans(limit = 8) {
       return [...state.scans.values()]
         .sort((left, right) => right.createdAt.localeCompare(left.createdAt))

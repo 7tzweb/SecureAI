@@ -61,7 +61,7 @@ export function buildScanPlanLineItems(): Stripe.Checkout.SessionCreateParams.Li
         currency: "usd",
         unit_amount: unitAmount,
         product_data: {
-          name: "CyberAudit Unlimited Scans",
+          name: "fixnx Unlimited Scans",
           description: "Unlock unlimited scans for your signed-in Google account.",
         },
       },
