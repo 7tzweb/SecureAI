@@ -1,8 +1,17 @@
 import "server-only";
 
 export type ScanAuthContext = {
+  scanMode?: "Fast" | "Deep" | "Authenticated" | null;
   authCookieHeader?: string | null;
   secondaryAuthCookieHeader?: string | null;
+  authLoginUrl?: string | null;
+  authUsername?: string | null;
+  authPassword?: string | null;
+  authRoleLabel?: string | null;
+  secondaryAuthLoginUrl?: string | null;
+  secondaryAuthUsername?: string | null;
+  secondaryAuthPassword?: string | null;
+  secondaryAuthRoleLabel?: string | null;
 };
 
 const globalState = globalThis as typeof globalThis & {
@@ -18,7 +27,15 @@ function getStore() {
 }
 
 export function setScanAuthContext(scanId: string, context: ScanAuthContext) {
-  if (!context.authCookieHeader && !context.secondaryAuthCookieHeader) {
+  if (
+    !context.scanMode &&
+    !context.authCookieHeader &&
+    !context.secondaryAuthCookieHeader &&
+    !context.authUsername &&
+    !context.authPassword &&
+    !context.secondaryAuthUsername &&
+    !context.secondaryAuthPassword
+  ) {
     return;
   }
 

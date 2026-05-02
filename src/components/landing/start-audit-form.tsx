@@ -48,8 +48,15 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
   const [checkoutPending, setCheckoutPending] = useState(false);
   const [paypalOpen, setPaypalOpen] = useState(false);
   const [showAuthOptions, setShowAuthOptions] = useState(false);
+  const [scanMode, setScanMode] = useState<"Fast" | "Deep" | "Authenticated">("Fast");
   const [authCookieHeader, setAuthCookieHeader] = useState("");
   const [secondaryAuthCookieHeader, setSecondaryAuthCookieHeader] = useState("");
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authRoleLabel, setAuthRoleLabel] = useState("");
+  const [secondaryAuthUsername, setSecondaryAuthUsername] = useState("");
+  const [secondaryAuthPassword, setSecondaryAuthPassword] = useState("");
+  const [secondaryAuthRoleLabel, setSecondaryAuthRoleLabel] = useState("");
   const [isPending, startTransition] = useTransition();
 
   type FormError = Error & {
@@ -180,8 +187,22 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
           },
           body: JSON.stringify({
             target: value,
+            scanMode:
+              scanMode === "Authenticated" ||
+              authCookieHeader.trim() ||
+              secondaryAuthCookieHeader.trim() ||
+              authUsername.trim() ||
+              secondaryAuthUsername.trim()
+                ? "Authenticated"
+                : scanMode,
             authCookieHeader: authCookieHeader.trim() || undefined,
             secondaryAuthCookieHeader: secondaryAuthCookieHeader.trim() || undefined,
+            authUsername: authUsername.trim() || undefined,
+            authPassword: authPassword.trim() || undefined,
+            authRoleLabel: authRoleLabel.trim() || undefined,
+            secondaryAuthUsername: secondaryAuthUsername.trim() || undefined,
+            secondaryAuthPassword: secondaryAuthPassword.trim() || undefined,
+            secondaryAuthRoleLabel: secondaryAuthRoleLabel.trim() || undefined,
           }),
         });
 
@@ -284,6 +305,44 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
 
           {showAuthOptions ? (
             <div className="mt-3 grid gap-3 rounded-[1.3rem] border border-white/70 bg-white/70 p-3 shadow-[0_12px_36px_rgba(15,23,42,0.08)]">
+              <div className="grid gap-2 rounded-[1rem] bg-slate-50 p-1 sm:grid-cols-3">
+                {(["Fast", "Deep", "Authenticated"] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => setScanMode(mode)}
+                    className={cn(
+                      "rounded-[0.8rem] px-3 py-2 text-xs font-bold transition-colors",
+                      scanMode === mode
+                        ? "bg-white text-[var(--primary)] shadow-sm"
+                        : "text-slate-500 hover:text-slate-900",
+                    )}
+                  >
+                    {mode}
+                  </button>
+                ))}
+              </div>
+              <div className="grid gap-3 md:grid-cols-3">
+                <input
+                  value={authUsername}
+                  onChange={(event) => setAuthUsername(event.target.value)}
+                  placeholder="User A email / username"
+                  className="h-11 rounded-[1rem] border border-slate-200 bg-white px-4 text-xs text-slate-700 outline-none transition-colors placeholder:text-slate-400 focus:border-[var(--primary)]"
+                />
+                <input
+                  value={authPassword}
+                  onChange={(event) => setAuthPassword(event.target.value)}
+                  placeholder="User A password"
+                  type="password"
+                  className="h-11 rounded-[1rem] border border-slate-200 bg-white px-4 text-xs text-slate-700 outline-none transition-colors placeholder:text-slate-400 focus:border-[var(--primary)]"
+                />
+                <input
+                  value={authRoleLabel}
+                  onChange={(event) => setAuthRoleLabel(event.target.value)}
+                  placeholder="User A role label"
+                  className="h-11 rounded-[1rem] border border-slate-200 bg-white px-4 text-xs text-slate-700 outline-none transition-colors placeholder:text-slate-400 focus:border-[var(--primary)]"
+                />
+              </div>
               <textarea
                 value={authCookieHeader}
                 onChange={(event) => setAuthCookieHeader(event.target.value)}
@@ -291,6 +350,27 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
                 spellCheck={false}
                 className="min-h-20 w-full resize-y rounded-[1rem] border border-slate-200 bg-white px-4 py-3 text-xs leading-5 text-slate-700 outline-none transition-colors placeholder:text-slate-400 focus:border-[var(--primary)]"
               />
+              <div className="grid gap-3 md:grid-cols-3">
+                <input
+                  value={secondaryAuthUsername}
+                  onChange={(event) => setSecondaryAuthUsername(event.target.value)}
+                  placeholder="User B email / username"
+                  className="h-11 rounded-[1rem] border border-slate-200 bg-white px-4 text-xs text-slate-700 outline-none transition-colors placeholder:text-slate-400 focus:border-[var(--primary)]"
+                />
+                <input
+                  value={secondaryAuthPassword}
+                  onChange={(event) => setSecondaryAuthPassword(event.target.value)}
+                  placeholder="User B password"
+                  type="password"
+                  className="h-11 rounded-[1rem] border border-slate-200 bg-white px-4 text-xs text-slate-700 outline-none transition-colors placeholder:text-slate-400 focus:border-[var(--primary)]"
+                />
+                <input
+                  value={secondaryAuthRoleLabel}
+                  onChange={(event) => setSecondaryAuthRoleLabel(event.target.value)}
+                  placeholder="User B role label"
+                  className="h-11 rounded-[1rem] border border-slate-200 bg-white px-4 text-xs text-slate-700 outline-none transition-colors placeholder:text-slate-400 focus:border-[var(--primary)]"
+                />
+              </div>
               <textarea
                 value={secondaryAuthCookieHeader}
                 onChange={(event) => setSecondaryAuthCookieHeader(event.target.value)}

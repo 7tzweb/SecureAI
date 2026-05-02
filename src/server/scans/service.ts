@@ -172,6 +172,7 @@ export async function createScan(
     createdAt: now,
     updatedAt: now,
     status: "queued",
+    scanMode: authContext.scanMode ?? (authContext.authCookieHeader || authContext.authUsername ? "Authenticated" : "Fast"),
     progress: 10,
     overallScore: null,
     securityScore: null,
@@ -187,8 +188,17 @@ export async function createScan(
 
   await repository.createScan(scan);
   setScanAuthContext(scan.id, {
+    scanMode: authContext.scanMode ?? null,
     authCookieHeader: authContext.authCookieHeader?.trim() || null,
     secondaryAuthCookieHeader: authContext.secondaryAuthCookieHeader?.trim() || null,
+    authLoginUrl: authContext.authLoginUrl?.trim() || null,
+    authUsername: authContext.authUsername?.trim() || null,
+    authPassword: authContext.authPassword?.trim() || null,
+    authRoleLabel: authContext.authRoleLabel?.trim() || null,
+    secondaryAuthLoginUrl: authContext.secondaryAuthLoginUrl?.trim() || null,
+    secondaryAuthUsername: authContext.secondaryAuthUsername?.trim() || null,
+    secondaryAuthPassword: authContext.secondaryAuthPassword?.trim() || null,
+    secondaryAuthRoleLabel: authContext.secondaryAuthRoleLabel?.trim() || null,
   });
   await repository.addEvent(
     scan.id,

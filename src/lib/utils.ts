@@ -4,6 +4,7 @@ import {
   categoryKeys,
   type CategoryKey,
   type CategoryState,
+  type FindingConfidence,
   type ScanFinding,
   type FindingStatus,
   type Severity,
@@ -18,18 +19,18 @@ const severityRank: Record<Severity, number> = {
 };
 
 const severityPenalty: Record<Severity, number> = {
-  critical: 32,
-  high: 18,
-  medium: 10,
-  low: 4,
-  info: 1,
+  critical: 28,
+  high: 16,
+  medium: 7,
+  low: 2,
+  info: 0,
 };
 
 const warningPenaltyCap: Record<Severity, number> = {
-  critical: 36,
-  high: 28,
-  medium: 18,
-  low: 8,
+  critical: 28,
+  high: 18,
+  medium: 10,
+  low: 4,
   info: 0,
 };
 
@@ -38,6 +39,22 @@ const statusRank: Record<FindingStatus, number> = {
   warning: 3,
   info: 2,
   pass: 1,
+};
+
+const confidenceRank: Record<FindingConfidence, number> = {
+  confirmed: 3,
+  likely: 2,
+  medium: 1.5,
+  low: 1.2,
+  info: 1,
+};
+
+const confidencePenaltyMultiplier: Record<FindingConfidence, number> = {
+  confirmed: 1.25,
+  likely: 0.75,
+  medium: 0.45,
+  low: 0.2,
+  info: 0,
 };
 
 export function cn(...inputs: ClassValue[]) {
@@ -86,7 +103,8 @@ export function computeScore(findings: ScanFinding[]) {
 
   const failPenalty = findings.reduce((sum, finding) => {
     const status = deriveFindingStatus(finding);
-    if (status === "pass" || status === "info") {
+    const confidence = finding.confidence ?? (status === "fail" || status === "warning" ? "likely" : "info");
+    if (status === "pass" || status === "info" || confidence === "info") {
       return sum;
     }
 
@@ -95,7 +113,8 @@ export function computeScore(findings: ScanFinding[]) {
       Math.round(
         severityPenalty[finding.severity] *
           (finding.scoreWeight ?? 1) *
-          (status === "warning" ? 0.5 : 1),
+          (status === "warning" ? 0.5 : 1) *
+          confidencePenaltyMultiplier[confidence],
       ),
     );
 
@@ -125,6 +144,12 @@ export function sortFindings(findings: ScanFinding[]) {
     const severityDelta = severityRank[right.severity] - severityRank[left.severity];
     if (severityDelta !== 0) {
       return severityDelta;
+    }
+
+    const confidenceDelta =
+      confidenceRank[right.confidence ?? "info"] - confidenceRank[left.confidence ?? "info"];
+    if (confidenceDelta !== 0) {
+      return confidenceDelta;
     }
 
     return left.title.localeCompare(right.title);
@@ -214,6 +239,22 @@ export function getStatusStyles(status: FindingStatus) {
       return "border-amber-200 bg-amber-50 text-amber-700";
     case "fail":
       return "border-rose-200 bg-rose-50 text-rose-700";
+    case "info":
+    default:
+      return "border-slate-200 bg-slate-50 text-slate-600";
+  }
+}
+
+export function getConfidenceStyles(confidence: FindingConfidence) {
+  switch (confidence) {
+    case "confirmed":
+      return "border-red-200 bg-red-50 text-red-700";
+    case "likely":
+      return "border-amber-200 bg-amber-50 text-amber-700";
+    case "medium":
+      return "border-orange-200 bg-orange-50 text-orange-700";
+    case "low":
+      return "border-sky-200 bg-sky-50 text-sky-700";
     case "info":
     default:
       return "border-slate-200 bg-slate-50 text-slate-600";

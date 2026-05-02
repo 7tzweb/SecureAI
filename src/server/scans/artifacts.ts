@@ -223,9 +223,9 @@ const globalState = globalThis as typeof globalThis & {
 
 const BROWSER_NAVIGATION_TIMEOUT_MS = 9_000;
 const BROWSER_NETWORK_IDLE_TIMEOUT_MS = 1_200;
-const BROWSER_CRAWL_PAGE_LIMIT = 4;
-const BROWSER_NETWORK_PROBE_LIMIT = 80;
-const FETCH_CRAWL_PAGE_LIMIT = 6;
+const BROWSER_CRAWL_PAGE_LIMIT = 8;
+const BROWSER_NETWORK_PROBE_LIMIT = 120;
+const FETCH_CRAWL_PAGE_LIMIT = 10;
 
 const emptyBrowserInspection: BrowserInspection = {
   attempted: false,
@@ -916,11 +916,11 @@ function buildPageSnapshot(
   };
 }
 
-async function probeUrl(url: string): Promise<UrlProbe> {
+async function probeUrl(url: string, timeoutMs = 8_000): Promise<UrlProbe> {
   const headAttempt = await loadAttempt(url, {
     method: "HEAD",
     includeBody: false,
-    timeoutMs: 8_000,
+    timeoutMs,
   });
   const needsGetFallback =
     !headAttempt ||
@@ -938,7 +938,7 @@ async function probeUrl(url: string): Promise<UrlProbe> {
       ? await loadAttempt(url, {
           method: "GET",
           includeBody: false,
-          timeoutMs: 8_000,
+          timeoutMs,
         })
       : headAttempt;
 
@@ -1309,13 +1309,13 @@ async function discoverInteractiveSnapshots(
       .catch(() => [])
   )
     .filter(safeInteractionCandidate)
-    .slice(0, 3);
+    .slice(0, 6);
 
   const snapshots: PageSnapshot[] = [];
   for (const candidate of candidates) {
     const element = locator.nth(candidate.index);
     await element.click({ timeout: 1_200 }).catch(() => undefined);
-    await page.waitForTimeout(300).catch(() => undefined);
+    await page.waitForTimeout(220).catch(() => undefined);
     await applyBrowserResourceTimings(page, sharedResources);
     const bodyText = await page.content().catch(() => "");
     if (!bodyText) {
@@ -1346,7 +1346,7 @@ async function renderBrowserPage(
   url: string,
   targetHostname: string,
   sharedResources: Map<string, BrowserNetworkResource>,
-  options: { interact?: boolean } = {},
+  options: { interact?: boolean; navigationTimeoutMs?: number; networkIdleTimeoutMs?: number } = {},
 ) {
   const page = await context.newPage();
   page.on("response", (response) => captureBrowserResponse(response, sharedResources));
@@ -1355,13 +1355,13 @@ async function renderBrowserPage(
   try {
     const response = await page.goto(url, {
       waitUntil: "domcontentloaded",
-      timeout: BROWSER_NAVIGATION_TIMEOUT_MS,
+      timeout: options.navigationTimeoutMs ?? BROWSER_NAVIGATION_TIMEOUT_MS,
     });
     if (response && response.status() >= 500) {
       return null;
     }
 
-    await page.waitForLoadState("networkidle", { timeout: BROWSER_NETWORK_IDLE_TIMEOUT_MS }).catch(() => undefined);
+    await page.waitForLoadState("networkidle", { timeout: options.networkIdleTimeoutMs ?? BROWSER_NETWORK_IDLE_TIMEOUT_MS }).catch(() => undefined);
     await page.waitForTimeout(250).catch(() => undefined);
     await applyBrowserResourceTimings(page, sharedResources);
 
@@ -1468,10 +1468,24 @@ function collectBrowserCrawlTargets(
   targetHostname: string,
 ) {
   const origin = new URL(primaryPage.url).origin;
-  const commonAuthRoutes = [
+  const spaLikely =
+    primaryPage.resources.some((resource) => resource.kind === "script" && resource.internal) ||
+    primaryPage.links.some((link) => /#\/?/.test(link.url)) ||
+    primaryPage.interactiveElements.length > 0;
+  const commonHashRoutes = [
     "/#/login",
-    "/login",
-    "/signin",
+    "/#/register",
+    "/#/search",
+    "/#/basket",
+    "/#/profile",
+    "/#/order-history",
+    "/#/administration",
+    "/#/score-board",
+    "/#/contact",
+    "/#/complain",
+  ];
+  const commonAuthRoutes = [
+    ...(spaLikely ? [...commonHashRoutes, "/login", "/signin"] : []),
   ].map((path) => new URL(path, origin).toString());
 
   return dedupeByUrl(
@@ -1494,14 +1508,38 @@ function collectBrowserCrawlTargets(
     ],
   )
     .filter((target) => target.url !== primaryPage.url)
+    .sort((left, right) => browserCrawlPriority(right.url) - browserCrawlPriority(left.url))
     .slice(0, BROWSER_CRAWL_PAGE_LIMIT - 1)
     .map((target) => target.url);
+}
+
+function browserCrawlPriority(url: string) {
+  try {
+    const parsed = new URL(url);
+    const value = `${parsed.pathname} ${parsed.hash} ${parsed.search}`.toLowerCase();
+    if (/(login|signin|auth|session|account|profile)/.test(value)) {
+      return 80;
+    }
+    if (/(admin|dashboard|settings|billing|invoice|order|cart|basket)/.test(value)) {
+      return 70;
+    }
+    if (/(search|filter|products|catalog|query)/.test(value)) {
+      return 60;
+    }
+    if (/(api|graphql|rest|upload|file)/.test(value)) {
+      return 50;
+    }
+    return value.includes("#/") ? 40 : 10;
+  } catch {
+    return 0;
+  }
 }
 
 async function inspectWithBrowser(
   startUrl: string,
   targetHostname: string,
   scanAuthCookieHeader?: string | null,
+  scanMode?: NormalizedTarget["scanMode"] | null,
 ): Promise<{
   primaryPage: PageSnapshot | null;
   crawledPages: PageSnapshot[];
@@ -1522,8 +1560,13 @@ async function inspectWithBrowser(
   let browser: Browser | null = null;
   const primaryOrigin = new URL(startUrl).origin;
   const authCookies = configuredBrowserCookies(primaryOrigin, targetHostname, scanAuthCookieHeader);
+  const browserPageLimit = scanMode === "Fast" ? 4 : BROWSER_CRAWL_PAGE_LIMIT;
+  const browserNavigationTimeoutMs = scanMode === "Fast" ? 6_000 : BROWSER_NAVIGATION_TIMEOUT_MS;
+  const browserNetworkIdleTimeoutMs = scanMode === "Fast" ? 700 : BROWSER_NETWORK_IDLE_TIMEOUT_MS;
+  const logPrefix = `[fixnx][artifacts][${targetHostname}][browser]`;
 
   try {
+    console.info(`${logPrefix} start url=${startUrl} mode=${scanMode ?? "Fast"} pageLimit=${browserPageLimit}`);
     const { chromium } = await import("playwright");
     browser = await chromium.launch({
       headless: true,
@@ -1542,15 +1585,29 @@ async function inspectWithBrowser(
 
     const primaryPage = await renderBrowserPage(context, startUrl, targetHostname, resources, {
       interact: true,
+      navigationTimeoutMs: browserNavigationTimeoutMs,
+      networkIdleTimeoutMs: browserNetworkIdleTimeoutMs,
     });
-    const crawlTargets = primaryPage ? collectBrowserCrawlTargets(primaryPage, targetHostname) : [];
+    console.info(
+      `${logPrefix} primary-rendered elapsed=${Date.now() - startedAt}ms rendered=${Boolean(primaryPage)} network=${resources.size}`,
+    );
+    const crawlTargets = primaryPage
+      ? collectBrowserCrawlTargets(primaryPage, targetHostname).slice(0, Math.max(0, browserPageLimit - 1))
+      : [];
     const crawledPages: PageSnapshot[] = [];
 
     for (const crawlTarget of crawlTargets) {
-      const snapshot = await renderBrowserPage(context, crawlTarget, targetHostname, resources).catch(() => null);
+      console.info(`${logPrefix} crawl-page start url=${crawlTarget}`);
+      const snapshot = await renderBrowserPage(context, crawlTarget, targetHostname, resources, {
+        navigationTimeoutMs: browserNavigationTimeoutMs,
+        networkIdleTimeoutMs: browserNetworkIdleTimeoutMs,
+      }).catch(() => null);
       if (snapshot && snapshot.url !== primaryPage?.url) {
         crawledPages.push(snapshot);
       }
+      console.info(
+        `${logPrefix} crawl-page done url=${crawlTarget} elapsed=${Date.now() - startedAt}ms captured=${Boolean(snapshot)}`,
+      );
     }
 
     await context.close().catch(() => undefined);
@@ -1573,6 +1630,7 @@ async function inspectWithBrowser(
       },
     };
   } catch (error) {
+    console.error(`${logPrefix} failed elapsed=${Date.now() - startedAt}ms`, error);
     return {
       primaryPage: null,
       crawledPages: [],
@@ -1686,8 +1744,36 @@ function detectTechnologies(context: PageContext, primaryPage: PageSnapshot | nu
   if (/_next\//.test(html)) {
     hints.add("Next.js");
   }
+  if (/__NEXT_DATA__"[^>]*>|next\/static|x-nextjs/i.test(html)) {
+    hints.add("Next.js frontend");
+  }
   if (/react/i.test(html) && /data-reactroot|__next/i.test(html)) {
     hints.add("React");
+  }
+  if (/ng-version=["'][^"']+["']|ng-app|_ngcontent-|angular/i.test(html)) {
+    const version = html.match(/ng-version=["']([^"']+)["']/i)?.[1];
+    hints.add(version ? `Angular ${version}` : "Angular");
+  }
+  if (/data-v-|__VUE__|vue(?:\.runtime)?(?:\.global)?(?:\.prod)?\.js/i.test(html)) {
+    hints.add("Vue.js");
+  }
+  if (/(?:\/|-)nuxt(?:\/|-)|__NUXT__/i.test(html)) {
+    hints.add("Nuxt");
+  }
+  if (/(?:\/|-)vite(?:\/|-)|@vite\/client/i.test(html)) {
+    hints.add("Vite");
+  }
+  if (/jquery(?:-|\.)(\d+\.\d+(?:\.\d+)?)/i.test(html)) {
+    hints.add(`jQuery ${html.match(/jquery(?:-|\.)(\d+\.\d+(?:\.\d+)?)/i)?.[1]}`);
+  } else if (/jquery/i.test(html)) {
+    hints.add("jQuery");
+  }
+  if (/bootstrap(?:\.bundle)?(?:\.min)?\.js|bootstrap(?:\.min)?\.css/i.test(html)) {
+    const version = html.match(/bootstrap[@/-](\d+\.\d+(?:\.\d+)?)/i)?.[1];
+    hints.add(version ? `Bootstrap ${version}` : "Bootstrap");
+  }
+  if (/cdn\.jsdelivr\.net|cdnjs\.cloudflare\.com|unpkg\.com|esm\.sh/i.test(html)) {
+    hints.add("Public package CDN");
   }
   if (
     /cdn\.shopify\.com|myshopify\.com|shopify-payment-button|shopify-section|shopify-analytics|Shopify\.(?:theme|routes|locale|Analytics)/i.test(
@@ -1696,6 +1782,32 @@ function detectTechnologies(context: PageContext, primaryPage: PageSnapshot | nu
   ) {
     hints.add("Shopify");
   }
+  if (/herokuapp\.com/i.test(context.primary.finalUrl) || /heroku/i.test(headers.server ?? "")) {
+    hints.add("Heroku hosting");
+  }
+
+  primaryPage.resources
+    .filter((resource) => resource.kind === "script" || resource.kind === "stylesheet")
+    .slice(0, 30)
+    .forEach((resource) => {
+      const url = resource.url;
+      const version = url.match(/(?:react|vue|angular|jquery|bootstrap|lodash|moment|axios)[@/-](\d+\.\d+(?:\.\d+)?)/i)?.[1];
+      if (/react/i.test(url)) {
+        hints.add(version ? `React ${version}` : "React asset");
+      }
+      if (/vue/i.test(url)) {
+        hints.add(version ? `Vue ${version}` : "Vue asset");
+      }
+      if (/angular/i.test(url)) {
+        hints.add(version ? `Angular ${version}` : "Angular asset");
+      }
+      if (/jquery/i.test(url)) {
+        hints.add(version ? `jQuery ${version}` : "jQuery asset");
+      }
+      if (/bootstrap/i.test(url)) {
+        hints.add(version ? `Bootstrap ${version}` : "Bootstrap asset");
+      }
+    });
 
   return [...hints];
 }
@@ -1728,12 +1840,26 @@ function detectWafCdn(context: PageContext) {
 }
 
 async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts> {
+  const startedAt = Date.now();
+  const scanMode = target.scanMode ?? "Fast";
+  const artifactTimeoutMs = scanMode === "Fast" ? 4_000 : 8_000;
+  const fetchCrawlLimit = scanMode === "Fast" ? 4 : FETCH_CRAWL_PAGE_LIMIT;
+  const resourceProbeLimit = scanMode === "Fast" ? 25 : 40;
+  const internalLinkProbeLimit = scanMode === "Fast" ? 8 : 16;
+  const externalLinkProbeLimit = scanMode === "Fast" ? 4 : 10;
+  const logPrefix = `[fixnx][artifacts][${target.targetHostname}][${scanMode}]`;
+  console.info(`${logPrefix} start`);
   const context = await loadPageContext(target);
+  console.info(`${logPrefix} page-context loaded elapsed=${Date.now() - startedAt}ms primary=${Boolean(context.primary)}`);
   const fetchedPrimaryPage = context.primary ? buildPageSnapshot(context.primary, target.targetHostname) : null;
   const browserResult = await inspectWithBrowser(
     context.primary?.finalUrl ?? target.httpsUrl,
     target.targetHostname,
     target.authCookieHeader,
+    scanMode,
+  );
+  console.info(
+    `${logPrefix} browser complete elapsed=${Date.now() - startedAt}ms rendered=${browserResult.inspection.rendered} pages=${browserResult.inspection.renderedPageCount} network=${browserResult.inspection.networkRequestCount}`,
   );
   const primaryPage = browserResult.primaryPage ?? fetchedPrimaryPage;
   const primaryIsInterstitial = isLikelyEdgeInterstitial(context.primary) && !browserResult.primaryPage;
@@ -1748,15 +1874,18 @@ async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts>
             !browserCrawledUrls.has(link.url),
         ),
       )
-        .slice(0, Math.max(0, FETCH_CRAWL_PAGE_LIMIT - browserResult.crawledPages.length))
+        .slice(0, Math.max(0, fetchCrawlLimit - browserResult.crawledPages.length))
         .map((link) => link.url)
     : [];
   const scopedCrawlTargets = primaryIsInterstitial ? [] : crawlTargets;
 
   const crawledAttempts = await mapWithConcurrency(scopedCrawlTargets, 3, async (url) =>
     loadAttempt(url, {
-      timeoutMs: 8_000,
+      timeoutMs: artifactTimeoutMs,
     }),
+  );
+  console.info(
+    `${logPrefix} fetch-crawl complete elapsed=${Date.now() - startedAt}ms targets=${scopedCrawlTargets.length}`,
   );
 
   const fetchedCrawledPages = crawledAttempts
@@ -1769,11 +1898,14 @@ async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts>
 
   const browserProbeUrls = new Set(browserResult.resourceProbes.map((probe) => probe.url));
   const resourceTargets = primaryPage && !primaryIsInterstitial
-    ? dedupeByUrl(primaryPage.resources).slice(0, 40)
+    ? dedupeByUrl(primaryPage.resources).slice(0, resourceProbeLimit)
         .filter((resource) => !browserProbeUrls.has(resource.url))
     : [];
   const fetchedResourceProbes = await mapWithConcurrency(resourceTargets, 5, async (resource) =>
-    probeUrl(resource.url),
+    probeUrl(resource.url, artifactTimeoutMs),
+  );
+  console.info(
+    `${logPrefix} resource-probes complete elapsed=${Date.now() - startedAt}ms targets=${resourceTargets.length}`,
   );
   const resourceProbes = dedupeByUrl([...browserResult.resourceProbes, ...fetchedResourceProbes]);
   const browserInspection = {
@@ -1783,13 +1915,13 @@ async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts>
 
   const internalLinkTargets = dedupeByUrl(
     allPages.flatMap((page) => page.links.filter((link) => link.internal && looksLikeHtmlPage(link.url))),
-  ).slice(0, 16);
+  ).slice(0, internalLinkProbeLimit);
   const externalLinkTargets = dedupeByUrl(
     allPages.flatMap((page) => page.links.filter((link) => !link.internal)),
-  ).slice(0, 10);
+  ).slice(0, externalLinkProbeLimit);
 
   const internalLinkProbes = await mapWithConcurrency(internalLinkTargets, 4, async (link) => {
-    const probe = await probeUrl(link.url);
+    const probe = await probeUrl(link.url, artifactTimeoutMs);
     return {
       ...probe,
       sourceUrl: link.sourceUrl,
@@ -1801,7 +1933,7 @@ async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts>
   });
 
   const externalLinkProbes = await mapWithConcurrency(externalLinkTargets, 3, async (link) => {
-    const probe = await probeUrl(link.url);
+    const probe = await probeUrl(link.url, artifactTimeoutMs);
     return {
       ...probe,
       sourceUrl: link.sourceUrl,
@@ -1811,8 +1943,12 @@ async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts>
       location: link.location,
     } satisfies LinkProbe;
   });
+  console.info(
+    `${logPrefix} link-probes complete elapsed=${Date.now() - startedAt}ms internal=${internalLinkTargets.length} external=${externalLinkTargets.length}`,
+  );
 
   const tlsInfo = await inspectTls(target.targetHostname);
+  console.info(`${logPrefix} tls complete elapsed=${Date.now() - startedAt}ms`);
 
   return {
     context,

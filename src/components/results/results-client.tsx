@@ -22,6 +22,7 @@ import {
   deriveFindingStatus,
   formatRelative,
   formatScore,
+  getConfidenceStyles,
   getSeverityStyles,
   getScoreTone,
   getStatusStyles,
@@ -36,6 +37,14 @@ type SidebarScan = Pick<
 type ProgressSessionState = {
   scanId: string | null;
   sawLiveState: boolean;
+};
+
+type ProgressStepStatus = "queued" | "running" | "completed" | "failed";
+
+type ProgressStep = {
+  label: string;
+  status: ProgressStepStatus;
+  active: boolean;
 };
 
 type ViewState = {
@@ -92,6 +101,421 @@ function summarizeFindingCounts(findings: ScanFinding[]) {
       failCount: 0,
     },
   );
+}
+
+function getLiveProgressHoldPercent(scanId: string | null) {
+  if (!scanId) {
+    return 98;
+  }
+
+  let hash = 0;
+  for (const char of scanId) {
+    hash = (hash * 31 + char.charCodeAt(0)) % 997;
+  }
+
+  return 97 + (hash % 3);
+}
+
+function getLiveProgressTarget(rawProgress: number, holdPercent: number) {
+  if (rawProgress >= 95) {
+    return holdPercent;
+  }
+
+  return Math.min(holdPercent, Math.max(12, rawProgress + 18));
+}
+
+function getProgressAnimationDelay(progress: number, target: number, isFinished: boolean) {
+  if (isFinished) {
+    return progress >= 99 ? 540 : 260;
+  }
+
+  const milestoneHolds = new Set([18, 32, 47, 63, 78, 90, Math.max(92, target - 1)]);
+  if (milestoneHolds.has(progress)) {
+    return progress >= 90 ? 1450 : 900;
+  }
+
+  if (progress < 35) {
+    return 145;
+  }
+
+  if (progress < 70) {
+    return 225;
+  }
+
+  if (progress < 90) {
+    return 340;
+  }
+
+  return 520;
+}
+
+function formatProgressStatus(status: ProgressStepStatus) {
+  switch (status) {
+    case "completed":
+      return "done";
+    case "running":
+      return "running";
+    case "failed":
+      return "failed";
+    case "queued":
+      return "waiting";
+  }
+}
+
+function isAttackSurfaceSummaryFinding(finding: ScanFinding) {
+  return finding.checkKey === "attack-surface-summary";
+}
+
+function compactReportValue(value: unknown, maxLength = 120) {
+  if (value === null || value === undefined || value === "") {
+    return "";
+  }
+
+  const raw =
+    typeof value === "string" || typeof value === "number" || typeof value === "boolean"
+      ? String(value)
+      : JSON.stringify(value);
+  const compact = raw.replace(/\s+/g, " ").trim();
+  return compact.length > maxLength ? `${compact.slice(0, maxLength - 1).trimEnd()}...` : compact;
+}
+
+function evidenceLinesForReport(finding: ScanFinding, maxLines = 5) {
+  if (finding.locked) {
+    return [];
+  }
+
+  const evidence = finding.evidence ?? {};
+  const lines = [
+    typeof evidence.summary === "string" ? `Proof: ${evidence.summary}` : "",
+    typeof evidence.checkedUrl === "string" ? `URL: ${compactReportValue(evidence.checkedUrl, 180)}` : "",
+    typeof evidence.parameter === "string" ? `Parameter: ${evidence.parameter}` : "",
+    evidence.beforeStatus !== undefined || evidence.afterStatus !== undefined
+      ? `Status: ${compactReportValue(evidence.beforeStatus ?? "n/a", 24)} -> ${compactReportValue(evidence.afterStatus ?? "n/a", 24)}`
+      : "",
+    typeof evidence.responseDiff === "string" ? `Response diff: ${compactReportValue(evidence.responseDiff, 120)}` : "",
+    typeof evidence.confidence === "string" ? `Evidence confidence: ${evidence.confidence}` : "",
+  ].filter(Boolean);
+
+  const resultItems = Array.isArray(evidence.results)
+    ? evidence.results.slice(0, 3)
+    : Array.isArray(evidence.activeProbes)
+      ? evidence.activeProbes.slice(0, 3)
+      : [];
+
+  resultItems.forEach((item, index) => {
+    if (!item || typeof item !== "object") {
+      return;
+    }
+
+    const row = item as Record<string, unknown>;
+    const parts = [
+      row.url ? `url=${compactReportValue(row.url, 120)}` : "",
+      row.parameter ? `param=${compactReportValue(row.parameter, 40)}` : "",
+      row.payload ? `payload=${compactReportValue(row.payload, 56)}` : "",
+      row.baselineStatus ? `before=${row.baselineStatus}` : "",
+      row.status ? `after=${row.status}` : "",
+      row.baselineRecordCount !== undefined ? `baselineRecords=${row.baselineRecordCount}` : "",
+      row.probeRecordCount !== undefined ? `probeRecords=${row.probeRecordCount}` : "",
+      row.recordExpansion ? "responseDiff=record-expansion" : "",
+      row.sqlError ? "sqlError=true" : "",
+      row.timeDelay ? "timeDelay=true" : "",
+      row.executed ? "executed=true" : "",
+    ].filter(Boolean);
+
+    if (parts.length > 0) {
+      lines.push(`Probe ${index + 1}: ${parts.join(", ")}`);
+    }
+  });
+
+  return lines.slice(0, maxLines);
+}
+
+function numericEvidence(evidence: Record<string, unknown>, key: string) {
+  const value = evidence[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function stringEvidence(evidence: Record<string, unknown>, key: string) {
+  const value = evidence[key];
+  return typeof value === "string" ? value : "";
+}
+
+function objectEvidence(value: unknown) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function nestedRecord(value: Record<string, unknown> | null, key: string) {
+  return value ? objectEvidence(value[key]) : null;
+}
+
+function nestedNumber(value: Record<string, unknown> | null, key: string) {
+  const entry = value?.[key];
+  return typeof entry === "number" && Number.isFinite(entry) ? entry : 0;
+}
+
+function nestedString(value: Record<string, unknown> | null, key: string) {
+  const entry = value?.[key];
+  return typeof entry === "string" ? entry : "";
+}
+
+function findingHasConcreteTarget(finding: ScanFinding) {
+  const evidence = finding.evidence ?? {};
+  return Boolean(
+    finding.affectedUrl ||
+      finding.affectedParameter ||
+      (typeof evidence.checkedUrl === "string" && evidence.checkedUrl.trim()) ||
+      (typeof evidence.url === "string" && evidence.url.trim()) ||
+      finding.structuredEvidence?.some((entry) => entry.url || entry.parameter),
+  );
+}
+
+function isConcreteFixableFinding(finding: ScanFinding) {
+  const status = deriveFindingStatus(finding);
+  const title = `${finding.title} ${finding.checkKey ?? ""}`.toLowerCase();
+  const findingClass = String(finding.findingClass ?? "").toLowerCase();
+  const isMeta =
+    finding.isMetaFinding === true ||
+    findingClass.includes("attack-path") ||
+    title.includes("attack path analysis") ||
+    title.includes("authenticated session context") ||
+    title.includes("session model") ||
+    title.includes("role-based access matrix") ||
+    title.includes("browser-rendered crawl coverage") ||
+    title.includes("technology fingerprinting") ||
+    title.includes("attack surface summary") ||
+    title.includes("authentication surface review");
+
+  return (
+    status !== "pass" &&
+    status !== "info" &&
+    finding.isExploitSupportingEvidence !== true &&
+    !isMeta &&
+    findingHasConcreteTarget(finding)
+  );
+}
+
+function isMetaOrSupportingFinding(finding: ScanFinding) {
+  const title = `${finding.title} ${finding.checkKey ?? ""}`.toLowerCase();
+  const findingClass = String(finding.findingClass ?? "").toLowerCase();
+
+  return (
+    finding.isMetaFinding === true ||
+    finding.isExploitSupportingEvidence === true ||
+    findingClass.includes("attack-path") ||
+    title.includes("attack path analysis") ||
+    title.includes("authenticated session context") ||
+    title.includes("session model") ||
+    title.includes("role-based access matrix") ||
+    title.includes("browser-rendered crawl coverage") ||
+    title.includes("technology fingerprinting") ||
+    title.includes("attack surface summary")
+  );
+}
+
+function isConfirmedExploitableFinding(finding: ScanFinding) {
+  return (
+    (finding.isFixableVulnerability === true ||
+      (finding.isFixableVulnerability !== false && isConcreteFixableFinding(finding))) &&
+    finding.confidence === "confirmed" &&
+    deriveFindingStatus(finding) === "fail" &&
+    isConcreteFixableFinding(finding)
+  );
+}
+
+function isInvalidFixTitle(title: string) {
+  const normalizedTitle = title.toLowerCase();
+
+  return (
+    !normalizedTitle ||
+    normalizedTitle.includes("attack path analysis") ||
+    normalizedTitle.includes("authenticated session context") ||
+    normalizedTitle.includes("session model") ||
+    normalizedTitle.includes("role-based access matrix") ||
+    normalizedTitle.includes("browser-rendered crawl coverage") ||
+    normalizedTitle.includes("technology fingerprinting") ||
+    normalizedTitle.includes("attack surface summary")
+  );
+}
+
+function isConcreteTopFixEntry(entry: Record<string, unknown>, allFindings: ScanFinding[]) {
+  const title = nestedString(entry, "title");
+  const id = nestedString(entry, "id");
+
+  if (isInvalidFixTitle(title)) {
+    return false;
+  }
+
+  const matchingFinding = allFindings.find((finding) => finding.id === id || finding.title === title);
+  return matchingFinding ? isConcreteFixableFinding(matchingFinding) : true;
+}
+
+function calculateClientSecurityScore(findings: ScanFinding[]) {
+  let score = 100;
+  const confirmedConcreteCritical = findings.filter(
+    (finding) =>
+      isConfirmedExploitableFinding(finding) &&
+      finding.severity === "critical",
+  );
+  const confirmedConcreteHigh = findings.filter(
+    (finding) =>
+      isConfirmedExploitableFinding(finding) &&
+      finding.severity === "high",
+  );
+  const likelyHighOrCritical = findings.filter(
+    (finding) =>
+      (finding.isFixableVulnerability === true ||
+        (finding.isFixableVulnerability !== false && isConcreteFixableFinding(finding))) &&
+      finding.confidence === "likely" &&
+      (finding.severity === "high" || finding.severity === "critical") &&
+      isConcreteFixableFinding(finding),
+  );
+  const likelyMedium = findings.filter(
+    (finding) =>
+      (finding.isFixableVulnerability === true ||
+        (finding.isFixableVulnerability !== false && isConcreteFixableFinding(finding))) &&
+      finding.confidence === "likely" &&
+      finding.severity === "medium" &&
+      isConcreteFixableFinding(finding),
+  );
+  const lowFixable = findings.filter(
+    (finding) =>
+      (finding.isFixableVulnerability === true ||
+        (finding.isFixableVulnerability !== false && isConcreteFixableFinding(finding))) &&
+      finding.severity === "low" &&
+      isConcreteFixableFinding(finding),
+  );
+
+  score -= confirmedConcreteCritical.length * 30;
+  score -= confirmedConcreteHigh.length * 20;
+  score -= likelyHighOrCritical.length * 12;
+  score -= likelyMedium.length * 5;
+  score -= lowFixable.length * 2;
+
+  const hasConfirmedAuthBypass = findings.some(
+    (finding) =>
+      isConfirmedExploitableFinding(finding) &&
+      finding.title.toLowerCase().includes("authentication bypass"),
+  );
+  const hasConfirmedSqli = findings.some(
+    (finding) =>
+      isConfirmedExploitableFinding(finding) &&
+      (finding.title.toLowerCase().includes("sql injection") ||
+        String(finding.findingClass ?? "").toLowerCase().includes("injection")),
+  );
+  const hasPrimaryAttackPath = findings.some(
+    (finding) =>
+      finding.confidence === "confirmed" &&
+      (String(finding.findingClass ?? "").toLowerCase().includes("attack-path") ||
+        finding.title.toLowerCase().includes("attack path analysis")),
+  );
+
+  if (confirmedConcreteCritical.length > 0) score = Math.min(score, 40);
+  if (hasConfirmedSqli) score = Math.min(score, 35);
+  if (hasConfirmedAuthBypass) score = Math.min(score, 30);
+  if (hasConfirmedSqli && hasConfirmedAuthBypass) score = Math.min(score, 25);
+  if (hasPrimaryAttackPath && (hasConfirmedSqli || hasConfirmedAuthBypass)) score = Math.min(score, 25);
+
+  const catastrophic = confirmedConcreteCritical.length >= 5;
+  if (!catastrophic && hasConfirmedSqli && hasConfirmedAuthBypass) {
+    score = Math.max(score, 20);
+  }
+  score = catastrophic ? Math.max(score, 0) : Math.max(score, 10);
+  const roundedScore = Math.max(0, Math.min(100, Math.round(score)));
+  const riskLabel =
+    roundedScore >= 80 ? "Low Risk" :
+    roundedScore >= 60 ? "Medium Risk" :
+    roundedScore >= 40 ? "High Risk" :
+    "Critical Risk";
+
+  return {
+    score: roundedScore,
+    riskLabel,
+    explanation:
+      "Security score is risk-based and capped by confirmed critical exploitable findings and attack path evidence.",
+  };
+}
+
+function extractAttackSurfaceSummary(findings: Record<CategoryKey, ScanFinding[]>) {
+  const summaryFinding = findings.security.find((finding) => finding.checkKey === "attack-surface-summary");
+  const evidence = (summaryFinding?.evidence ?? {}) as Record<string, unknown>;
+  const reportSummary = objectEvidence(evidence.reportSummary);
+  const reportCounts = nestedRecord(reportSummary, "counts");
+  const reportSecurity = nestedRecord(reportSummary, "security");
+  const reportAttackSurface = nestedRecord(reportSummary, "attackSurface");
+  const reportRecommendedFix = objectEvidence(reportSummary?.recommendedFirstFix);
+  const allFindings = categoryKeys.flatMap((category) => findings[category]);
+  const fallbackCritical = allFindings.filter(
+    (finding) => deriveFindingStatus(finding) === "fail" && finding.severity === "critical",
+  ).length;
+  const fallbackConfirmed = allFindings.filter(
+    isConfirmedExploitableFinding,
+  ).length;
+  const fallbackSupporting = allFindings.filter(
+    (finding) => finding.confidence === "confirmed" && isMetaOrSupportingFinding(finding),
+  ).length;
+  const fallbackLikelyHighImpact = allFindings.filter(
+    (finding) =>
+      (finding.isFixableVulnerability === true ||
+        (finding.isFixableVulnerability !== false && isConcreteFixableFinding(finding))) &&
+      finding.confidence === "likely" &&
+      (finding.severity === "high" || finding.severity === "critical") &&
+      isConcreteFixableFinding(finding),
+  ).length;
+  const fallbackSecurity = calculateClientSecurityScore(allFindings);
+  const fallbackRecommendedFix = [...allFindings]
+    .filter(isConcreteFixableFinding)
+    .sort((left, right) => (right.riskScore ?? 0) - (left.riskScore ?? 0))[0];
+  const evidenceRecommendedFix = stringEvidence(evidence, "recommendedFirstFix");
+  const safeEvidenceRecommendedFix = isInvalidFixTitle(evidenceRecommendedFix) ? "" : evidenceRecommendedFix;
+
+  if (!summaryFinding) {
+    return null;
+  }
+
+  return {
+    finding: summaryFinding,
+    evidence,
+    reportSummary,
+    recommendedFirstFix:
+      nestedString(reportRecommendedFix, "title") ||
+      safeEvidenceRecommendedFix ||
+      fallbackRecommendedFix?.title ||
+      "No concrete exploitable vulnerability was confirmed",
+    recommendedFirstFixReason:
+      stringEvidence(evidence, "recommendedFirstFixReason") ||
+      nestedString(reportRecommendedFix, "fixFirstReason") ||
+      nestedString(reportRecommendedFix, "proofSummary") ||
+      nestedString(reportRecommendedFix, "shortDescription") ||
+      "No concrete exploitable vulnerability was confirmed.",
+    scanMode: stringEvidence(evidence, "scanMode") || "Fast",
+    security: {
+      score: nestedNumber(reportSecurity, "score") || numericEvidence(evidence, "securityScore") || fallbackSecurity.score,
+      riskLabel:
+        nestedString(reportSecurity, "riskLabel") ||
+        stringEvidence(evidence, "securityRiskLabel") ||
+        fallbackSecurity.riskLabel,
+      explanation:
+        nestedString(reportSecurity, "explanation") ||
+        stringEvidence(evidence, "securityScoreExplanation") ||
+        fallbackSecurity.explanation,
+    },
+    metrics: [
+      { label: "Critical issues", value: nestedNumber(reportCounts, "criticalIssues") || numericEvidence(evidence, "criticalIssues") || fallbackCritical },
+      { label: "Confirmed exploitable vulnerabilities", value: nestedNumber(reportCounts, "confirmedExploitableVulnerabilities") || numericEvidence(evidence, "confirmedExploitableVulnerabilities") || fallbackConfirmed },
+      { label: "Supporting evidence", value: nestedNumber(reportCounts, "confirmedSupportingEvidence") || numericEvidence(evidence, "confirmedSupportingEvidence") || fallbackSupporting },
+      { label: "Likely high-impact", value: nestedNumber(reportCounts, "likelyHighImpactIssues") || numericEvidence(evidence, "likelyHighImpactIssues") || fallbackLikelyHighImpact },
+      { label: "Public APIs", value: nestedNumber(reportAttackSurface, "publicApis") || numericEvidence(evidence, "publicApis") },
+      { label: "Sensitive endpoints", value: nestedNumber(reportAttackSurface, "sensitiveEndpoints") || numericEvidence(evidence, "sensitiveEndpoints") },
+      { label: "Missing headers", value: nestedNumber(reportAttackSurface, "missingHeaders") || numericEvidence(evidence, "missingHeaders") },
+      { label: "Crawled pages", value: nestedNumber(reportAttackSurface, "crawledPages") || numericEvidence(evidence, "crawledPages") },
+      { label: "Discovered endpoints", value: nestedNumber(reportAttackSurface, "discoveredEndpoints") || numericEvidence(evidence, "discoveredEndpoints") },
+      { label: "Tested parameters", value: nestedNumber(reportAttackSurface, "testedParameters") || numericEvidence(evidence, "testedParameters") },
+      { label: "Active probes", value: numericEvidence(evidence, "activeProbesExecuted") },
+      { label: "Duration", value: stringEvidence(evidence, "scanDuration") || "Running" },
+    ],
+  };
 }
 
 function findingAccentTone(finding: ScanFinding) {
@@ -252,6 +676,31 @@ async function downloadReportPdf(
         };
     }
   };
+  const getConfidenceTheme = (
+    confidence: NonNullable<ScanFinding["confidence"]>,
+  ): { fill: PdfColor; border: PdfColor; text: PdfColor } => {
+    switch (confidence) {
+      case "confirmed":
+        return {
+          fill: [254, 242, 242] as const,
+          border: [254, 202, 202] as const,
+          text: [185, 28, 28] as const,
+        };
+      case "likely":
+        return {
+          fill: [255, 251, 235] as const,
+          border: [253, 230, 138] as const,
+          text: [180, 83, 9] as const,
+        };
+      case "info":
+      default:
+        return {
+          fill: [248, 250, 252] as const,
+          border: [226, 232, 240] as const,
+          text: [71, 85, 105] as const,
+        };
+    }
+  };
   const getPillWidth = (text: string, fontSize = 8.5, horizontalPadding = 10) => {
     doc.setFont("helvetica", "bold");
     doc.setFontSize(fontSize);
@@ -350,8 +799,14 @@ async function downloadReportPdf(
     }
 
     const evidence = finding.evidence ?? {};
+    const confidence = finding.confidence ?? "info";
     const lines = [
+      `Confidence: ${confidence.toUpperCase()}`,
       typeof evidence.summary === "string" ? `Proof: ${evidence.summary}` : "",
+      evidence.beforeStatus !== undefined || evidence.afterStatus !== undefined
+        ? `Status: ${compactPdfValue(evidence.beforeStatus ?? "n/a", 24)} -> ${compactPdfValue(evidence.afterStatus ?? "n/a", 24)}`
+        : "",
+      typeof evidence.responseDiff === "string" ? `Response diff: ${compactPdfValue(evidence.responseDiff, 110)}` : "",
       Array.isArray(evidence.probePayloads)
         ? `Payloads: ${evidence.probePayloads.map((payload) => compactPdfValue(payload, 42)).filter(Boolean).join(", ")}`
         : typeof evidence.probePayload === "string"
@@ -371,10 +826,17 @@ async function downloadReportPdf(
 
       const row = item as Record<string, unknown>;
       const proofParts = [
-        compactPdfValue(row.parameter ? `param=${row.parameter}` : row.mutatedUrl ? `mutated=${row.mutatedUrl}` : "", 90),
-        compactPdfValue(row.status ? `status=${row.status}` : "", 30),
+        compactPdfValue(row.url ? `url=${row.url}` : row.mutatedUrl ? `mutated=${row.mutatedUrl}` : "", 120),
+        compactPdfValue(row.parameter ? `param=${row.parameter}` : "", 40),
+        compactPdfValue(row.payload ? `payload=${row.payload}` : "", 56),
+        compactPdfValue(row.baselineStatus ? `before=${row.baselineStatus}` : "", 30),
+        compactPdfValue(row.status ? `after=${row.status}` : "", 30),
+        row.baselineRecordCount !== undefined ? compactPdfValue(`baselineRecords=${row.baselineRecordCount}`, 40) : "",
+        row.probeRecordCount !== undefined ? compactPdfValue(`probeRecords=${row.probeRecordCount}`, 40) : "",
         row.sqlError ? "sql-error=true" : "",
         row.recordExpansion ? "record-expansion=true" : "",
+        row.timeDelay ? "time-delay=true" : "",
+        row.executed ? "executed=true" : "",
         row.context ? compactPdfValue(`context=${row.context}`, 50) : "",
       ].filter(Boolean);
       lines.push(`Result ${index + 1}: ${proofParts.join(", ") || compactPdfValue(row, 120)}`);
@@ -393,12 +855,14 @@ async function downloadReportPdf(
     score,
     passCount,
     failCount,
+    riskLabel,
   }: {
     x: number;
     label: string;
     score: number | null;
     passCount: number;
     failCount: number;
+    riskLabel?: string;
   }) => {
     const cardWidth = (contentWidth - 24) / 4;
     const y = cursorY;
@@ -434,13 +898,20 @@ async function downloadReportPdf(
     doc.setFont("helvetica", "bold");
     doc.setFontSize(9);
     doc.setTextColor(...tone);
-    doc.text(`SCORE ${formatScorePercent(score)}`, x + 14, y + 80);
+    if (riskLabel) {
+      doc.text(`RISK ${riskLabel}`, x + 14, y + 76);
+      doc.text(`SCORE ${score ?? "--"}/100`, x + 14, y + 86);
+    } else {
+      doc.text(`SCORE ${formatScorePercent(score)}`, x + 14, y + 80);
+    }
   };
 
   const drawFindingCard = (finding: ScanFinding) => {
     const cardX = marginX;
     const cardWidth = contentWidth;
     const statusTheme = getStatusTheme(finding.status);
+    const confidence = finding.confidence ?? "info";
+    const confidenceTheme = getConfidenceTheme(confidence);
     const severityTheme = getSeverityTheme(finding.severity);
     const issueDetected = finding.status === "warning" || finding.status === "fail";
     const innerX = cardX + (issueDetected ? 26 : 18);
@@ -450,11 +921,17 @@ async function downloadReportPdf(
       finding.status === "warning" || finding.status === "fail"
         ? `${finding.severity.toUpperCase()} SEVERITY`
         : null;
+    const confidenceLabel = confidence.toUpperCase();
     const chipGap = 8;
     const chipHeight = 20;
     const statusChipWidth = getPillWidth(statusLabel);
     const severityChipWidth = severityLabel ? getPillWidth(severityLabel) : 0;
-    const chipsWidth = statusChipWidth + (severityLabel ? chipGap + severityChipWidth : 0);
+    const confidenceChipWidth = getPillWidth(confidenceLabel);
+    const chipsWidth =
+      statusChipWidth +
+      confidenceChipWidth +
+      chipGap +
+      (severityLabel ? chipGap + severityChipWidth : 0);
     const titleLines = splitLines(finding.title, 16, Math.max(180, innerWidth - chipsWidth - 18));
     const summaryLines = splitLines(finding.shortDescription, 11, innerWidth);
     const detailPanelGap = 12;
@@ -526,10 +1003,10 @@ async function downloadReportPdf(
     });
 
     const chipsY = startY + 18;
-    let chipCursorX = cardX + cardWidth - 18 - statusChipWidth;
+    let chipCursorX = cardX + cardWidth - 18;
     if (severityLabel) {
-      const severityX = cardX + cardWidth - 18 - severityChipWidth;
-      chipCursorX = severityX - chipGap - statusChipWidth;
+      const severityX = chipCursorX - severityChipWidth;
+      chipCursorX = severityX - chipGap;
       drawPill({
         x: severityX,
         y: chipsY,
@@ -539,6 +1016,17 @@ async function downloadReportPdf(
         color: severityTheme.text,
       });
     }
+    const confidenceX = chipCursorX - confidenceChipWidth;
+    chipCursorX = confidenceX - chipGap;
+    drawPill({
+      x: confidenceX,
+      y: chipsY,
+      text: confidenceLabel,
+      fill: confidenceTheme.fill,
+      border: confidenceTheme.border,
+      color: confidenceTheme.text,
+    });
+    chipCursorX -= statusChipWidth;
     drawPill({
       x: chipCursorX,
       y: chipsY,
@@ -636,11 +1124,110 @@ async function downloadReportPdf(
     cursorY += cardHeight + 12;
   };
 
-  const pdfAllFindings = categoryKeys.flatMap((category) => findings[category]);
+  const pdfFindings = Object.fromEntries(
+    categoryKeys.map((category) => [
+      category,
+      findings[category].filter((finding) => !isAttackSurfaceSummaryFinding(finding)),
+    ]),
+  ) as Record<CategoryKey, ScanFinding[]>;
+  const pdfAllFindings = categoryKeys.flatMap((category) => pdfFindings[category]);
   const pdfOverallCounts = summarizeFindingCounts(pdfAllFindings);
   const pdfCategoryCounts = Object.fromEntries(
-    categoryKeys.map((category) => [category, summarizeFindingCounts(findings[category])]),
+    categoryKeys.map((category) => [category, summarizeFindingCounts(pdfFindings[category])]),
   ) as Record<CategoryKey, ReturnType<typeof summarizeFindingCounts>>;
+  const pdfAttackSurface = extractAttackSurfaceSummary(findings);
+  const pdfReportSummary = pdfAttackSurface?.reportSummary ?? null;
+  const pdfReportCounts = nestedRecord(pdfReportSummary, "counts");
+  const pdfReportSecurity = nestedRecord(pdfReportSummary, "security");
+  const pdfConfirmedFindings = pdfAllFindings.filter(
+    isConfirmedExploitableFinding,
+  );
+  const pdfSupportingEvidenceCount =
+    nestedNumber(pdfReportCounts, "confirmedSupportingEvidence") ||
+    pdfAllFindings.filter(
+      (finding) =>
+        finding.confidence === "confirmed" &&
+        (finding.isMetaFinding === true || finding.isExploitSupportingEvidence === true),
+    ).length;
+  const pdfLikelyFindings = pdfAllFindings.filter(
+    (finding) =>
+      finding.isFixableVulnerability === true &&
+      finding.confidence === "likely" &&
+      (finding.severity === "high" || finding.severity === "critical") &&
+      isConcreteFixableFinding(finding),
+  );
+  const pdfInfoFindings = pdfAllFindings.filter(
+    (finding) => (finding.confidence ?? "info") === "info" || deriveFindingStatus(finding) === "info",
+  );
+  const pdfReportTopFixes = Array.isArray(pdfReportSummary?.topFixes)
+    ? (pdfReportSummary.topFixes as Array<Record<string, unknown>>)
+        .filter((entry) => isConcreteTopFixEntry(entry, pdfAllFindings))
+        .slice(0, 5)
+    : [];
+  const pdfEvidenceTopFixes = Array.isArray(pdfAttackSurface?.evidence.topFixes)
+    ? (pdfAttackSurface.evidence.topFixes as Array<Record<string, unknown>>)
+        .filter((entry) => isConcreteTopFixEntry(entry, pdfAllFindings))
+        .slice(0, 5)
+    : [];
+  const pdfFallbackTopFixes = pdfAllFindings
+    .filter(isConcreteFixableFinding)
+    .sort((left, right) => (right.riskScore ?? 0) - (left.riskScore ?? 0))
+    .slice(0, 5)
+    .map((finding, index) => ({
+      rank: index + 1,
+      id: finding.id,
+      title: finding.title,
+      riskScore: finding.riskScore ?? 0,
+      reason: finding.proofSummary ?? finding.shortDescription,
+      recommendation: finding.recommendation,
+    }));
+  const pdfTopFixes =
+    pdfReportTopFixes.length > 0
+      ? pdfReportTopFixes
+      : pdfEvidenceTopFixes.length > 0
+        ? pdfEvidenceTopFixes
+        : pdfFallbackTopFixes;
+  const pdfRecommendedFix =
+    objectEvidence(pdfReportSummary?.recommendedFirstFix) ??
+    (pdfTopFixes[0] ?? null);
+  const pdfRecommendedFixTitle =
+    nestedString(pdfRecommendedFix, "title") ||
+    (isInvalidFixTitle(pdfAttackSurface?.recommendedFirstFix ?? "") ? "" : pdfAttackSurface?.recommendedFirstFix) ||
+    "No concrete exploitable vulnerability was confirmed";
+  const pdfRecommendedFixReason =
+    nestedString(pdfRecommendedFix, "fixFirstReason") ||
+    nestedString(pdfRecommendedFix, "proofSummary") ||
+    nestedString(pdfRecommendedFix, "shortDescription") ||
+    pdfAttackSurface?.recommendedFirstFixReason ||
+    "No concrete exploitable vulnerability was confirmed.";
+  const pdfFallbackSecurity = calculateClientSecurityScore(pdfAllFindings);
+  const pdfSecurityScore =
+    nestedNumber(pdfReportSecurity, "score") ||
+    pdfAttackSurface?.security.score ||
+    scan.securityScore ||
+    pdfFallbackSecurity.score ||
+    null;
+  const pdfSecurityRiskLabel =
+    nestedString(pdfReportSecurity, "riskLabel") ||
+    pdfAttackSurface?.security.riskLabel ||
+    pdfFallbackSecurity.riskLabel ||
+    (pdfSecurityScore !== null && pdfSecurityScore < 40 ? "Critical Risk" : "");
+  const pdfSecurityExplanation =
+    nestedString(pdfReportSecurity, "explanation") ||
+    pdfAttackSurface?.security.explanation ||
+    pdfFallbackSecurity.explanation ||
+    "Security score is risk-based and capped by confirmed critical exploitable findings and attack path evidence.";
+  const pdfAttackPaths = Array.isArray(pdfAttackSurface?.evidence.attackPaths)
+    ? (pdfAttackSurface.evidence.attackPaths as Array<Record<string, unknown>>).slice(0, 3)
+    : [];
+  const pdfSessionModel =
+    pdfAttackSurface?.evidence.sessionModel &&
+    typeof pdfAttackSurface.evidence.sessionModel === "object"
+      ? (pdfAttackSurface.evidence.sessionModel as Record<string, unknown>)
+      : null;
+  const pdfAccessMatrix = Array.isArray(pdfAttackSurface?.evidence.accessMatrix)
+    ? (pdfAttackSurface.evidence.accessMatrix as Array<Record<string, unknown>>).slice(0, 12)
+    : [];
 
   const headerBadgeRadius = 34;
   const headerRightX = pageWidth - marginX - 68;
@@ -674,6 +1261,12 @@ async function downloadReportPdf(
     text: `Status: ${scan.status}`,
     fontSize: 11,
     color: palette.muted,
+    gapAfter: 0,
+  });
+  drawTextBlock({
+    text: `Scan mode: ${pdfAttackSurface?.scanMode ?? scan.scanMode ?? "Fast"} | Confirmed exploitable vulnerabilities: ${nestedNumber(pdfReportCounts, "confirmedExploitableVulnerabilities") || pdfConfirmedFindings.length} | Supporting evidence: ${pdfSupportingEvidenceCount} | Likely high-impact: ${nestedNumber(pdfReportCounts, "likelyHighImpactIssues") || pdfLikelyFindings.length} | Informational findings: ${nestedNumber(pdfReportCounts, "informationalFindings") || pdfInfoFindings.length}`,
+    fontSize: 11,
+    color: palette.muted,
     gapAfter: 20,
   });
 
@@ -704,9 +1297,10 @@ async function downloadReportPdf(
   drawMetricCard({
     x: marginX + metricWidth + 8,
     label: "Security",
-    score: scan.securityScore,
+    score: pdfSecurityScore,
     passCount: pdfCategoryCounts.security.passCount,
     failCount: pdfCategoryCounts.security.failCount,
+    riskLabel: pdfSecurityRiskLabel,
   });
   drawMetricCard({
     x: marginX + (metricWidth + 8) * 2,
@@ -724,17 +1318,246 @@ async function downloadReportPdf(
   });
   cursorY += 114;
 
+  if (pdfAttackSurface) {
+    ensureSpace(124);
+    const boxY = cursorY;
+    doc.setFillColor(...palette.surface);
+    doc.setDrawColor(...palette.border);
+    doc.roundedRect(marginX, boxY, contentWidth, 112, 16, 16, "FD");
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(13);
+    doc.setTextColor(...palette.ink);
+    doc.text("Attack Surface Summary", marginX + 16, boxY + 24);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.setTextColor(...palette.muted);
+    doc.text(`Scan mode: ${pdfAttackSurface.scanMode}`, pageWidth - marginX - 16, boxY + 24, {
+      align: "right",
+    });
+
+    const metricGap = 8;
+    const summaryMetrics = pdfAttackSurface.metrics.slice(0, 8);
+    const summaryCardWidth = (contentWidth - 32 - metricGap * 3) / 4;
+    summaryMetrics.forEach((metric, index) => {
+      const column = index % 4;
+      const row = Math.floor(index / 4);
+      const x = marginX + 16 + column * (summaryCardWidth + metricGap);
+      const y = boxY + 38 + row * 28;
+      doc.setFillColor(...palette.white);
+      doc.setDrawColor(...palette.border);
+      doc.roundedRect(x, y, summaryCardWidth, 24, 8, 8, "FD");
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(8);
+      doc.setTextColor(...palette.ink);
+      doc.text(String(metric.value), x + 8, y + 15);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(6.5);
+      doc.setTextColor(...palette.muted);
+      doc.text(metric.label.toUpperCase(), x + summaryCardWidth - 8, y + 15, {
+        align: "right",
+      });
+    });
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(9);
+    doc.setTextColor(...palette.primary);
+    doc.text(
+      `Recommended first fix: ${compactPdfValue(pdfRecommendedFixTitle, 150)}`,
+      marginX + 16,
+      boxY + 102,
+    );
+    cursorY += 126;
+  }
+
+  ensureSpace(120);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(18);
+  doc.setTextColor(...palette.ink);
+  doc.text("Executive Summary", marginX, cursorY);
+  cursorY += 24;
+  drawTextBlock({
+    text:
+      pdfConfirmedFindings.length > 0
+        ? `This scan confirmed ${nestedNumber(pdfReportCounts, "confirmedExploitableVulnerabilities") || pdfConfirmedFindings.length} exploitable vulnerability/vulnerabilities and identified ${nestedNumber(pdfReportCounts, "likelyHighImpactIssues") || pdfLikelyFindings.length} likely high-impact issue(s). The highest priority fix is ${pdfRecommendedFixTitle} because it is the strongest concrete fixable issue by confidence, exposure, and attack-path impact. The report separates confirmed exploitability from supporting evidence and coverage notes.`
+        : `This scan did not confirm a concrete exploitable vulnerability. Review ${nestedNumber(pdfReportCounts, "likelyHighImpactIssues") || pdfLikelyFindings.length} likely high-impact issue(s) and ${nestedNumber(pdfReportCounts, "informationalFindings") || pdfInfoFindings.length} informational coverage note(s) for areas that may require deeper authenticated testing.`,
+    fontSize: 11,
+    color: palette.ink,
+    gapAfter: 12,
+  });
+  drawTextBlock({
+    text: `Security Risk: ${pdfSecurityRiskLabel || "Unknown"} | Security Score: ${pdfSecurityScore ?? "--"}/100. ${pdfSecurityExplanation}`,
+    fontSize: 10,
+    color: palette.muted,
+    gapAfter: 12,
+  });
+
+  ensureSpace(120);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(16);
+  doc.setTextColor(...palette.ink);
+  doc.text("Recommended First Fix", marginX, cursorY);
+  cursorY += 20;
+  drawTextBlock({
+    text: pdfRecommendedFixTitle,
+    fontSize: 12,
+    color: palette.primary,
+    fontStyle: "bold",
+    gapAfter: 4,
+  });
+  drawTextBlock({
+    text: compactPdfValue(pdfRecommendedFixReason, 240),
+    fontSize: 10,
+    color: palette.muted,
+    gapAfter: 16,
+  });
+
+  if (pdfTopFixes.length > 0) {
+    ensureSpace(160);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(16);
+    doc.setTextColor(...palette.ink);
+    doc.text("Top 5 Fixes", marginX, cursorY);
+    cursorY += 20;
+    pdfTopFixes.forEach((fix, index) => {
+      ensureSpace(42);
+      doc.setFillColor(...palette.surface);
+      doc.setDrawColor(...palette.border);
+      doc.roundedRect(marginX, cursorY, contentWidth, 34, 10, 10, "FD");
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(10);
+      doc.setTextColor(...palette.primary);
+      doc.text(`#${index + 1}`, marginX + 10, cursorY + 21);
+      doc.setTextColor(...palette.ink);
+      doc.text(compactPdfValue(fix.title, 84), marginX + 42, cursorY + 14);
+	      doc.setFont("helvetica", "normal");
+	      doc.setFontSize(8);
+	      doc.setTextColor(...palette.muted);
+	      doc.text(
+	        `Risk ${compactPdfValue(fix.riskScore ?? 0, 12)} | ${compactPdfValue(fix.reason ?? fix.fixFirstReason ?? fix.proofSummary ?? fix.shortDescription, 120)}`,
+	        marginX + 42,
+	        cursorY + 27,
+	      );
+	      cursorY += 42;
+	    });
+  }
+
+  if (pdfAttackPaths.length > 0) {
+    doc.addPage();
+    cursorY = marginY;
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(18);
+    doc.setTextColor(...palette.ink);
+    doc.text("Attack Path Analysis", marginX, cursorY);
+    cursorY += 24;
+    pdfAttackPaths.forEach((path, pathIndex) => {
+      const steps = Array.isArray(path.steps) ? (path.steps as Array<Record<string, unknown>>) : [];
+      drawTextBlock({
+        text: `${pathIndex + 1}. ${compactPdfValue(path.title, 140)}`,
+        fontSize: 12,
+        color: palette.primary,
+        fontStyle: "bold",
+        gapAfter: 4,
+      });
+      drawTextBlock({
+        text: compactPdfValue(path.summary ?? path.finalImpact ?? "", 240),
+        fontSize: 10,
+        color: palette.muted,
+        gapAfter: 8,
+      });
+      steps.slice(0, 5).forEach((step, index) => {
+        ensureSpace(58);
+        doc.setFillColor(...palette.surface);
+        doc.setDrawColor(...palette.border);
+        doc.roundedRect(marginX, cursorY, contentWidth, 48, 12, 12, "FD");
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(9);
+        doc.setTextColor(...palette.ink);
+        doc.text(`Step ${index + 1}: ${compactPdfValue(step.title, 100)}`, marginX + 12, cursorY + 15);
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(8);
+        doc.setTextColor(...palette.muted);
+        doc.text(compactPdfValue(`Action: ${step.attackerAction ?? ""}`, 150), marginX + 12, cursorY + 29);
+        doc.text(compactPdfValue(`Evidence: ${step.technicalEvidence ?? ""}`, 150), marginX + 12, cursorY + 41);
+        cursorY += 58;
+      });
+      drawTextBlock({
+        text: `Fix first: ${compactPdfValue(path.fixFirstReason, 240)}`,
+        fontSize: 10,
+        color: palette.ink,
+        gapAfter: 16,
+      });
+    });
+  }
+
+  if (pdfSessionModel || pdfAccessMatrix.length > 0) {
+    doc.addPage();
+    cursorY = marginY;
+    if (pdfSessionModel) {
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(18);
+      doc.setTextColor(...palette.ink);
+      doc.text("Session Model", marginX, cursorY);
+      cursorY += 24;
+      [
+        `Session type: ${compactPdfValue(pdfSessionModel.sessionType ?? "unknown")}`,
+        `Authenticated context obtained: ${compactPdfValue(pdfSessionModel.authenticatedContextObtained ?? false)}`,
+        `Storage locations: ${Array.isArray(pdfSessionModel.storageLocations) ? pdfSessionModel.storageLocations.join(", ") : "unknown"}`,
+        `Token exposed to JavaScript: ${compactPdfValue(pdfSessionModel.tokenExposedToJavaScript ?? "unknown")}`,
+        `Risks: ${Array.isArray(pdfSessionModel.risks) && pdfSessionModel.risks.length ? pdfSessionModel.risks.join(", ") : "none observed"}`,
+      ].forEach((line) => {
+        drawTextBlock({
+          text: line,
+          fontSize: 10,
+          color: palette.ink,
+          gapAfter: 2,
+        });
+      });
+      cursorY += 12;
+    }
+
+    if (pdfAccessMatrix.length > 0) {
+      ensureSpace(80);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(18);
+      doc.setTextColor(...palette.ink);
+      doc.text("Role-Based Access Matrix", marginX, cursorY);
+      cursorY += 24;
+      pdfAccessMatrix.forEach((row) => {
+        ensureSpace(38);
+        const observed = row.observed && typeof row.observed === "object" ? row.observed as Record<string, { status?: number }> : {};
+        doc.setFillColor(...palette.surface);
+        doc.setDrawColor(...palette.border);
+        doc.roundedRect(marginX, cursorY, contentWidth, 30, 8, 8, "FD");
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(8);
+        doc.setTextColor(...palette.ink);
+        doc.text(compactPdfValue(row.endpoint, 88), marginX + 8, cursorY + 12);
+        doc.setFont("helvetica", "normal");
+        doc.setTextColor(...palette.muted);
+        doc.text(
+          compactPdfValue(
+            `Sensitivity ${row.sensitivity ?? "unknown"} | anon ${observed.anonymous?.status ?? "-"} | userA ${observed.userA?.status ?? "-"} | userB ${observed.userB?.status ?? "-"} | issue ${row.issueType ?? "none"}`,
+            150,
+          ),
+          marginX + 8,
+          cursorY + 24,
+        );
+        cursorY += 38;
+      });
+    }
+  }
+
   categoryKeys.forEach((category) => {
     ensureSpace(40);
     doc.setFont("helvetica", "bold");
     doc.setFontSize(18);
     doc.setTextColor(...palette.ink);
-    doc.text(titleCaseCategory(category), marginX, cursorY);
+    doc.text(category === "security" ? "Security Report" : `${titleCaseCategory(category)} Appendix`, marginX, cursorY);
 
     doc.setFont("helvetica", "normal");
     doc.setFontSize(11);
     doc.setTextColor(...palette.muted);
-    doc.text(`${findings[category].length} checks`, pageWidth - marginX, cursorY, {
+    doc.text(`${pdfFindings[category].length} checks`, pageWidth - marginX, cursorY, {
       align: "right",
     });
 
@@ -744,7 +1567,7 @@ async function downloadReportPdf(
     doc.line(marginX, cursorY, pageWidth - marginX, cursorY);
     cursorY += 20;
 
-    if (findings[category].length === 0) {
+    if (pdfFindings[category].length === 0) {
       drawTextBlock({
         text: "No checks were returned for this category.",
         fontSize: 11,
@@ -754,7 +1577,7 @@ async function downloadReportPdf(
       return;
     }
 
-    findings[category].forEach((finding) => {
+    pdfFindings[category].forEach((finding) => {
       drawFindingCard(finding);
     });
     cursorY += 6;
@@ -837,6 +1660,11 @@ export function ResultsClient({ scanId }: { scanId: string }) {
   const [reportOpen, setReportOpen] = useState(false);
   const [quota, setQuota] = useState<ScanQuotaSummary | null>(null);
   const [paypalOpen, setPaypalOpen] = useState(false);
+  const [severityFilter, setSeverityFilter] = useState<"all" | ScanFinding["severity"]>("all");
+  const [confidenceFilter, setConfidenceFilter] = useState<"all" | NonNullable<ScanFinding["confidence"]>>("all");
+  const [confirmedOnly, setConfirmedOnly] = useState(false);
+  const [attackPathOnly, setAttackPathOnly] = useState(false);
+  const [publicOnly, setPublicOnly] = useState(false);
   const [displayProgress, setDisplayProgress] = useState(0);
   const [progressSession, setProgressSession] = useState<ProgressSessionState>({
     scanId: null,
@@ -894,8 +1722,11 @@ export function ResultsClient({ scanId }: { scanId: string }) {
         return statusIsFinal && findingsAreLoaded;
       })
     : false;
-  const displayProgressCap = allResultsReady ? 100 : 99;
-  const progressTargetForDisplay = allResultsReady ? 100 : Math.min(progressTarget, 99);
+  const liveProgressHoldPercent = scan ? getLiveProgressHoldPercent(scan.id) : 98;
+  const displayProgressCap = allResultsReady ? 100 : liveProgressHoldPercent;
+  const progressTargetForDisplay = allResultsReady
+    ? 100
+    : getLiveProgressTarget(progressTarget, liveProgressHoldPercent);
   const isLiveProgressState = scan ? !allResultsReady : false;
   const isFinishedProgressState = allResultsReady;
   const isNewProgressSession = scan ? progressSession.scanId !== scan.id : false;
@@ -971,11 +1802,15 @@ export function ResultsClient({ scanId }: { scanId: string }) {
       };
     }
 
-    if (displayProgress >= displayProgressCap) {
+    if (displayProgress >= progressTargetForDisplay) {
       return;
     }
 
-    const delay = displayProgress < 70 ? 85 : displayProgress < 90 ? 145 : 220;
+    const delay = getProgressAnimationDelay(
+      displayProgress,
+      progressTargetForDisplay,
+      isFinishedProgressState,
+    );
     const timer = window.setTimeout(() => {
       setDisplayProgress((current) => {
         if (progressSession.scanId !== scan.id) {
@@ -986,7 +1821,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
           return Math.min(100, current + 1);
         }
 
-        return Math.min(99, current + 1);
+        return Math.min(progressTargetForDisplay, current + 1);
       });
     }, delay);
 
@@ -995,7 +1830,6 @@ export function ResultsClient({ scanId }: { scanId: string }) {
     };
   }, [
     displayProgress,
-    displayProgressCap,
     isFinishedProgressState,
     progressSession.scanId,
     progressSession.sawLiveState,
@@ -1029,9 +1863,69 @@ export function ResultsClient({ scanId }: { scanId: string }) {
     [scan, state.findings],
   );
 
-  const activeFindings = state.findings[activeTab];
+  const rawActiveFindings = state.findings[activeTab].filter(
+    (finding) => !isAttackSurfaceSummaryFinding(finding),
+  );
   const latestEvent = state.events[0] ?? null;
-  const allFindings = useMemo(() => categoryKeys.flatMap((category) => state.findings[category]), [state.findings]);
+  const progressSteps = useMemo<ProgressStep[]>(() => {
+    if (!scan) {
+      return [];
+    }
+
+    const hasStarted =
+      scan.progress > 10 ||
+      state.events.length > 0 ||
+      categoryCards.some((item) => item.status !== "queued");
+    const reportStatus: ProgressStepStatus = allResultsReady
+      ? "completed"
+      : scan.status === "failed"
+        ? "failed"
+        : scan.status === "queued"
+          ? "queued"
+          : "running";
+
+    return [
+      {
+        label: "Discovery",
+        status: hasStarted ? "completed" : "running",
+        active: !hasStarted,
+      },
+      ...categoryCards.map((item) => ({
+        label: item.category === "seo" ? "SEO" : titleCaseCategory(item.category),
+        status: item.status,
+        active: item.status === "running",
+      })),
+      {
+        label: "Report",
+        status: reportStatus,
+        active:
+          reportStatus === "running" &&
+          !categoryCards.some((item) => item.status === "running"),
+      },
+    ];
+  }, [allResultsReady, categoryCards, scan, state.events.length]);
+  const activeProgressStepIndex = progressSteps.findIndex((step) => step.active);
+  const progressStepCounter = progressSteps.length
+    ? `${activeProgressStepIndex >= 0 ? activeProgressStepIndex + 1 : progressSteps.length}/${progressSteps.length}`
+    : null;
+  const currentProgressMessage = allResultsReady
+    ? "Report ready. All checks completed."
+    : latestEvent?.message ??
+      (activeProgressStepIndex >= 0
+        ? `${progressSteps[activeProgressStepIndex]?.label} ${formatProgressStatus(progressSteps[activeProgressStepIndex]?.status ?? "queued")}.`
+        : scan?.latestPhase ?? "Preparing scan.");
+  const progressNarrative = allResultsReady
+    ? "All scan results are loaded and the report is ready."
+    : visibleProgress >= liveProgressHoldPercent
+      ? "Finalizing evidence and report output before marking the scan complete."
+      : "Live checks are running across discovery, security, SEO, and performance.";
+  const allFindings = useMemo(
+    () =>
+      categoryKeys
+        .flatMap((category) => state.findings[category])
+        .filter((finding) => !isAttackSurfaceSummaryFinding(finding)),
+    [state.findings],
+  );
   const criticalIssueCount = useMemo(
     () =>
       allFindings.filter(
@@ -1048,6 +1942,10 @@ export function ResultsClient({ scanId }: { scanId: string }) {
     [allFindings],
   );
   const overallCounts = useMemo(() => summarizeFindingCounts(allFindings), [allFindings]);
+  const attackSurfaceSummary = useMemo(
+    () => extractAttackSurfaceSummary(state.findings),
+    [state.findings],
+  );
   const reportMetricCards = [
     {
       label: "Overall",
@@ -1064,6 +1962,24 @@ export function ResultsClient({ scanId }: { scanId: string }) {
       failCount: item.failCount,
     })),
   ];
+  const activeFindings = rawActiveFindings.filter((finding) => {
+    if (severityFilter !== "all" && finding.severity !== severityFilter) {
+      return false;
+    }
+    if (confidenceFilter !== "all" && (finding.confidence ?? "info") !== confidenceFilter) {
+      return false;
+    }
+    if (confirmedOnly && (finding.confidence ?? "info") !== "confirmed") {
+      return false;
+    }
+    if (attackPathOnly && !finding.attackPathParticipant) {
+      return false;
+    }
+    if (publicOnly && !finding.publicEndpoint) {
+      return false;
+    }
+    return true;
+  });
 
   const handleChangeTab = (tab: CategoryKey) => {
     const nextParams = new URLSearchParams(searchParams.toString());
@@ -1263,7 +2179,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                   <span className="rounded-full bg-blue-50 px-3 py-1 text-[11px] font-bold uppercase tracking-[0.18em] text-blue-600">
                     Live Analysis
                   </span>
-                  <span className="inline-flex items-center gap-2 rounded-full bg-white/70 px-3 py-1 text-sm text-slate-500">
+                  <span className="scan-phase-pill inline-flex max-w-full items-center gap-2 rounded-full bg-white/75 px-3 py-1 text-sm text-slate-500 shadow-sm">
                     <span
                       className={cn(
                         "loader-dot inline-flex",
@@ -1274,7 +2190,12 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                             : "text-[var(--primary)]",
                       )}
                     />
-                    {latestEvent?.message ?? scan.latestPhase}
+                    <span className="min-w-0 truncate">{currentProgressMessage}</span>
+                    {progressStepCounter ? (
+                      <span className="hidden shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.12em] text-slate-500 sm:inline-flex">
+                        Step {progressStepCounter}
+                      </span>
+                    ) : null}
                   </span>
                 </div>
                 <h1 className="text-4xl font-semibold tracking-[-0.03em] text-slate-900 md:text-5xl">
@@ -1313,9 +2234,38 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                     style={{ width: `${visibleProgress}%` }}
                   />
                 </div>
-                <p className="mt-4 text-sm text-slate-500">
-                  Live site checks across Security, SEO, and Performance.
-                </p>
+                <p className="mt-4 text-sm text-slate-500">{progressNarrative}</p>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {progressSteps.map((step) => (
+                    <span
+                      key={step.label}
+                      className={cn(
+                        "inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] font-semibold shadow-sm transition-colors",
+                        step.status === "completed" &&
+                          "border-emerald-100 bg-emerald-50 text-emerald-700",
+                        step.status === "running" &&
+                          "border-blue-100 bg-blue-50 text-blue-700",
+                        step.status === "failed" && "border-rose-100 bg-rose-50 text-rose-700",
+                        step.status === "queued" &&
+                          "border-white/70 bg-white/65 text-slate-500",
+                      )}
+                    >
+                      <span
+                        className={cn(
+                          "h-2 w-2 rounded-full",
+                          step.status === "completed" && "bg-emerald-500",
+                          step.status === "running" && "bg-blue-500",
+                          step.status === "failed" && "bg-rose-500",
+                          step.status === "queued" && "bg-slate-300",
+                        )}
+                      />
+                      <span>{step.label}</span>
+                      <span className="text-[10px] uppercase tracking-[0.12em] opacity-70">
+                        {formatProgressStatus(step.status)}
+                      </span>
+                    </span>
+                  ))}
+                </div>
                 <div className="mt-6 grid gap-3 md:grid-cols-3">
                   {categoryCards.map((item) => (
                     <div key={item.category} className="rounded-[1.3rem] bg-white/55 p-4">
@@ -1323,10 +2273,12 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                         <div className="min-w-0">
                           <p className="text-xs font-bold uppercase text-slate-500">
                             {titleCaseCategory(item.category)}
-                          </p>
-                          <p className="mt-1 text-xs font-semibold text-slate-500">
-                            Score {formatScorePercent(item.score)}
-                          </p>
+	                          </p>
+	                          <p className="mt-1 text-xs font-semibold text-slate-500">
+	                            {item.category === "security" && attackSurfaceSummary?.security.riskLabel
+	                              ? `Risk ${attackSurfaceSummary.security.riskLabel} | Score ${item.score ?? "--"}/100`
+	                              : `Score ${formatScorePercent(item.score)}`}
+	                          </p>
                         </div>
                         <span
                           className={cn(
@@ -1392,9 +2344,84 @@ export function ResultsClient({ scanId }: { scanId: string }) {
             </div>
           </div>
 
+          {attackSurfaceSummary ? (
+            <section className="mt-6 rounded-[2rem] border border-white/70 bg-white/65 p-5 shadow-[0_12px_48px_rgba(15,23,42,0.05)]">
+              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                <div>
+                  <p className="text-xs font-bold uppercase tracking-[0.18em] text-[var(--primary)]">
+                    Attack Surface Summary
+                  </p>
+                  <p className="mt-2 text-sm leading-7 text-slate-500">
+                    Scan mode {attackSurfaceSummary.scanMode}. First fix:{" "}
+                    <span className="font-semibold text-slate-800">
+                      {attackSurfaceSummary.recommendedFirstFix}
+                    </span>
+                  </p>
+                </div>
+                <span className="inline-flex w-fit rounded-full border border-blue-100 bg-blue-50 px-3 py-1 text-[10px] font-bold uppercase text-blue-700">
+                  Security report default
+                </span>
+              </div>
+              <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
+                {attackSurfaceSummary.metrics.slice(0, 10).map((metric) => (
+                  <div
+                    key={`surface-${metric.label}`}
+                    className="rounded-[1.1rem] border border-white/70 bg-white/75 px-3 py-2"
+                  >
+                    <p className="text-lg font-bold text-slate-900">{metric.value}</p>
+                    <p className="text-[10px] font-bold uppercase tracking-[0.12em] text-slate-500">
+                      {metric.label}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
+
+          <section className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+            {[
+              {
+                label: "Confirmed Exploitable Vulnerabilities",
+                value:
+                  attackSurfaceSummary?.metrics.find((metric) => metric.label === "Confirmed exploitable vulnerabilities")?.value ??
+                  allFindings.filter(isConfirmedExploitableFinding).length,
+              },
+              {
+                label: "Supporting Evidence",
+                value:
+                  attackSurfaceSummary?.metrics.find((metric) => metric.label === "Supporting evidence")?.value ?? 0,
+              },
+              { label: "Critical Issues", value: criticalIssueCount },
+              {
+                label: "Attack Paths",
+                value: allFindings.filter((finding) => finding.findingClass === "attack-path").length,
+              },
+              {
+                label: "Public APIs",
+                value:
+                  attackSurfaceSummary?.metrics.find((metric) => metric.label === "Public APIs")?.value ?? 0,
+              },
+              {
+                label: "Sensitive Endpoints",
+                value:
+                  attackSurfaceSummary?.metrics.find((metric) => metric.label === "Sensitive endpoints")?.value ?? 0,
+              },
+            ].map((card) => (
+              <div
+                key={`risk-card-${card.label}`}
+                className="rounded-[1.35rem] border border-white/70 bg-white/70 px-4 py-3 shadow-[0_10px_30px_rgba(15,23,42,0.05)]"
+              >
+                <p className="text-2xl font-bold text-slate-900">{card.value}</p>
+                <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.12em] text-slate-500">
+                  {card.label}
+                </p>
+              </div>
+            ))}
+          </section>
+
           <div className="mt-8 flex flex-col items-start justify-between gap-5 xl:flex-row xl:items-center">
             <div className="flex flex-wrap gap-2 rounded-full bg-white/50 p-1.5 shadow-sm backdrop-blur-xl">
-              {categoryCards.map((item) => (
+                  {categoryCards.map((item) => (
                 <button
                   key={item.category}
                   type="button"
@@ -1406,7 +2433,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                       : "text-slate-500 hover:text-slate-800",
                   )}
                 >
-                  {titleCaseCategory(item.category)}
+                  {item.category === "security" ? "Security" : `${titleCaseCategory(item.category)} appendix`}
                 </button>
               ))}
             </div>
@@ -1438,6 +2465,52 @@ export function ResultsClient({ scanId }: { scanId: string }) {
           {actionError ? (
             <p className="mt-4 text-sm font-medium text-[var(--danger)]">{actionError}</p>
           ) : null}
+
+          <div className="mt-5 flex flex-wrap items-center gap-2 rounded-[1.5rem] border border-white/70 bg-white/55 p-3">
+            <select
+              value={severityFilter}
+              onChange={(event) => setSeverityFilter(event.target.value as typeof severityFilter)}
+              className="h-10 rounded-full border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 outline-none"
+            >
+              <option value="all">All severities</option>
+              <option value="critical">Critical</option>
+              <option value="high">High</option>
+              <option value="medium">Medium</option>
+              <option value="low">Low</option>
+              <option value="info">Info</option>
+            </select>
+            <select
+              value={confidenceFilter}
+              onChange={(event) => setConfidenceFilter(event.target.value as typeof confidenceFilter)}
+              className="h-10 rounded-full border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 outline-none"
+            >
+              <option value="all">All confidence</option>
+              <option value="confirmed">Confirmed</option>
+              <option value="likely">Likely</option>
+              <option value="medium">Medium</option>
+              <option value="low">Low</option>
+              <option value="info">Info</option>
+            </select>
+            {[
+              ["Confirmed only", confirmedOnly, setConfirmedOnly],
+              ["Attack path only", attackPathOnly, setAttackPathOnly],
+              ["Public endpoint only", publicOnly, setPublicOnly],
+            ].map(([label, enabled, setter]) => (
+              <button
+                key={label as string}
+                type="button"
+                onClick={() => (setter as (value: boolean) => void)(!(enabled as boolean))}
+                className={cn(
+                  "h-10 rounded-full border px-3 text-xs font-semibold transition-colors",
+                  enabled
+                    ? "border-blue-200 bg-blue-50 text-blue-700"
+                    : "border-slate-200 bg-white text-slate-600",
+                )}
+              >
+                {label as string}
+              </button>
+            ))}
+          </div>
 
           <div
             id="threats-panel"
@@ -1554,9 +2627,11 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                           <p className="text-[11px] font-semibold text-rose-700">failed</p>
                         </div>
                       </div>
-                      <p className="mt-3 text-sm font-semibold" style={{ color: getScoreTone(metric.score) }}>
-                        Score {formatScorePercent(metric.score)}
-                      </p>
+	                      <p className="mt-3 text-sm font-semibold" style={{ color: getScoreTone(metric.score) }}>
+	                        {metric.label === "Security" && attackSurfaceSummary?.security.riskLabel
+	                          ? `Security Risk: ${attackSurfaceSummary.security.riskLabel} | Score ${metric.score ?? "--"}/100`
+	                          : `Score ${formatScorePercent(metric.score)}`}
+	                      </p>
                       <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-slate-200">
                         <div
                           className="h-full rounded-full"
@@ -1572,22 +2647,56 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                 </div>
               </div>
 
+              {attackSurfaceSummary ? (
+                <div className="mt-5 rounded-[1.8rem] border border-white/80 bg-white/80 p-5 shadow-[0_12px_42px_rgba(15,23,42,0.05)]">
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                    <div>
+                      <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-[var(--primary)]">
+                        Attack Surface Summary
+                      </p>
+                      <p className="mt-2 text-sm leading-7 text-slate-600">
+                        Recommended first fix:{" "}
+                        <span className="font-semibold text-slate-900">
+                          {attackSurfaceSummary.recommendedFirstFix}
+                        </span>
+                      </p>
+                    </div>
+                    <span className="inline-flex w-fit rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[10px] font-bold uppercase text-slate-600">
+                      {attackSurfaceSummary.scanMode} mode
+                    </span>
+                  </div>
+                  <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
+                    {attackSurfaceSummary.metrics.slice(0, 10).map((metric) => (
+                      <div
+                        key={`report-surface-${metric.label}`}
+                        className="rounded-[1rem] border border-slate-100 bg-slate-50 px-3 py-2"
+                      >
+                        <p className="text-lg font-bold text-slate-900">{metric.value}</p>
+                        <p className="text-[10px] font-bold uppercase tracking-[0.12em] text-slate-500">
+                          {metric.label}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
               <div className="mt-8 space-y-8">
                 {categoryKeys.map((category) => (
                   <section key={`report-${category}`}>
                     <div className="flex items-center justify-between gap-3 border-b border-slate-200/80 pb-3">
                       <div>
                         <h3 className="text-2xl font-semibold tracking-[-0.02em] text-slate-900">
-                          {titleCaseCategory(category)}
+                          {category === "security" ? "Security Report" : `${titleCaseCategory(category)} Appendix`}
                         </h3>
                         <p className="mt-1 text-sm text-slate-500">
-                          {state.findings[category].length} checks in this category
+                      {state.findings[category].filter((finding) => !isAttackSurfaceSummaryFinding(finding)).length} checks in this category
                         </p>
                       </div>
                     </div>
 
                     <div className="mt-4 space-y-4">
-                      {state.findings[category].map((finding) => (
+                      {state.findings[category].filter((finding) => !isAttackSurfaceSummaryFinding(finding)).map((finding) => (
                         <article
                           key={`report-card-${finding.id}`}
                           className={cn(
@@ -1629,6 +2738,24 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                                   {finding.severity} severity
                                 </span>
                               )}
+                              <span
+                                className={cn(
+                                  "rounded-full px-3 py-1 text-[10px] font-bold uppercase tracking-[0.14em]",
+                                  getConfidenceStyles(finding.confidence ?? "info"),
+                                )}
+                              >
+                                {finding.confidence ?? "info"}
+                              </span>
+                              {typeof finding.riskScore === "number" ? (
+                                <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-[10px] font-bold uppercase tracking-[0.14em] text-slate-700">
+                                  Risk {finding.riskScore}/100
+                                </span>
+                              ) : null}
+                              {finding.priorityLabel ? (
+                                <span className="rounded-full border border-blue-100 bg-blue-50 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.14em] text-blue-700">
+                                  {finding.priorityLabel}
+                                </span>
+                              ) : null}
                             </div>
                           </div>
 
@@ -1659,6 +2786,24 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                               </div>
                             </div>
                           )}
+
+                          {!finding.locked && evidenceLinesForReport(finding, 4).length > 0 ? (
+                            <div className="mt-4 rounded-[1.3rem] border border-white/70 bg-white/75 p-4 shadow-[0_10px_28px_rgba(148,163,184,0.08)]">
+                              <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-[var(--primary)]">
+                                Evidence
+                              </p>
+                              <div className="mt-2 space-y-1">
+                                {evidenceLinesForReport(finding, 4).map((line, index) => (
+                                  <p
+                                    key={`report-evidence-${finding.id}-${index}`}
+                                    className="break-words text-xs leading-6 text-slate-600"
+                                  >
+                                    {line}
+                                  </p>
+                                ))}
+                              </div>
+                            </div>
+                          ) : null}
                         </article>
                       ))}
                     </div>

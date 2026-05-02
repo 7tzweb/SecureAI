@@ -139,12 +139,16 @@ a {
   animation: shimmer 2.2s infinite;
 }
 
+.scan-phase-pill {
+  animation: phase-pill-fade 0.65s ease-out;
+}
+
 .completion-bar-finish {
-  animation: completion-bar-glow 1.15s ease-out;
+  animation: completion-bar-glow 1.6s ease-out;
 }
 
 .scan-complete-check {
-  animation: completion-check-pop 0.72s cubic-bezier(0.2, 1.25, 0.35, 1);
+  animation: completion-check-pop 1.05s cubic-bezier(0.2, 0.9, 0.25, 1);
 }
 
 .score-ring-modern {
@@ -188,18 +192,39 @@ a {
   }
 }
 
+@keyframes phase-pill-fade {
+  0% {
+    opacity: 0;
+    transform: translateY(0.25rem);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 @keyframes completion-check-pop {
   0% {
     opacity: 0;
-    transform: translateX(0.45rem) scale(0.55);
+    transform: translateX(0.35rem) scale(0.72);
   }
   60% {
     opacity: 1;
-    transform: translateX(0) scale(1.12);
+    transform: translateX(0) scale(1.04);
   }
   100% {
     opacity: 1;
     transform: translateX(0) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-stripes::after,
+  .loader-dot::before,
+  .scan-phase-pill,
+  .completion-bar-finish,
+  .scan-complete-check {
+    animation: none;
   }
 }
 

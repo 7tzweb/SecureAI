@@ -1,14 +1,50 @@
 export const categoryKeys = ["security", "seo", "performance"] as const;
 export const severityLevels = ["info", "low", "medium", "high", "critical"] as const;
 export const findingStatuses = ["pass", "info", "warning", "fail"] as const;
+export const findingConfidences = ["confirmed", "likely", "medium", "low", "info"] as const;
 export const categoryRunStatuses = ["queued", "running", "completed", "failed"] as const;
 export const scanStatuses = ["queued", "running", "partial", "completed", "failed"] as const;
+export const securityFindingCategories = [
+  "injection",
+  "xss",
+  "authentication",
+  "authorization",
+  "session",
+  "headers",
+  "cors",
+  "exposure",
+  "transport",
+  "configuration",
+  "attack-path",
+  "recon",
+  "other",
+] as const;
+export const evidenceTypes = [
+  "request-response",
+  "browser-execution",
+  "dom",
+  "console",
+  "dialog",
+  "network",
+  "cookie",
+  "storage",
+  "token",
+  "diff",
+  "timing",
+  "access-matrix",
+  "ownership",
+  "attack-path-step",
+] as const;
 
 export type CategoryKey = (typeof categoryKeys)[number];
 export type Severity = (typeof severityLevels)[number];
 export type FindingStatus = (typeof findingStatuses)[number];
+export type FindingConfidence = (typeof findingConfidences)[number];
 export type CategoryRunStatus = (typeof categoryRunStatuses)[number];
 export type ScanStatus = (typeof scanStatuses)[number];
+export type ScanMode = "Fast" | "Deep" | "Authenticated";
+export type SecurityFindingCategory = (typeof securityFindingCategories)[number];
+export type EvidenceType = (typeof evidenceTypes)[number];
 export type SubscriptionStatus = "free" | "premium";
 export type EntitlementLevel = "free" | "premium";
 
@@ -39,6 +75,34 @@ export interface ScanFindingEvidence {
   [key: string]: unknown;
 }
 
+export interface StructuredEvidence {
+  type: EvidenceType;
+  url?: string;
+  method?: string;
+  statusBefore?: number | null;
+  statusAfter?: number | null;
+  parameter?: string;
+  payload?: string;
+  sanitizedPayload?: string;
+  beforeSummary?: string;
+  afterSummary?: string;
+  responseDiff?: string;
+  normalizedBodyHashBefore?: string;
+  normalizedBodyHashAfter?: string;
+  browserSignal?: string;
+  consoleMessage?: string;
+  dialogMessage?: string;
+  domMarker?: string;
+  timingBaselineMs?: number;
+  timingTestMs?: number;
+  timingControlMs?: number;
+  ownerContext?: string;
+  attackerContext?: string;
+  victimContext?: string;
+  leakedFields?: string[];
+  notes?: string;
+}
+
 export interface ScanRecord {
   id: string;
   target: string;
@@ -49,6 +113,7 @@ export interface ScanRecord {
   createdAt: string;
   updatedAt: string;
   status: ScanStatus;
+  scanMode?: ScanMode;
   progress: number;
   overallScore: number | null;
   securityScore: number | null;
@@ -67,13 +132,37 @@ export interface ScanFinding {
   checkKey?: string;
   title: string;
   category: CategoryKey;
+  findingClass?: SecurityFindingCategory;
   status: FindingStatus;
   severity: Severity;
+  confidence?: FindingConfidence;
   scoreWeight?: number;
   shortDescription: string;
   whyItMatters: string;
   recommendation: string;
   evidence: ScanFindingEvidence;
+  structuredEvidence?: StructuredEvidence[];
+  proofSummary?: string;
+  affectedUrl?: string;
+  affectedParameter?: string;
+  affectedMethod?: string;
+  exploitabilityScore?: number;
+  impactScore?: number;
+  exposureScore?: number;
+  confidenceScore?: number;
+  riskScore?: number;
+  priorityLabel?: "Fix immediately" | "High priority" | "Medium priority" | "Low priority";
+  publicEndpoint?: boolean;
+  authRequired?: boolean;
+  dataExposure?: boolean;
+  attackPathParticipant?: boolean;
+  isFixableVulnerability?: boolean;
+  isMetaFinding?: boolean;
+  isExploitSupportingEvidence?: boolean;
+  capabilitiesGained?: string[];
+  requiresCapabilities?: string[];
+  falsePositiveNotes?: string;
+  fixFirstReason?: string;
   references: string[];
   premiumOnly: boolean;
   createdAt: string;

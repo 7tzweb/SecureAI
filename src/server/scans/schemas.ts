@@ -6,6 +6,15 @@ export const createScanSchema = z.object({
   target: z.string().trim().min(1).max(255),
   authCookieHeader: z.string().trim().max(8_000).optional(),
   secondaryAuthCookieHeader: z.string().trim().max(8_000).optional(),
+  authLoginUrl: z.string().trim().max(500).optional(),
+  authUsername: z.string().trim().max(500).optional(),
+  authPassword: z.string().trim().max(500).optional(),
+  authRoleLabel: z.string().trim().max(80).optional(),
+  secondaryAuthLoginUrl: z.string().trim().max(500).optional(),
+  secondaryAuthUsername: z.string().trim().max(500).optional(),
+  secondaryAuthPassword: z.string().trim().max(500).optional(),
+  secondaryAuthRoleLabel: z.string().trim().max(80).optional(),
+  scanMode: z.enum(["Fast", "Deep", "Authenticated"]).optional(),
 });
 
 export const checkoutSchema = z.object({

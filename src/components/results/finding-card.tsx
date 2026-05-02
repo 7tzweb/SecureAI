@@ -18,7 +18,7 @@ import {
   type ScanFinding,
   type ScanFindingEvidence,
 } from "@/lib/types";
-import { deriveFindingStatus, getSeverityStyles, getStatusStyles } from "@/lib/utils";
+import { deriveFindingStatus, getConfidenceStyles, getSeverityStyles, getStatusStyles } from "@/lib/utils";
 
 function StatusIcon({ finding }: { finding: ScanFinding }) {
   const status = deriveFindingStatus(finding);
@@ -179,6 +179,7 @@ export function FindingCard({
   const [showDetails, setShowDetails] = useState(true);
   const status = deriveFindingStatus(finding);
   const evidence = finding.evidence ?? {};
+  const confidence = finding.confidence ?? "info";
   const locations = extractLocations(evidence);
   const evidenceMeta = extractEvidenceMeta(evidence);
   const checkedUrl = typeof evidence.checkedUrl === "string" ? evidence.checkedUrl : null;
@@ -212,8 +213,35 @@ export function FindingCard({
           <span className="rounded-full bg-slate-100 px-3 py-1 text-[10px] font-bold uppercase text-slate-600">
             {finding.category}
           </span>
+          <span
+            className={`rounded-full px-3 py-1 text-[10px] font-bold uppercase ${getConfidenceStyles(confidence)}`}
+          >
+            {confidence}
+          </span>
         </div>
         <p className="max-w-3xl text-sm leading-7 text-slate-500">{finding.shortDescription}</p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {typeof finding.riskScore === "number" ? (
+            <span className="rounded-full border border-slate-200 bg-white/75 px-3 py-1 text-[10px] font-bold uppercase text-slate-700">
+              Risk {finding.riskScore}/100
+            </span>
+          ) : null}
+          {finding.priorityLabel ? (
+            <span className="rounded-full border border-blue-100 bg-blue-50 px-3 py-1 text-[10px] font-bold uppercase text-blue-700">
+              {finding.priorityLabel}
+            </span>
+          ) : null}
+          {finding.attackPathParticipant ? (
+            <span className="rounded-full border border-purple-100 bg-purple-50 px-3 py-1 text-[10px] font-bold uppercase text-purple-700">
+              Attack path
+            </span>
+          ) : null}
+          {finding.publicEndpoint ? (
+            <span className="rounded-full border border-slate-200 bg-white/75 px-3 py-1 text-[10px] font-bold uppercase text-slate-700">
+              Public endpoint
+            </span>
+          ) : null}
+        </div>
 
         {finding.locked ? (
           <div className="mt-4 rounded-[1.4rem] border border-dashed border-slate-300 bg-slate-50 p-4 text-sm text-slate-500">

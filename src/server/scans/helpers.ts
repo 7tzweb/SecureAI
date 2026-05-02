@@ -6,6 +6,7 @@ import { type AnyNode, type Element } from "domhandler";
 import {
   type CategoryKey,
   type FindingEvidenceLocation,
+  type FindingConfidence,
   type FindingStatus,
   type ScanFinding,
   type ScanFindingEvidence,
@@ -13,6 +14,7 @@ import {
 } from "@/lib/types";
 import { badRequest } from "@/server/api/errors";
 import { type HttpAttempt, type NormalizedTarget, type PageContext } from "@/server/scans/types";
+import { normalizeFinding } from "@/security/findings";
 
 const HOSTNAME_PATTERN =
   /^(?=.{1,253}$)(?!-)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
@@ -287,6 +289,7 @@ export function createFinding(input: {
   category: CategoryKey;
   status?: FindingStatus;
   severity: Severity;
+  confidence?: FindingConfidence;
   scoreWeight?: number;
   title: string;
   shortDescription: string;
@@ -299,12 +302,22 @@ export function createFinding(input: {
   checkKey?: string;
 }) {
   const timestamp = new Date().toISOString();
-  return {
+  const status =
+    input.status ??
+    (input.severity === "info"
+      ? "info"
+      : input.severity === "low" || input.severity === "medium"
+        ? "warning"
+        : "fail");
+  return normalizeFinding({
     id: input.id ?? `${input.category}-${randomUUID()}`,
     checkKey: input.checkKey,
     category: input.category,
-    status: input.status ?? (input.severity === "info" ? "info" : input.severity === "low" || input.severity === "medium" ? "warning" : "fail"),
+    status,
     severity: input.severity,
+    confidence:
+      input.confidence ??
+      (status === "fail" || status === "warning" ? "likely" : "info"),
     scoreWeight: input.scoreWeight,
     title: input.title,
     shortDescription: input.shortDescription,
@@ -315,7 +328,7 @@ export function createFinding(input: {
     premiumOnly: input.premiumOnly ?? false,
     createdAt: timestamp,
     updatedAt: timestamp,
-  } satisfies ScanFinding;
+  } satisfies ScanFinding);
 }
 
 export function getOrigin(url: string) {
