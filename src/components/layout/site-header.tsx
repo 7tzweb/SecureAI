@@ -275,9 +275,26 @@ export function SiteHeader() {
                 setAccountOpen((current) => !current);
                 setMobileScanOpen(false);
               }}
-              className="rounded-full p-2 text-slate-600 transition-all hover:bg-white/20"
+              className={cn(
+                "inline-flex h-10 items-center overflow-hidden rounded-full border border-white/70 bg-white/75 text-sm font-semibold text-slate-700 shadow-sm transition-all hover:bg-white",
+                status === "signed-in" ? "pl-2 pr-3" : "w-10 justify-center",
+              )}
+              aria-expanded={accountOpen}
+              aria-label={status === "signed-in" ? "Open account and scan credits" : "Open account menu"}
             >
-              <UserCircle2 className="h-5 w-5" />
+              <UserCircle2 className="h-5 w-5 shrink-0 text-slate-600" />
+              {status === "signed-in" ? (
+                <>
+                  <span className="mx-2 h-5 w-px bg-slate-200" aria-hidden="true" />
+                  <span className="whitespace-nowrap text-xs">
+                    {quota
+                      ? quota.hasUnlimitedPlan
+                        ? "Scans: unlimited"
+                        : `Scans: ${quota.remainingScans}`
+                      : "Scans: ..."}
+                  </span>
+                </>
+              ) : null}
             </button>
 
             {accountOpen ? (
@@ -362,13 +379,6 @@ export function SiteHeader() {
 
           {status === "signed-in" ? (
             <>
-              <div className="hidden rounded-full border border-white/70 bg-white/70 px-3 py-2 text-xs font-semibold text-slate-700 shadow-sm sm:block">
-                {quota
-                  ? quota.hasUnlimitedPlan
-                    ? "Scans: unlimited"
-                    : `Scans: ${quota.remainingScans}`
-                  : "Scans: ..."}
-              </div>
               <Button variant="outline" size="sm" onClick={() => void signOut()}>
                 Log out
               </Button>

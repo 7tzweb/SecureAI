@@ -20,10 +20,10 @@ import {
 import {
   cn,
   deriveFindingStatus,
+  formatFindingHeader,
   formatRelative,
   formatScore,
   getConfidenceStyles,
-  getSeverityStyles,
   getScoreTone,
   getStatusStyles,
   titleCaseCategory,
@@ -185,6 +185,24 @@ function evidenceLinesForReport(finding: ScanFinding, maxLines = 5) {
   }
 
   const evidence = finding.evidence ?? {};
+  const authBypassEvidence =
+    evidence.authBypassEvidence && typeof evidence.authBypassEvidence === "object" && !Array.isArray(evidence.authBypassEvidence)
+      ? (evidence.authBypassEvidence as Record<string, unknown>)
+      : null;
+  if (authBypassEvidence) {
+    return [
+      `Login endpoint: ${compactReportValue(authBypassEvidence.loginEndpoint, 120)}`,
+      `Payload preview: ${compactReportValue(authBypassEvidence.payloadPreview, 80)}`,
+      `Response status: ${compactReportValue(authBypassEvidence.responseStatus, 20)}`,
+      `Session artifact: ${compactReportValue(authBypassEvidence.sessionArtifactType, 40)}`,
+      `Authentication model: ${compactReportValue(authBypassEvidence.authModel, 40)}`,
+      `Verification endpoint: ${compactReportValue(authBypassEvidence.verificationEndpoint, 120)}`,
+      `Verification status: ${compactReportValue(authBypassEvidence.verificationStatus, 20)}`,
+      `Verification result: ${compactReportValue(authBypassEvidence.verificationResult, 80)}`,
+      authBypassEvidence.tokenPreview ? `Token preview: ${compactReportValue(authBypassEvidence.tokenPreview, 40)}` : "",
+    ].filter(Boolean).slice(0, maxLines);
+  }
+
   const lines = [
     typeof evidence.summary === "string" ? `Proof: ${evidence.summary}` : "",
     typeof evidence.checkedUrl === "string" ? `URL: ${compactReportValue(evidence.checkedUrl, 180)}` : "",
@@ -258,6 +276,120 @@ function nestedNumber(value: Record<string, unknown> | null, key: string) {
 function nestedString(value: Record<string, unknown> | null, key: string) {
   const entry = value?.[key];
   return typeof entry === "string" ? entry : "";
+}
+
+function arrayRecords(value: unknown) {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === "object" && !Array.isArray(entry)))
+    : [];
+}
+
+function getScanModeLimitations(scanMode: string) {
+  if (scanMode === "Deep") {
+    return {
+      title: "Deep Mode Coverage",
+      summary:
+        "Deep mode enabled expanded crawling, repeated blind SQLi probes, XSS execution verification, and broader endpoint testing.",
+      bullets: [
+        "Crawling and endpoint discovery use a larger budget than Fast mode.",
+        "Blind SQL injection probes may use repeated baseline/control/test requests.",
+        "XSS execution verification is attempted where render locations are discovered.",
+        "Authenticated and role-aware proof still depends on provided credentials or sessions.",
+      ],
+    };
+  }
+
+  if (scanMode === "Authenticated") {
+    return {
+      title: "Authenticated Mode Coverage",
+      summary:
+        "Authenticated mode used provided credentials/session contexts for protected endpoint, role-based, and authorization testing.",
+      bullets: [
+        "Protected API checks use the supplied authentication material.",
+        "Role-based testing improves when userA, userB, and admin contexts are all provided.",
+        "IDOR confirmation still requires cross-user ownership proof.",
+        "Tokens and cookies are masked in stored report output.",
+      ],
+    };
+  }
+
+  return {
+    title: "Fast Mode Limitations",
+    summary:
+      "This scan ran in Fast mode. Fast mode prioritizes quick coverage and safe bounded probes. Some deeper checks may be skipped, reduced, or reported as coverage notes instead of confirmed findings.",
+    bullets: [
+      "Rate-limit probing was deferred or reduced.",
+      "Time-based blind SQL injection checks were limited or skipped.",
+      "Role-based testing is partial unless userA, userB, and admin contexts are provided.",
+      "IDOR confirmation requires two separate user contexts for ownership proof.",
+      "Stored XSS execution depends on discovering the page where stored content renders.",
+      "Crawling depth and endpoint discovery are bounded.",
+      "Some INFO findings represent coverage limitations, not proof that a risk does not exist.",
+    ],
+  };
+}
+
+function primaryAttackPathFrom(evidence: Record<string, unknown>, reportSummary: Record<string, unknown> | null) {
+  const summaryPath = objectEvidence(reportSummary?.primaryAttackPath);
+  if (summaryPath) {
+    return summaryPath;
+  }
+
+  const evidencePath = objectEvidence(evidence.primaryAttackPath);
+  if (evidencePath) {
+    return evidencePath;
+  }
+
+  return arrayRecords(evidence.attackPaths)[0] ?? null;
+}
+
+function confirmedAttackSteps(path: Record<string, unknown> | null) {
+  if (!path) {
+    return [];
+  }
+
+  const confirmed = arrayRecords(path.confirmedSteps);
+  if (confirmed.length > 0) {
+    return confirmed.filter((step) => String(step.confidence ?? "").toLowerCase() === "confirmed");
+  }
+
+  return arrayRecords(path.steps).filter((step) => String(step.confidence ?? "").toLowerCase() === "confirmed");
+}
+
+function likelyAttackExtensions(path: Record<string, unknown> | null) {
+  if (!path) {
+    return [];
+  }
+
+  const likely = arrayRecords(path.likelyExtensions);
+  if (likely.length > 0) {
+    return likely;
+  }
+
+  return arrayRecords(path.steps).filter((step) => String(step.confidence ?? "").toLowerCase() === "likely");
+}
+
+function accessMatrixCellLabel(cell: unknown) {
+  const record = objectEvidence(cell);
+  if (!record) {
+    return "not-tested";
+  }
+
+  const status = typeof record.status === "number" && record.status > 0 ? `${record.status} ` : "";
+  const responseClass = nestedString(record, "responseClass") || "not-tested";
+  return `${status}${responseClass}`.trim();
+}
+
+function accessMatrixIsPartial(rows: Record<string, unknown>[]) {
+  return rows.some((row) => {
+    const issue = nestedString(row, "issue") || nestedString(row, "issueType");
+    return (
+      issue === "partial-coverage" ||
+      accessMatrixCellLabel(row.userA) === "not-tested" ||
+      accessMatrixCellLabel(row.userB) === "not-tested" ||
+      accessMatrixCellLabel(row.admin) === "not-tested"
+    );
+  });
 }
 
 function findingHasConcreteTarget(finding: ScanFinding) {
@@ -445,6 +577,9 @@ function extractAttackSurfaceSummary(findings: Record<CategoryKey, ScanFinding[]
   const reportSecurity = nestedRecord(reportSummary, "security");
   const reportAttackSurface = nestedRecord(reportSummary, "attackSurface");
   const reportRecommendedFix = objectEvidence(reportSummary?.recommendedFirstFix);
+  const primaryAttackPath = primaryAttackPathFrom(evidence, reportSummary);
+  const scanModeLimitations =
+    objectEvidence(reportSummary?.scanModeLimitations) ?? getScanModeLimitations(stringEvidence(evidence, "scanMode") || "Fast");
   const allFindings = categoryKeys.flatMap((category) => findings[category]);
   const fallbackCritical = allFindings.filter(
     (finding) => deriveFindingStatus(finding) === "fail" && finding.severity === "critical",
@@ -478,6 +613,11 @@ function extractAttackSurfaceSummary(findings: Record<CategoryKey, ScanFinding[]
     finding: summaryFinding,
     evidence,
     reportSummary,
+    primaryAttackPath,
+    confirmedAttackSteps: confirmedAttackSteps(primaryAttackPath),
+    likelyAttackExtensions: likelyAttackExtensions(primaryAttackPath),
+    scanModeLimitations,
+    accessMatrix: arrayRecords(evidence.accessMatrix),
     recommendedFirstFix:
       nestedString(reportRecommendedFix, "title") ||
       safeEvidenceRecommendedFix ||
@@ -799,6 +939,24 @@ async function downloadReportPdf(
     }
 
     const evidence = finding.evidence ?? {};
+    const authBypassEvidence =
+      evidence.authBypassEvidence && typeof evidence.authBypassEvidence === "object" && !Array.isArray(evidence.authBypassEvidence)
+        ? (evidence.authBypassEvidence as Record<string, unknown>)
+        : null;
+    if (authBypassEvidence) {
+      return [
+        `Login endpoint: ${compactPdfValue(authBypassEvidence.loginEndpoint, 120)}`,
+        `Payload preview: ${compactPdfValue(authBypassEvidence.payloadPreview, 80)}`,
+        `Response status: ${compactPdfValue(authBypassEvidence.responseStatus, 20)}`,
+        `Session artifact: ${compactPdfValue(authBypassEvidence.sessionArtifactType, 40)}`,
+        `Authentication model: ${compactPdfValue(authBypassEvidence.authModel, 40)}`,
+        `Verification endpoint: ${compactPdfValue(authBypassEvidence.verificationEndpoint, 120)}`,
+        `Verification status: ${compactPdfValue(authBypassEvidence.verificationStatus, 20)}`,
+        `Verification result: ${compactPdfValue(authBypassEvidence.verificationResult, 80)}`,
+        authBypassEvidence.tokenPreview ? `Token preview: ${compactPdfValue(authBypassEvidence.tokenPreview, 40)}` : "",
+      ].filter(Boolean).slice(0, 9);
+    }
+
     const confidence = finding.confidence ?? "info";
     const lines = [
       `Confidence: ${confidence.toUpperCase()}`,
@@ -911,27 +1069,19 @@ async function downloadReportPdf(
     const cardWidth = contentWidth;
     const statusTheme = getStatusTheme(finding.status);
     const confidence = finding.confidence ?? "info";
+    const headerLabels = formatFindingHeader(finding);
     const confidenceTheme = getConfidenceTheme(confidence);
     const severityTheme = getSeverityTheme(finding.severity);
     const issueDetected = finding.status === "warning" || finding.status === "fail";
     const innerX = cardX + (issueDetected ? 26 : 18);
     const innerWidth = cardWidth - (issueDetected ? 44 : 36);
-    const statusLabel = finding.status.toUpperCase();
-    const severityLabel =
-      finding.status === "warning" || finding.status === "fail"
-        ? `${finding.severity.toUpperCase()} SEVERITY`
-        : null;
-    const confidenceLabel = confidence.toUpperCase();
+    const statusLabel = headerLabels.compact;
+    const confidenceLabel = `Confidence: ${headerLabels.confidenceLabel}`;
     const chipGap = 8;
     const chipHeight = 20;
     const statusChipWidth = getPillWidth(statusLabel);
-    const severityChipWidth = severityLabel ? getPillWidth(severityLabel) : 0;
     const confidenceChipWidth = getPillWidth(confidenceLabel);
-    const chipsWidth =
-      statusChipWidth +
-      confidenceChipWidth +
-      chipGap +
-      (severityLabel ? chipGap + severityChipWidth : 0);
+    const chipsWidth = statusChipWidth + confidenceChipWidth + chipGap;
     const titleLines = splitLines(finding.title, 16, Math.max(180, innerWidth - chipsWidth - 18));
     const summaryLines = splitLines(finding.shortDescription, 11, innerWidth);
     const detailPanelGap = 12;
@@ -1004,18 +1154,6 @@ async function downloadReportPdf(
 
     const chipsY = startY + 18;
     let chipCursorX = cardX + cardWidth - 18;
-    if (severityLabel) {
-      const severityX = chipCursorX - severityChipWidth;
-      chipCursorX = severityX - chipGap;
-      drawPill({
-        x: severityX,
-        y: chipsY,
-        text: severityLabel,
-        fill: severityTheme.soft,
-        border: severityTheme.border,
-        color: severityTheme.text,
-      });
-    }
     const confidenceX = chipCursorX - confidenceChipWidth;
     chipCursorX = confidenceX - chipGap;
     drawPill({
@@ -1217,17 +1355,21 @@ async function downloadReportPdf(
     pdfAttackSurface?.security.explanation ||
     pdfFallbackSecurity.explanation ||
     "Security score is risk-based and capped by confirmed critical exploitable findings and attack path evidence.";
-  const pdfAttackPaths = Array.isArray(pdfAttackSurface?.evidence.attackPaths)
-    ? (pdfAttackSurface.evidence.attackPaths as Array<Record<string, unknown>>).slice(0, 3)
-    : [];
+  const pdfPrimaryAttackPath = pdfAttackSurface
+    ? primaryAttackPathFrom(pdfAttackSurface.evidence, pdfReportSummary)
+    : null;
+  const pdfConfirmedAttackSteps = confirmedAttackSteps(pdfPrimaryAttackPath);
+  const pdfLikelyAttackExtensions = likelyAttackExtensions(pdfPrimaryAttackPath);
+  const pdfScanModeLimitations =
+    objectEvidence(pdfReportSummary?.scanModeLimitations) ??
+    getScanModeLimitations(pdfAttackSurface?.scanMode ?? scan.scanMode ?? "Fast");
   const pdfSessionModel =
     pdfAttackSurface?.evidence.sessionModel &&
     typeof pdfAttackSurface.evidence.sessionModel === "object"
       ? (pdfAttackSurface.evidence.sessionModel as Record<string, unknown>)
       : null;
-  const pdfAccessMatrix = Array.isArray(pdfAttackSurface?.evidence.accessMatrix)
-    ? (pdfAttackSurface.evidence.accessMatrix as Array<Record<string, unknown>>).slice(0, 12)
-    : [];
+  const pdfAccessMatrix = arrayRecords(pdfAttackSurface?.evidence.accessMatrix).slice(0, 12);
+  const pdfAccessMatrixPartial = accessMatrixIsPartial(pdfAccessMatrix);
 
   const headerBadgeRadius = 34;
   const headerRightX = pageWidth - marginX - 68;
@@ -1390,6 +1532,31 @@ async function downloadReportPdf(
     color: palette.muted,
     gapAfter: 12,
   });
+  if (pdfScanModeLimitations) {
+    ensureSpace(90);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(15);
+    doc.setTextColor(...palette.ink);
+    doc.text(compactPdfValue(pdfScanModeLimitations.title, 120), marginX, cursorY);
+    cursorY += 20;
+    drawTextBlock({
+      text: compactPdfValue(pdfScanModeLimitations.summary, 260),
+      fontSize: 10,
+      color: palette.muted,
+      gapAfter: 4,
+    });
+    if (Array.isArray(pdfScanModeLimitations.bullets)) {
+      pdfScanModeLimitations.bullets.slice(0, 7).forEach((bullet) => {
+        drawTextBlock({
+          text: `- ${compactPdfValue(bullet, 160)}`,
+          fontSize: 9,
+          color: palette.ink,
+          gapAfter: 1,
+        });
+      });
+    }
+    cursorY += 8;
+  }
 
   ensureSpace(120);
   doc.setFont("helvetica", "bold");
@@ -1441,7 +1608,7 @@ async function downloadReportPdf(
 	    });
   }
 
-  if (pdfAttackPaths.length > 0) {
+  if (pdfPrimaryAttackPath) {
     doc.addPage();
     cursorY = marginY;
     doc.setFont("helvetica", "bold");
@@ -1449,44 +1616,82 @@ async function downloadReportPdf(
     doc.setTextColor(...palette.ink);
     doc.text("Attack Path Analysis", marginX, cursorY);
     cursorY += 24;
-    pdfAttackPaths.forEach((path, pathIndex) => {
-      const steps = Array.isArray(path.steps) ? (path.steps as Array<Record<string, unknown>>) : [];
+    drawTextBlock({
+      text: `Primary Attack Path: ${compactPdfValue(pdfPrimaryAttackPath.title, 140)}`,
+      fontSize: 12,
+      color: palette.primary,
+      fontStyle: "bold",
+      gapAfter: 4,
+    });
+    drawTextBlock({
+      text: compactPdfValue(pdfPrimaryAttackPath.summary ?? pdfPrimaryAttackPath.finalImpact ?? "", 260),
+      fontSize: 10,
+      color: palette.muted,
+      gapAfter: 10,
+    });
+    drawTextBlock({
+      text: "Confirmed Steps",
+      fontSize: 11,
+      color: palette.ink,
+      fontStyle: "bold",
+      gapAfter: 4,
+    });
+    pdfConfirmedAttackSteps.slice(0, 5).forEach((step, index) => {
+      ensureSpace(66);
+      doc.setFillColor(...palette.surface);
+      doc.setDrawColor(...palette.border);
+      doc.roundedRect(marginX, cursorY, contentWidth, 56, 12, 12, "FD");
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(9);
+      doc.setTextColor(...palette.ink);
+      const suffix = step.supportingEvidence === true ? " (supporting evidence)" : "";
+      doc.text(`Step ${index + 1}: ${compactPdfValue(step.title, 100)}${suffix}`, marginX + 12, cursorY + 14);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8);
+      doc.setTextColor(...palette.muted);
+      doc.text(compactPdfValue(`Action: ${step.attackerAction ?? ""}`, 150), marginX + 12, cursorY + 28);
+      doc.text(compactPdfValue(`Evidence: ${step.evidence ?? step.technicalEvidence ?? ""}`, 150), marginX + 12, cursorY + 40);
+      doc.text(compactPdfValue(`Gained capability: ${step.gainedCapability ?? ""}`, 150), marginX + 12, cursorY + 51);
+      cursorY += 66;
+    });
+    if (pdfLikelyAttackExtensions.length > 0) {
       drawTextBlock({
-        text: `${pathIndex + 1}. ${compactPdfValue(path.title, 140)}`,
-        fontSize: 12,
-        color: palette.primary,
+        text: "Likely Extensions",
+        fontSize: 11,
+        color: palette.ink,
         fontStyle: "bold",
         gapAfter: 4,
       });
-      drawTextBlock({
-        text: compactPdfValue(path.summary ?? path.finalImpact ?? "", 240),
-        fontSize: 10,
-        color: palette.muted,
-        gapAfter: 8,
+      pdfLikelyAttackExtensions.slice(0, 4).forEach((step) => {
+        drawTextBlock({
+          text: `- ${compactPdfValue(step.title, 100)}: ${compactPdfValue(step.evidence ?? step.technicalEvidence ?? "", 160)}`,
+          fontSize: 9,
+          color: palette.muted,
+          gapAfter: 2,
+        });
       });
-      steps.slice(0, 5).forEach((step, index) => {
-        ensureSpace(58);
-        doc.setFillColor(...palette.surface);
-        doc.setDrawColor(...palette.border);
-        doc.roundedRect(marginX, cursorY, contentWidth, 48, 12, 12, "FD");
-        doc.setFont("helvetica", "bold");
-        doc.setFontSize(9);
-        doc.setTextColor(...palette.ink);
-        doc.text(`Step ${index + 1}: ${compactPdfValue(step.title, 100)}`, marginX + 12, cursorY + 15);
-        doc.setFont("helvetica", "normal");
-        doc.setFontSize(8);
-        doc.setTextColor(...palette.muted);
-        doc.text(compactPdfValue(`Action: ${step.attackerAction ?? ""}`, 150), marginX + 12, cursorY + 29);
-        doc.text(compactPdfValue(`Evidence: ${step.technicalEvidence ?? ""}`, 150), marginX + 12, cursorY + 41);
-        cursorY += 58;
-      });
-      drawTextBlock({
-        text: `Fix first: ${compactPdfValue(path.fixFirstReason, 240)}`,
-        fontSize: 10,
-        color: palette.ink,
-        gapAfter: 16,
-      });
+    }
+    drawTextBlock({
+      text: `Final impact: ${compactPdfValue(pdfPrimaryAttackPath.finalImpact, 240)}`,
+      fontSize: 10,
+      color: palette.ink,
+      gapAfter: 4,
     });
+    drawTextBlock({
+      text: `Fix first: ${compactPdfValue(pdfPrimaryAttackPath.fixFirstTitle ?? pdfRecommendedFixTitle, 140)}. ${compactPdfValue(pdfPrimaryAttackPath.fixFirstReason ?? pdfRecommendedFixReason, 220)}`,
+      fontSize: 10,
+      color: palette.ink,
+      gapAfter: 16,
+    });
+    const suppressedCount = Number(pdfPrimaryAttackPath.suppressedRelatedPathCount ?? 0);
+    if (suppressedCount > 0) {
+      drawTextBlock({
+        text: `${suppressedCount} related path(s) were suppressed to reduce duplicate attack-chain reporting.`,
+        fontSize: 9,
+        color: palette.muted,
+        gapAfter: 10,
+      });
+    }
   }
 
   if (pdfSessionModel || pdfAccessMatrix.length > 0) {
@@ -1520,14 +1725,22 @@ async function downloadReportPdf(
       doc.setFont("helvetica", "bold");
       doc.setFontSize(18);
       doc.setTextColor(...palette.ink);
-      doc.text("Role-Based Access Matrix", marginX, cursorY);
+      doc.text(pdfAccessMatrixPartial ? "Partial Access Matrix" : "Role-Based Access Matrix", marginX, cursorY);
       cursorY += 24;
+      if (pdfAccessMatrixPartial) {
+        drawTextBlock({
+          text:
+            "Only anonymous and scanner-auth-context were available for at least one sampled endpoint. Provide userA, userB, and admin contexts for full role-based authorization proof.",
+          fontSize: 10,
+          color: palette.muted,
+          gapAfter: 8,
+        });
+      }
       pdfAccessMatrix.forEach((row) => {
-        ensureSpace(38);
-        const observed = row.observed && typeof row.observed === "object" ? row.observed as Record<string, { status?: number }> : {};
+        ensureSpace(72);
         doc.setFillColor(...palette.surface);
         doc.setDrawColor(...palette.border);
-        doc.roundedRect(marginX, cursorY, contentWidth, 30, 8, 8, "FD");
+        doc.roundedRect(marginX, cursorY, contentWidth, 64, 8, 8, "FD");
         doc.setFont("helvetica", "bold");
         doc.setFontSize(8);
         doc.setTextColor(...palette.ink);
@@ -1536,13 +1749,22 @@ async function downloadReportPdf(
         doc.setTextColor(...palette.muted);
         doc.text(
           compactPdfValue(
-            `Sensitivity ${row.sensitivity ?? "unknown"} | anon ${observed.anonymous?.status ?? "-"} | userA ${observed.userA?.status ?? "-"} | userB ${observed.userB?.status ?? "-"} | issue ${row.issueType ?? "none"}`,
+            `Sensitivity ${row.sensitivity ?? "unknown"} | Issue ${row.issue ?? row.issueType ?? "none"}`,
             150,
           ),
           marginX + 8,
           cursorY + 24,
         );
-        cursorY += 38;
+        doc.text(
+          compactPdfValue(
+            `Anon ${accessMatrixCellLabel(row.anonymous)} | Scanner auth ${accessMatrixCellLabel(row.scannerAuthContext)} | UserA ${accessMatrixCellLabel(row.userA)} | UserB ${accessMatrixCellLabel(row.userB)} | Admin ${accessMatrixCellLabel(row.admin)}`,
+            170,
+          ),
+          marginX + 8,
+          cursorY + 38,
+        );
+        doc.text(compactPdfValue(String(row.explanation ?? ""), 170), marginX + 8, cursorY + 52);
+        cursorY += 72;
       });
     }
   }
@@ -2394,7 +2616,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
               { label: "Critical Issues", value: criticalIssueCount },
               {
                 label: "Attack Paths",
-                value: allFindings.filter((finding) => finding.findingClass === "attack-path").length,
+                value: attackSurfaceSummary?.primaryAttackPath ? 1 : 0,
               },
               {
                 label: "Public APIs",
@@ -2681,6 +2903,150 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                 </div>
               ) : null}
 
+              {attackSurfaceSummary?.scanModeLimitations ? (
+                <section className="mt-5 rounded-[1.8rem] border border-white/80 bg-white/80 p-5 shadow-[0_12px_42px_rgba(15,23,42,0.05)]">
+                  <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-[var(--primary)]">
+                    {nestedString(attackSurfaceSummary.scanModeLimitations, "title")}
+                  </p>
+                  <p className="mt-2 text-sm leading-7 text-slate-600">
+                    {nestedString(attackSurfaceSummary.scanModeLimitations, "summary")}
+                  </p>
+                  {Array.isArray(attackSurfaceSummary.scanModeLimitations.bullets) ? (
+                    <ul className="mt-3 grid gap-2 text-sm leading-6 text-slate-600 md:grid-cols-2">
+                      {attackSurfaceSummary.scanModeLimitations.bullets.map((bullet) => (
+                        <li key={`mode-limit-${bullet}`} className="rounded-[1rem] bg-slate-50 px-3 py-2">
+                          {String(bullet)}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </section>
+              ) : null}
+
+              {attackSurfaceSummary?.primaryAttackPath ? (
+                <section className="mt-5 rounded-[1.8rem] border border-white/80 bg-white/80 p-5 shadow-[0_12px_42px_rgba(15,23,42,0.05)]">
+                  <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-[var(--primary)]">
+                    Attack Path Analysis
+                  </p>
+                  <h3 className="mt-2 text-xl font-semibold text-slate-900">
+                    Primary Attack Path: {nestedString(attackSurfaceSummary.primaryAttackPath, "title")}
+                  </h3>
+                  <p className="mt-2 text-sm leading-7 text-slate-600">
+                    {nestedString(attackSurfaceSummary.primaryAttackPath, "summary")}
+                  </p>
+                  <div className="mt-4 grid gap-3 lg:grid-cols-[1.2fr_0.8fr]">
+                    <div className="rounded-[1.3rem] border border-slate-100 bg-slate-50 p-4">
+                      <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-slate-500">
+                        Confirmed Steps
+                      </p>
+                      <div className="mt-3 space-y-3">
+                        {attackSurfaceSummary.confirmedAttackSteps.map((step, index) => (
+                          <div key={`confirmed-step-${nestedString(step, "findingId") || index}`} className="rounded-[1rem] bg-white px-3 py-3">
+                            <p className="text-sm font-semibold text-slate-900">
+                              Step {index + 1} — {nestedString(step, "title")}
+                              {step.supportingEvidence === true ? (
+                                <span className="ml-2 rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-bold uppercase text-blue-700">
+                                  supporting evidence
+                                </span>
+                              ) : null}
+                            </p>
+                            <p className="mt-1 text-xs leading-6 text-slate-600">
+                              Action: {nestedString(step, "attackerAction")}
+                            </p>
+                            <p className="text-xs leading-6 text-slate-600">
+                              Evidence: {nestedString(step, "evidence") || nestedString(step, "technicalEvidence")}
+                            </p>
+                            <p className="text-xs leading-6 text-slate-600">
+                              Gained capability: {nestedString(step, "gainedCapability")}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="rounded-[1.3rem] border border-amber-100 bg-amber-50/70 p-4">
+                      <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-amber-700">
+                        Likely Extensions
+                      </p>
+                      <div className="mt-3 space-y-3">
+                        {attackSurfaceSummary.likelyAttackExtensions.length > 0 ? (
+                          attackSurfaceSummary.likelyAttackExtensions.map((step, index) => (
+                            <div key={`likely-step-${nestedString(step, "findingId") || index}`} className="rounded-[1rem] bg-white/80 px-3 py-3">
+                              <p className="text-sm font-semibold text-slate-900">{nestedString(step, "title")}</p>
+                              <p className="mt-1 text-xs leading-6 text-slate-600">
+                                Why likely: {nestedString(step, "evidence") || nestedString(step, "technicalEvidence")}
+                              </p>
+                            </div>
+                          ))
+                        ) : (
+                          <p className="text-sm leading-7 text-slate-600">
+                            No unconfirmed chain extensions were included in the primary path.
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="mt-4 rounded-[1.2rem] border border-blue-100 bg-blue-50 px-4 py-3 text-sm leading-7 text-slate-700">
+                    <p>
+                      <span className="font-semibold text-slate-900">Final impact:</span>{" "}
+                      {nestedString(attackSurfaceSummary.primaryAttackPath, "finalImpact")}
+                    </p>
+                    <p>
+                      <span className="font-semibold text-slate-900">Fix first:</span>{" "}
+                      {nestedString(attackSurfaceSummary.primaryAttackPath, "fixFirstTitle") ||
+                        attackSurfaceSummary.recommendedFirstFix}
+                    </p>
+                  </div>
+                </section>
+              ) : null}
+
+              {attackSurfaceSummary?.accessMatrix?.length ? (
+                <section className="mt-5 rounded-[1.8rem] border border-white/80 bg-white/80 p-5 shadow-[0_12px_42px_rgba(15,23,42,0.05)]">
+                  <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-[var(--primary)]">
+                    {accessMatrixIsPartial(attackSurfaceSummary.accessMatrix)
+                      ? "Partial Access Matrix"
+                      : "Role-Based Access Matrix"}
+                  </p>
+                  {accessMatrixIsPartial(attackSurfaceSummary.accessMatrix) ? (
+                    <p className="mt-2 text-sm leading-7 text-slate-600">
+                      Only anonymous and scanner-auth-context were available for at least one sampled endpoint. Provide userA, userB, and admin contexts for full role-based authorization proof.
+                    </p>
+                  ) : null}
+                  <div className="mt-4 space-y-3">
+                    {attackSurfaceSummary.accessMatrix.slice(0, 8).map((row, index) => (
+                      <div key={`access-row-${nestedString(row, "endpoint") || index}`} className="rounded-[1.2rem] border border-slate-100 bg-slate-50 p-4">
+                        <div className="flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+                          <div>
+                            <p className="break-all text-sm font-semibold text-slate-900">
+                              {nestedString(row, "endpoint")}
+                            </p>
+                            <p className="mt-1 text-xs uppercase tracking-[0.12em] text-slate-500">
+                              Sensitivity {nestedString(row, "sensitivity") || "unknown"} · Issue {nestedString(row, "issue") || nestedString(row, "issueType") || "none"}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="mt-3 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-5">
+                          {[
+                            ["Anonymous", row.anonymous],
+                            ["Scanner Auth", row.scannerAuthContext],
+                            ["UserA", row.userA],
+                            ["UserB", row.userB],
+                            ["Admin", row.admin],
+                          ].map(([label, cell]) => (
+                            <div key={`${nestedString(row, "endpoint")}-${label}`} className="rounded-[0.9rem] bg-white px-3 py-2">
+                              <p className="font-bold uppercase text-slate-500">{String(label)}</p>
+                              <p className="mt-1 font-semibold text-slate-800">{accessMatrixCellLabel(cell)}</p>
+                            </div>
+                          ))}
+                        </div>
+                        <p className="mt-3 text-xs leading-6 text-slate-600">
+                          {nestedString(row, "explanation")}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              ) : null}
+
               <div className="mt-8 space-y-8">
                 {categoryKeys.map((category) => (
                   <section key={`report-${category}`}>
@@ -2725,26 +3091,15 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                                   getStatusStyles(deriveFindingStatus(finding)),
                                 )}
                               >
-                                {deriveFindingStatus(finding)}
+                                {formatFindingHeader(finding).compact}
                               </span>
-                              {(deriveFindingStatus(finding) === "warning" ||
-                                deriveFindingStatus(finding) === "fail") && (
-                                <span
-                                  className={cn(
-                                    "rounded-full px-3 py-1 text-[10px] font-bold uppercase tracking-[0.14em]",
-                                    getSeverityStyles(finding.severity),
-                                  )}
-                                >
-                                  {finding.severity} severity
-                                </span>
-                              )}
                               <span
                                 className={cn(
                                   "rounded-full px-3 py-1 text-[10px] font-bold uppercase tracking-[0.14em]",
                                   getConfidenceStyles(finding.confidence ?? "info"),
                                 )}
                               >
-                                {finding.confidence ?? "info"}
+                                Confidence: {formatFindingHeader(finding).confidenceLabel}
                               </span>
                               {typeof finding.riskScore === "number" ? (
                                 <span className="rounded-full border border-slate-200 bg-white px-3 py-1 text-[10px] font-bold uppercase tracking-[0.14em] text-slate-700">

@@ -8,11 +8,14 @@ export type AttackPathStep = {
   severity: Severity;
   confidence: FindingConfidence;
   attackerAction: string;
+  evidence: string;
   technicalEvidence: string;
   gainedCapability: string;
   businessImpact: string;
   affectedUrl?: string;
   affectedParameter?: string;
+  isConfirmedChainStep: boolean;
+  supportingEvidence?: boolean;
 };
 
 export type AttackPath = {
@@ -21,11 +24,15 @@ export type AttackPath = {
   summary: string;
   entryPoint: string;
   finalImpact: string;
+  confirmedSteps: AttackPathStep[];
+  likelyExtensions: AttackPathStep[];
   steps: AttackPathStep[];
   fixFirstFindingId: string;
+  fixFirstTitle: string;
   fixFirstReason: string;
   collapsedFindingsIfFixed: string[];
   riskScore: number;
+  suppressedRelatedPathCount?: number;
 };
 
 function defaultCapabilities(finding: ScanFinding) {
@@ -105,11 +112,63 @@ function evidenceFor(finding: ScanFinding) {
   );
 }
 
+function isMetaFinding(finding: ScanFinding) {
+  const key = `${finding.checkKey ?? ""} ${finding.title} ${finding.findingClass ?? ""}`.toLowerCase();
+  return finding.isMetaFinding === true || /attack path analysis|attack-surface|coverage|crawl/.test(key);
+}
+
+function isSupportingFinding(finding: ScanFinding) {
+  const key = `${finding.checkKey ?? ""} ${finding.title}`.toLowerCase();
+  return finding.isExploitSupportingEvidence === true || /authenticated session context|protected api access/.test(key);
+}
+
+function chainOrder(entry: {
+  finding: ScanFinding;
+  gained: string[];
+}) {
+  const key = `${entry.finding.checkKey ?? ""} ${entry.finding.title}`.toLowerCase();
+  if (/sql/.test(key)) return 10;
+  if (/auth.*bypass|authentication.*bypass/.test(key)) return 20;
+  if (/authenticated.*session|protected.*api|session reuse/.test(key)) return 30;
+  if (/admin/.test(key)) return 40;
+  if (/idor|object.*access|cross-user/.test(key)) return 50;
+  if (/xss/.test(key)) return 60;
+  return 90;
+}
+
+function stepFromEntry(
+  entry: {
+    finding: ScanFinding;
+    gained: string[];
+  },
+  index: number,
+  isConfirmedChainStep: boolean,
+) {
+  const capability = entry.gained[0] ?? "access";
+  const evidence = evidenceFor(entry.finding);
+  return {
+    stepNumber: index + 1,
+    title: entry.finding.title,
+    findingId: entry.finding.id,
+    severity: entry.finding.severity,
+    confidence: entry.finding.confidence ?? "info",
+    attackerAction: actionFor(entry.finding),
+    evidence,
+    technicalEvidence: evidence,
+    gainedCapability: capability,
+    businessImpact: finalImpactFor(capability),
+    affectedUrl: entry.finding.affectedUrl,
+    affectedParameter: entry.finding.affectedParameter,
+    isConfirmedChainStep,
+    supportingEvidence: isSupportingFinding(entry.finding),
+  } satisfies AttackPathStep;
+}
+
 export function buildAttackPaths(findings: ScanFinding[]) {
   const issues = findings
     .filter((finding) => {
       const status = deriveFindingStatus(finding);
-      return status === "fail" || status === "warning";
+      return (status === "fail" || status === "warning") && !isMetaFinding(finding);
     })
     .map((finding) => ({
       finding,
@@ -127,62 +186,88 @@ export function buildAttackPaths(findings: ScanFinding[]) {
       return (right.finding.riskScore ?? 0) - (left.finding.riskScore ?? 0);
     });
 
-  const paths: AttackPath[] = [];
-  for (const start of issues.filter((entry) => entry.requires.length === 0).slice(0, 3)) {
-    const gained = new Set(start.gained);
-    const steps = [start];
+  const gained = new Set<string>();
+  const confirmedEntries = issues
+    .filter((entry) => entry.finding.confidence === "confirmed")
+    .sort((left, right) => chainOrder(left) - chainOrder(right));
+  const confirmedChain: typeof confirmedEntries = [];
 
-    for (const candidate of issues) {
-      if (candidate.finding.id === start.finding.id) {
-        continue;
-      }
-      if (candidate.requires.every((requirement) => gained.has(requirement))) {
-        steps.push(candidate);
-        candidate.gained.forEach((capability) => gained.add(capability));
-      }
-      if (steps.length >= 5) {
-        break;
-      }
-    }
+  for (const candidate of confirmedEntries) {
+    const requirementsMet =
+      candidate.requires.length === 0 ||
+      candidate.requires.every((requirement) => gained.has(requirement)) ||
+      isSupportingFinding(candidate.finding);
 
-    if (steps.length < 2) {
+    if (!requirementsMet) {
       continue;
     }
 
-    const stepModels = steps.map((entry, index) => {
-      const capability = entry.gained[0] ?? "access";
-      return {
-        stepNumber: index + 1,
-        title: entry.finding.title,
-        findingId: entry.finding.id,
-        severity: entry.finding.severity,
-        confidence: entry.finding.confidence ?? "info",
-        attackerAction: actionFor(entry.finding),
-        technicalEvidence: evidenceFor(entry.finding),
-        gainedCapability: capability,
-        businessImpact: finalImpactFor(capability),
-        affectedUrl: entry.finding.affectedUrl,
-        affectedParameter: entry.finding.affectedParameter,
-      } satisfies AttackPathStep;
-    });
-    const finalCapability = stepModels.at(-1)?.gainedCapability ?? "access";
-    const fixFirst = steps.find((entry) => entry.finding.confidence === "confirmed") ?? steps[0];
-
-    paths.push({
-      id: `attack-path-${start.finding.checkKey ?? start.finding.id}`,
-      title: `From ${start.finding.title} to ${finalImpactFor(finalCapability).replace(/\.$/, "").toLowerCase()}`,
-      summary: `The scanner connected ${stepModels.length} findings into a practical attacker narrative.`,
-      entryPoint: start.finding.affectedUrl ?? start.finding.title,
-      finalImpact: finalImpactFor(finalCapability),
-      steps: stepModels,
-      fixFirstFindingId: fixFirst.finding.id,
-      fixFirstReason: `${fixFirst.finding.title} is the strongest early step and may remove downstream access if fixed.`,
-      collapsedFindingsIfFixed: steps
-        .filter((entry) => entry.finding.id !== fixFirst.finding.id)
-        .map((entry) => entry.finding.id),
-      riskScore: Math.min(100, Math.max(...steps.map((entry) => entry.finding.riskScore ?? 0)) + (stepModels.length - 1) * 5),
-    });
+    confirmedChain.push(candidate);
+    candidate.gained.forEach((capability) => gained.add(capability));
   }
 
-  return paths.slice(0, 3);
+  const likelyExtensions = issues
+    .filter(
+      (entry) =>
+        entry.finding.confidence === "likely" &&
+        !confirmedChain.some((confirmed) => confirmed.finding.id === entry.finding.id),
+    )
+    .sort((left, right) => chainOrder(left) - chainOrder(right))
+    .slice(0, 4);
+
+  if (confirmedChain.length + likelyExtensions.length < 2) {
+    return [];
+  }
+
+  const confirmedSteps = confirmedChain.map((entry, index) => stepFromEntry(entry, index, true));
+  const likelyExtensionSteps = likelyExtensions.map((entry, index) =>
+    stepFromEntry(entry, index, false),
+  );
+  const finalCapability =
+    confirmedSteps.at(-1)?.gainedCapability ??
+    likelyExtensionSteps.at(-1)?.gainedCapability ??
+    "access";
+  const fixFirst =
+    confirmedChain.find((entry) => !isSupportingFinding(entry.finding)) ??
+    confirmedChain[0] ??
+    likelyExtensions[0];
+  const title =
+    confirmedSteps.some((step) => /sql/i.test(step.title)) &&
+    confirmedSteps.some((step) => /auth/i.test(step.title))
+      ? "From public SQL injection to authenticated access"
+      : `From ${confirmedSteps[0]?.title ?? likelyExtensionSteps[0]?.title} to ${finalImpactFor(finalCapability).replace(/\.$/, "").toLowerCase()}`;
+  const summary =
+    confirmedSteps.length > 0
+      ? "The scanner connected confirmed evidence into a practical attacker narrative. Likely downstream issues are listed separately because they require stronger proof."
+      : "The scanner found likely chainable issues, but no confirmed multi-step attack path was proven.";
+
+  return [
+    {
+      id: `attack-path-primary-${fixFirst?.finding.checkKey ?? fixFirst?.finding.id ?? "sampled"}`,
+      title,
+      summary,
+      entryPoint: confirmedSteps[0]?.affectedUrl ?? likelyExtensionSteps[0]?.affectedUrl ?? title,
+      finalImpact:
+        confirmedSteps.length > 0 && likelyExtensionSteps.length > 0
+          ? `${finalImpactFor(finalCapability)} Additional likely issues suggest possible downstream impact, but those require stronger proof.`
+          : finalImpactFor(finalCapability),
+      confirmedSteps,
+      likelyExtensions: likelyExtensionSteps,
+      steps: confirmedSteps,
+      fixFirstFindingId: fixFirst?.finding.id ?? "",
+      fixFirstTitle: fixFirst?.finding.title ?? "No concrete fixable step",
+      fixFirstReason: fixFirst
+        ? `${fixFirst.finding.title} is the strongest confirmed early step and may remove downstream attack-chain risk if fixed.`
+        : "No concrete confirmed step was available.",
+      collapsedFindingsIfFixed: [...confirmedChain, ...likelyExtensions]
+        .filter((entry) => entry.finding.id !== fixFirst?.finding.id)
+        .map((entry) => entry.finding.id),
+      riskScore: Math.min(
+        100,
+        Math.max(...[...confirmedChain, ...likelyExtensions].map((entry) => entry.finding.riskScore ?? 0)) +
+          Math.max(0, confirmedSteps.length - 1) * 5,
+      ),
+      suppressedRelatedPathCount: Math.max(0, issues.filter((entry) => entry.requires.length === 0).length - 1),
+    },
+  ];
 }

@@ -50,7 +50,57 @@ export type ReportSummary = {
   recommendedFirstFix: ScanFinding | null;
   topFixes: ScanFinding[];
   primaryAttackPath?: AttackPath | null;
+  scanModeLimitations: {
+    title: string;
+    summary: string;
+    bullets: string[];
+  };
 };
+
+export function scanModeLimitationsFor(scanMode: string): ReportSummary["scanModeLimitations"] {
+  if (scanMode === "Deep") {
+    return {
+      title: "Deep Mode Coverage",
+      summary:
+        "Deep mode enabled expanded crawling, repeated blind SQLi probes, XSS execution verification, and broader endpoint testing.",
+      bullets: [
+        "Crawling and endpoint discovery use a larger budget than Fast mode.",
+        "Blind SQL injection probes may use repeated baseline/control/test requests.",
+        "XSS execution verification is attempted where render locations are discovered.",
+        "Authenticated and role-aware proof still depends on provided credentials or sessions.",
+      ],
+    };
+  }
+
+  if (scanMode === "Authenticated") {
+    return {
+      title: "Authenticated Mode Coverage",
+      summary:
+        "Authenticated mode used provided credentials/session contexts for protected endpoint, role-based, and authorization testing.",
+      bullets: [
+        "Protected API checks use the supplied authentication material.",
+        "Role-based testing improves when userA, userB, and admin contexts are all provided.",
+        "IDOR confirmation still requires cross-user ownership proof.",
+        "Tokens and cookies are masked in stored report output.",
+      ],
+    };
+  }
+
+  return {
+    title: "Fast Mode Limitations",
+    summary:
+      "This scan ran in Fast mode. Fast mode prioritizes quick coverage and safe bounded probes. Some deeper checks may be skipped, reduced, or reported as coverage notes instead of confirmed findings.",
+    bullets: [
+      "Rate-limit probing was deferred or reduced.",
+      "Time-based blind SQL injection checks were limited or skipped.",
+      "Role-based testing is partial unless userA, userB, and admin contexts are provided.",
+      "IDOR confirmation requires two separate user contexts for ownership proof.",
+      "Stored XSS execution depends on discovering the page where stored content renders.",
+      "Crawling depth and endpoint discovery are bounded.",
+      "Some INFO findings represent coverage limitations, not proof that a risk does not exist.",
+    ],
+  };
+}
 
 export function buildReportSummary(params: {
   target: string;
@@ -108,5 +158,6 @@ export function buildReportSummary(params: {
     recommendedFirstFix,
     topFixes,
     primaryAttackPath: params.attackPaths[0] ?? null,
+    scanModeLimitations: scanModeLimitationsFor(params.scanMode),
   };
 }

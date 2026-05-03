@@ -7,6 +7,7 @@ import {
   ShieldCheck,
   Zap,
 } from "lucide-react";
+import Link from "next/link";
 import { StartAuditForm } from "@/components/landing/start-audit-form";
 
 const featureCards = [
@@ -215,12 +216,12 @@ export default function HomePage() {
                   Scan Site
                   <ChevronRight className="h-4 w-4 text-white" />
                 </a>
-                <a
+                <Link
                   href="/history"
                   className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white/80 px-6 py-3 text-sm font-semibold text-slate-700 shadow-sm backdrop-blur-md transition-all hover:bg-white"
                 >
                   Open Scans
-                </a>
+                </Link>
               </div>
             </div>
           </div>

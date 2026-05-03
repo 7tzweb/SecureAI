@@ -18,7 +18,12 @@ import {
   type ScanFinding,
   type ScanFindingEvidence,
 } from "@/lib/types";
-import { deriveFindingStatus, getConfidenceStyles, getSeverityStyles, getStatusStyles } from "@/lib/utils";
+import {
+  deriveFindingStatus,
+  formatFindingHeader,
+  getConfidenceStyles,
+  getStatusStyles,
+} from "@/lib/utils";
 
 function StatusIcon({ finding }: { finding: ScanFinding }) {
   const status = deriveFindingStatus(finding);
@@ -180,6 +185,7 @@ export function FindingCard({
   const status = deriveFindingStatus(finding);
   const evidence = finding.evidence ?? {};
   const confidence = finding.confidence ?? "info";
+  const headerLabels = formatFindingHeader(finding);
   const locations = extractLocations(evidence);
   const evidenceMeta = extractEvidenceMeta(evidence);
   const checkedUrl = typeof evidence.checkedUrl === "string" ? evidence.checkedUrl : null;
@@ -201,22 +207,15 @@ export function FindingCard({
           <span
             className={`rounded-full px-3 py-1 text-[10px] font-bold uppercase ${getStatusStyles(status)}`}
           >
-            {status}
+            {headerLabels.compact}
           </span>
-          {(status === "warning" || status === "fail") ? (
-            <span
-              className={`rounded-full px-3 py-1 text-[10px] font-bold uppercase ${getSeverityStyles(finding.severity)}`}
-            >
-              {finding.severity}
-            </span>
-          ) : null}
           <span className="rounded-full bg-slate-100 px-3 py-1 text-[10px] font-bold uppercase text-slate-600">
             {finding.category}
           </span>
           <span
             className={`rounded-full px-3 py-1 text-[10px] font-bold uppercase ${getConfidenceStyles(confidence)}`}
           >
-            {confidence}
+            Confidence: {headerLabels.confidenceLabel}
           </span>
         </div>
         <p className="max-w-3xl text-sm leading-7 text-slate-500">{finding.shortDescription}</p>

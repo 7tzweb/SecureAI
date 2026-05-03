@@ -92,6 +92,20 @@ export function deriveFindingStatus(finding: Pick<ScanFinding, "severity"> & { s
   }
 }
 
+export function formatFindingHeader(finding: Pick<ScanFinding, "severity" | "confidence"> & { status?: FindingStatus }) {
+  const status = deriveFindingStatus(finding).toUpperCase();
+  const severity = finding.severity.toUpperCase();
+  const confidence = (finding.confidence ?? "info").toUpperCase();
+  const showSeverity = Boolean(severity && severity !== status);
+
+  return {
+    statusLabel: status,
+    severityLabel: showSeverity ? severity : undefined,
+    confidenceLabel: confidence,
+    compact: showSeverity ? `${status} · ${severity}` : status,
+  };
+}
+
 export function computeScore(findings: ScanFinding[]) {
   const warningPenaltyTotals: Record<Severity, number> = {
     critical: 0,

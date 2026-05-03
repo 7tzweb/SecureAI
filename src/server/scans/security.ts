@@ -704,6 +704,14 @@ function redactValue(value: string, visible = 4) {
   return `${compact.slice(0, visible)}...${compact.slice(-visible)}`;
 }
 
+function maskSecret(value: string | null | undefined) {
+  if (!value || value.length < 12) {
+    return "[masked]";
+  }
+
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
 function collectCookieHints(setCookies: string[]) {
   const cookies = setCookies.map((cookie) => ({
     name: cookieName(cookie),
@@ -3444,6 +3452,50 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       primarySession?.source === "active-bypass" &&
       authenticatedEndpointProbes.some((probe) => probe.status >= 200 && probe.status < 400),
   );
+  const authBypassVerificationProbe =
+    authenticatedEndpointProbes.find((probe) => probe.status >= 200 && probe.status < 400) ?? null;
+  const authBypassSessionArtifactType =
+    successfulAuthBypass?.sessionCookie
+      ? "cookie"
+      : primarySession?.token && primarySession.headers && "authorization" in (primarySession.headers as Record<string, unknown>)
+        ? "bearer-token"
+        : successfulAuthBypass?.token
+          ? "json-token"
+          : "unknown";
+  const authBypassAuthModel =
+    successfulAuthBypass?.sessionCookie && successfulAuthBypass.token
+      ? "mixed"
+      : successfulAuthBypass?.sessionCookie
+        ? "cookie-based"
+        : successfulAuthBypass?.token || primarySession?.token
+          ? "token-based"
+          : "unknown";
+  const authBypassEvidence = successfulAuthBypass
+    ? {
+        loginEndpoint: `POST ${new URL(successfulAuthBypass.url).pathname}`,
+        payloadPreview: redactValue(successfulAuthBypass.payload),
+        responseStatus: successfulAuthBypass.status,
+        sessionArtifactType: authBypassSessionArtifactType,
+        tokenPreview: successfulAuthBypass.token ? maskSecret(successfulAuthBypass.token) : undefined,
+        verificationEndpoint: authBypassVerificationProbe
+          ? new URL(authBypassVerificationProbe.url).pathname
+          : "not-verified",
+        verificationStatus: authBypassVerificationProbe?.status ?? 0,
+        verificationResult: verifiedAuthBypass
+          ? authBypassVerificationProbe?.sensitiveResponse
+            ? "protected-data-access"
+            : successfulAuthBypass.userId || successfulAuthBypass.userEmail
+              ? "authenticated-identity"
+              : "token-accepted"
+          : "unknown",
+        identitySummary: {
+          userId: successfulAuthBypass.userId ? String(successfulAuthBypass.userId) : undefined,
+          emailPreview: successfulAuthBypass.userEmail ? redactValue(successfulAuthBypass.userEmail, 3) : undefined,
+          role: successfulAuthBypass.roles[0],
+        },
+        authModel: authBypassAuthModel,
+      }
+    : null;
   findings.push(
     buildSecurityCheck({
       checkKey: "authentication-bypass-active-probe",
@@ -3481,8 +3533,16 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         confidence: verifiedAuthBypass ? "confirmed-reusable-session-verified" : successfulAuthBypass ? "likely-token-or-session-signal" : "not-detected",
         authenticatedVerification: verifiedAuthBypass,
         reusableSessionVerified: verifiedAuthBypass,
-        verificationEndpoint:
-          authenticatedEndpointProbes.find((probe) => probe.status >= 200 && probe.status < 400)?.url ?? null,
+        authBypassEvidence,
+        loginEndpoint: authBypassEvidence?.loginEndpoint ?? null,
+        payloadPreview: authBypassEvidence?.payloadPreview ?? null,
+        responseStatus: authBypassEvidence?.responseStatus ?? null,
+        sessionArtifactType: authBypassEvidence?.sessionArtifactType ?? "unknown",
+        tokenPreview: authBypassEvidence?.tokenPreview ?? null,
+        authModel: authBypassEvidence?.authModel ?? "unknown",
+        verificationEndpoint: authBypassVerificationProbe?.url ?? null,
+        verificationStatus: authBypassEvidence?.verificationStatus ?? null,
+        verificationResult: authBypassEvidence?.verificationResult ?? "unknown",
         results: authBypassProbeResults.map((result) => ({
           url: result.url,
           payload: redactValue(result.payload),
@@ -3920,24 +3980,27 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   });
   const confirmedAccessIssue = accessMatrix.find(
     (row) =>
-      row.issueType &&
-      (row.issueType === "admin_endpoint_public" ||
-        row.issueType === "anonymous_can_access_protected"),
+      row.issue === "anonymous-sensitive-access" ||
+      row.issue === "user-admin-access" ||
+      row.issue === "cross-user-access",
   );
-  const likelyAccessIssue = accessMatrix.find((row) => row.issueType);
+  const likelyAccessIssue = accessMatrix.find((row) => row.issue !== "none" && row.issue !== "partial-coverage");
+  const partialAccessCoverage = accessMatrix.some((row) => row.issue === "partial-coverage");
   findings.push(
     buildSecurityCheck({
       checkKey: "role-based-access-matrix",
-      title: "Role-based access matrix",
+      title: partialAccessCoverage ? "Partial access matrix" : "Role-based access matrix",
       scoreWeight: 1.3,
       status: confirmedAccessIssue ? "fail" : likelyAccessIssue ? "warning" : "info",
       severity: confirmedAccessIssue ? "high" : likelyAccessIssue ? "medium" : "info",
       confidence: confirmedAccessIssue ? "confirmed" : likelyAccessIssue ? "likely" : "info",
       shortDescription: confirmedAccessIssue
-        ? `${confirmedAccessIssue.issueType?.replace(/_/g, " ")} was observed on ${confirmedAccessIssue.endpoint}.`
+        ? `${confirmedAccessIssue.issue.replace(/-/g, " ")} was observed on ${confirmedAccessIssue.endpoint}.`
         : likelyAccessIssue
-          ? `${likelyAccessIssue.issueType?.replace(/_/g, " ")} may affect ${likelyAccessIssue.endpoint}.`
-          : "Access behavior was recorded for available anonymous and authenticated contexts.",
+          ? `${likelyAccessIssue.issue.replace(/-/g, " ")} may affect ${likelyAccessIssue.endpoint}.`
+          : partialAccessCoverage
+            ? "Partial access behavior was recorded for anonymous and scanner-auth-context coverage; userA/userB/admin were not all available."
+            : "Access behavior was recorded for available anonymous and authenticated contexts.",
       whyItMatters:
         "Broken access control often appears only when comparing anonymous, normal user, secondary user, and admin contexts against the same endpoints.",
       recommendation:
@@ -3951,14 +4014,26 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           ? confirmedAccessIssue.evidenceSummary
           : likelyAccessIssue
             ? likelyAccessIssue.evidenceSummary
-            : "No role-based access issue was confirmed in the sampled matrix.",
+            : partialAccessCoverage
+              ? "Partial access matrix generated. Full cross-user and admin proof requires userA, userB, and admin contexts."
+              : "No role-based access issue was confirmed in the sampled matrix.",
         accessMatrix,
+        matrixTitle: partialAccessCoverage ? "Partial Access Matrix" : "Role-Based Access Matrix",
+        partialCoverage: partialAccessCoverage,
+        coverageNote: partialAccessCoverage
+          ? "Only anonymous and scanner-auth-context were available for at least one sampled endpoint. Provide userA, userB, and admin contexts for full role-based authorization proof."
+          : null,
         results: accessMatrix.map((row) => ({
           url: row.endpoint,
           method: row.method,
           sensitivity: row.sensitivity,
-          issueType: row.issueType ?? null,
-          observed: row.observed,
+          issue: row.issue,
+          explanation: row.explanation,
+          anonymous: row.anonymous,
+          scannerAuthContext: row.scannerAuthContext,
+          userA: row.userA,
+          userB: row.userB,
+          admin: row.admin,
         })),
       },
     }),
@@ -5613,8 +5688,10 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const attackPaths = buildAttackPaths(findings);
   const confirmedAttackPathSteps = attackPathSteps.filter((step) => step.confidence === "confirmed").length;
   const topAttackPath = attackPaths[0] ?? null;
+  const topConfirmedSteps = topAttackPath?.confirmedSteps ?? topAttackPath?.steps ?? [];
+  const topLikelyExtensions = topAttackPath?.likelyExtensions ?? [];
   const attackChainStatus =
-    topAttackPath && topAttackPath.steps.filter((step) => step.confidence === "confirmed").length >= 2
+    topAttackPath && topConfirmedSteps.length >= 2
       ? { status: "fail" as const, severity: "critical" as const }
       : topAttackPath || attackPathSteps.length >= 2
         ? { status: "warning" as const, severity: "high" as const }
@@ -5628,14 +5705,14 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       scoreWeight: 1.5,
       ...attackChainStatus,
       confidence:
-        topAttackPath && topAttackPath.steps.filter((step) => step.confidence === "confirmed").length >= 2
+        topAttackPath && topConfirmedSteps.length >= 2
           ? "confirmed"
           : topAttackPath || attackPathSteps.length > 0
             ? "likely"
             : "info",
       shortDescription:
         topAttackPath
-          ? `The scan built an attacker path with ${topAttackPath.steps.length} numbered step(s): ${topAttackPath.title}.`
+          ? `The scan built one primary attacker path with ${topConfirmedSteps.length} confirmed step(s) and ${topLikelyExtensions.length} likely extension(s): ${topAttackPath.title}.`
         : attackPathSteps.length >= 2
           ? `The scan connected ${attackPathSteps.length} exploitable or likely-exploitable steps into a plausible attacker path.`
           : attackPathSteps.length === 1
@@ -5653,28 +5730,41 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         checkedUrl: attackPathSteps.map((step) => String(step.evidence ?? "")).filter(Boolean).join(", "),
         expectedLocation: "Confirmed vulnerabilities and session-aware follow-on probes",
         summary:
-          attackPathSteps.length >= 2
-            ? "Multiple findings can be chained into a higher-impact attack path."
+          topAttackPath
+            ? topAttackPath.summary
+            : attackPathSteps.length >= 2
+              ? "Multiple findings can be chained into a higher-impact attack path."
             : attackPathSteps.length === 1
               ? "Only one attack-path step was available."
               : "No chainable path was confirmed.",
         attackPath: attackPathSteps,
         attackPaths,
-        numberedSteps: topAttackPath?.steps ?? [],
+        primaryAttackPath: topAttackPath,
+        numberedSteps: topConfirmedSteps,
+        confirmedSteps: topConfirmedSteps,
+        likelyExtensions: topLikelyExtensions,
+        relatedPathsSuppressed: topAttackPath?.suppressedRelatedPathCount ?? 0,
         fixFirstFindingId: topAttackPath?.fixFirstFindingId ?? null,
+        fixFirstTitle: topAttackPath?.fixFirstTitle ?? null,
         fixFirstReason: topAttackPath?.fixFirstReason ?? null,
         collapsedFindingsIfFixed: topAttackPath?.collapsedFindingsIfFixed ?? [],
         businessImpact:
-          confirmedAttackPathSteps >= 2
+          topConfirmedSteps.length >= 2 || confirmedAttackPathSteps >= 2
             ? "A practical attacker path exists from initial exploitation into authenticated or user-impacting access."
             : attackPathSteps.length >= 2
               ? "A plausible attacker path exists but needs one more confirmation step."
               : "No chained business impact was confirmed.",
         exploitabilityScore:
-          confirmedAttackPathSteps >= 2 ? 10 : attackPathSteps.length >= 2 ? 8 : attackPathSteps.length === 1 ? 5 : 1,
+          topConfirmedSteps.length >= 2 || confirmedAttackPathSteps >= 2
+            ? 10
+            : attackPathSteps.length >= 2
+              ? 8
+              : attackPathSteps.length === 1
+                ? 5
+                : 1,
         recommendedFirstFix:
           (topAttackPath
-            ? findings.find((finding) => finding.id === topAttackPath.fixFirstFindingId)?.title
+            ? topAttackPath.fixFirstTitle || findings.find((finding) => finding.id === topAttackPath.fixFirstFindingId)?.title
             : null) ??
           attackPathSteps[0]?.step ??
           "No chained path detected",
