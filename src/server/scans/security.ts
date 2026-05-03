@@ -2042,7 +2042,18 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const cspHeader = primaryAttempt.headers["content-security-policy"];
   const cspReportOnlyHeader = primaryAttempt.headers["content-security-policy-report-only"];
   const effectiveCspHeader = cspHeader || cspReportOnlyHeader || "";
-  const cspWeak = effectiveCspHeader ? /unsafe-inline|unsafe-eval/i.test(effectiveCspHeader) : false;
+  const cspDirectives = effectiveCspHeader
+    .split(";")
+    .map((directive) => directive.trim().toLowerCase())
+    .filter(Boolean);
+  const cspOnlyUpgradeInsecureRequests =
+    cspDirectives.length > 0 &&
+    cspDirectives.every((directive) => directive === "upgrade-insecure-requests");
+  const cspWeak = effectiveCspHeader
+    ? /unsafe-inline|unsafe-eval/i.test(effectiveCspHeader) ||
+      cspOnlyUpgradeInsecureRequests ||
+      !/(^|;)\s*(script-src|default-src)\b/i.test(effectiveCspHeader)
+    : false;
   const cspStatus = cspHeader
     ? cspWeak
       ? { status: "warning" as const, severity: "low" as const }
@@ -2055,11 +2066,13 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   findings.push(
     buildSecurityCheck({
       checkKey: "content-security-policy",
-      title: "Content-Security-Policy",
+      title: cspWeak ? "Weak Content-Security-Policy" : "Content-Security-Policy",
       scoreWeight: 0.7,
       ...cspStatus,
       shortDescription: cspHeader
-        ? `Content-Security-Policy is set to "${cspHeader}".`
+        ? cspWeak
+          ? `Content-Security-Policy is set, but it is weak: "${cspHeader}".`
+          : `Content-Security-Policy is set to "${cspHeader}".`
         : cspReportOnlyHeader
           ? `Content-Security-Policy-Report-Only is set to "${cspReportOnlyHeader}".`
           : primaryAttemptIsInterstitial
@@ -2068,7 +2081,9 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       whyItMatters:
         "A strong CSP reduces exposure to XSS and limits where scripts, frames, and other content can load from.",
       recommendation: cspHeader
-        ? "Tighten permissive directives like `unsafe-inline` or `unsafe-eval` when feasible."
+        ? cspWeak
+          ? "Add a stronger CSP with script-src, object-src, base-uri, frame-ancestors, and default-src directives where feasible."
+          : "Tighten permissive directives like `unsafe-inline` or `unsafe-eval` when feasible."
         : cspReportOnlyHeader
           ? "Promote the report-only policy to an enforced `Content-Security-Policy` header once it is validated."
           : primaryAttemptIsInterstitial
@@ -2085,6 +2100,8 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
             ),
             value: effectiveCspHeader,
             enforced: Boolean(cspHeader),
+            weakPolicy: cspWeak,
+            onlyUpgradeInsecureRequests: cspOnlyUpgradeInsecureRequests,
           }
         : headerEvidence(primaryAttempt.finalUrl, "content-security-policy", "The CSP header is missing from the main response."),
     }),
@@ -4307,7 +4324,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const passwordForms = authForms.filter((form) => form.hasPasswordField);
   const passwordFieldStatus =
     passwordForms.length === 0 && authSurfaceDetected
-      ? { status: "info" as const, severity: "info" as const }
+      ? { status: "warning" as const, severity: "medium" as const }
       : passwordForms.length === 0
       ? { status: "info" as const, severity: "info" as const }
       : passwordForms.some((form) => !form.secure)
@@ -4371,7 +4388,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         ? { status: "fail" as const, severity: "high" as const }
         : uploadForms.some((form) => form.csrfFieldNames.length === 0 && !metaCsrfTokenPresent)
           ? { status: "warning" as const, severity: "medium" as const }
-          : { status: "info" as const, severity: "info" as const };
+          : { status: "warning" as const, severity: "medium" as const };
   findings.push(
     buildSecurityCheck({
       checkKey: "file-upload-risk-indicators",
@@ -5834,8 +5851,13 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     title: finding.title,
     riskScore: finding.riskScore ?? 0,
     priorityLabel: finding.priorityLabel ?? "Low priority",
-    reason: finding.fixFirstReason ?? finding.proofSummary ?? finding.shortDescription,
+    reason:
+      "reason" in finding
+        ? finding.reason
+        : finding.fixFirstReason ?? finding.proofSummary ?? finding.shortDescription,
     recommendation: finding.recommendation,
+    findings: "findings" in finding ? finding.findings : undefined,
+    affectedUrls: "affectedUrls" in finding ? finding.affectedUrls : undefined,
   }));
   findings.unshift(
     buildSecurityCheck({
@@ -5873,12 +5895,16 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         securityScore: reportSummary.security.score,
         securityRiskLabel: reportSummary.security.riskLabel,
         securityScoreExplanation: reportSummary.security.explanation,
+        securityScoreBreakdown: reportSummary.security.breakdown,
+        coverageConfidence: reportSummary.coverageConfidence,
         recommendedFirstFix: recommendedFix,
         recommendedFirstFixId: reportSummary.recommendedFirstFix?.id ?? null,
         recommendedFirstFixReason:
-          reportSummary.recommendedFirstFix?.fixFirstReason ??
-          reportSummary.recommendedFirstFix?.proofSummary ??
-          reportSummary.recommendedFirstFix?.shortDescription ??
+          (reportSummary.recommendedFirstFix && "reason" in reportSummary.recommendedFirstFix
+            ? reportSummary.recommendedFirstFix.reason
+            : reportSummary.recommendedFirstFix?.fixFirstReason ??
+              reportSummary.recommendedFirstFix?.proofSummary ??
+              reportSummary.recommendedFirstFix?.shortDescription) ??
           "No concrete exploitable vulnerability was confirmed.",
         topFixes: recommendedFixes,
         attackPaths,

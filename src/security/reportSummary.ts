@@ -2,6 +2,10 @@ import type { ScanFinding } from "@/lib/types";
 import { deriveFindingStatus } from "@/lib/utils";
 import type { AttackPath } from "@/security/analysis/attackPathBuilder";
 import {
+  type CoverageConfidence,
+  type FixRecommendation,
+  type SecurityScoreBreakdown,
+  calculateCoverageConfidence,
   calculateSecurityScore,
   chooseRecommendedFirstFix,
   getTopFixes,
@@ -23,7 +27,9 @@ export type ReportSummary = {
     explanation: string;
     passedChecks: number;
     failedChecks: number;
+    breakdown: SecurityScoreBreakdown;
   };
+  coverageConfidence: CoverageConfidence;
   counts: {
     confirmedExploitableVulnerabilities: number;
     confirmedSupportingEvidence: number;
@@ -47,8 +53,8 @@ export type ReportSummary = {
     scanDurationMs?: number;
     scanDuration?: string;
   };
-  recommendedFirstFix: ScanFinding | null;
-  topFixes: ScanFinding[];
+  recommendedFirstFix: FixRecommendation | null;
+  topFixes: FixRecommendation[];
   primaryAttackPath?: AttackPath | null;
   scanModeLimitations: {
     title: string;
@@ -113,7 +119,8 @@ export function buildReportSummary(params: {
 }): ReportSummary {
   const recommendedFirstFix = chooseRecommendedFirstFix(params.findings, params.attackPaths);
   const topFixes = getTopFixes(params.findings, params.attackPaths, 5);
-  const securityScore = calculateSecurityScore(params.findings, params.attackPaths);
+  const securityScore = calculateSecurityScore(params.findings, params.attackPaths, params.attackSurface);
+  const coverageConfidence = calculateCoverageConfidence(params.findings, params.attackSurface);
   const passedChecks = params.findings.filter((finding) => deriveFindingStatus(finding) === "pass").length;
   const failedChecks = params.findings.filter((finding) => deriveFindingStatus(finding) === "fail").length;
 
@@ -121,14 +128,16 @@ export function buildReportSummary(params: {
     target: params.target,
     scanMode: params.scanMode,
     generatedAt: params.generatedAt,
-    overallScore: params.overallScore ?? securityScore.score,
+    overallScore: params.overallScore ?? securityScore.finalScore,
     security: {
-      score: securityScore.score,
-      riskLabel: securityScore.label as SecurityRiskLabel,
+      score: securityScore.finalScore,
+      riskLabel: securityScore.riskLabel as SecurityRiskLabel,
       explanation: securityScore.explanation,
       passedChecks,
       failedChecks,
+      breakdown: securityScore,
     },
+    coverageConfidence,
     counts: {
       confirmedExploitableVulnerabilities: params.findings.filter(isConfirmedExploitableVulnerability).length,
       confirmedSupportingEvidence: params.findings.filter(isConfirmedSupportingEvidence).length,

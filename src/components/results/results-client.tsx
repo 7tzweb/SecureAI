@@ -459,6 +459,10 @@ function isConfirmedExploitableFinding(finding: ScanFinding) {
 function isInvalidFixTitle(title: string) {
   const normalizedTitle = title.toLowerCase();
 
+  if (normalizedTitle.includes("fix browser-rendered crawl coverage")) {
+    return false;
+  }
+
   return (
     !normalizedTitle ||
     normalizedTitle.includes("attack path analysis") ||
@@ -576,6 +580,7 @@ function extractAttackSurfaceSummary(findings: Record<CategoryKey, ScanFinding[]
   const reportCounts = nestedRecord(reportSummary, "counts");
   const reportSecurity = nestedRecord(reportSummary, "security");
   const reportAttackSurface = nestedRecord(reportSummary, "attackSurface");
+  const reportCoverageConfidence = objectEvidence(reportSummary?.coverageConfidence) ?? objectEvidence(evidence.coverageConfidence);
   const reportRecommendedFix = objectEvidence(reportSummary?.recommendedFirstFix);
   const primaryAttackPath = primaryAttackPathFrom(evidence, reportSummary);
   const scanModeLimitations =
@@ -625,6 +630,7 @@ function extractAttackSurfaceSummary(findings: Record<CategoryKey, ScanFinding[]
       "No concrete exploitable vulnerability was confirmed",
     recommendedFirstFixReason:
       stringEvidence(evidence, "recommendedFirstFixReason") ||
+      nestedString(reportRecommendedFix, "reason") ||
       nestedString(reportRecommendedFix, "fixFirstReason") ||
       nestedString(reportRecommendedFix, "proofSummary") ||
       nestedString(reportRecommendedFix, "shortDescription") ||
@@ -641,6 +647,7 @@ function extractAttackSurfaceSummary(findings: Record<CategoryKey, ScanFinding[]
         stringEvidence(evidence, "securityScoreExplanation") ||
         fallbackSecurity.explanation,
     },
+    coverageConfidence: reportCoverageConfidence,
     metrics: [
       { label: "Critical issues", value: nestedNumber(reportCounts, "criticalIssues") || numericEvidence(evidence, "criticalIssues") || fallbackCritical },
       { label: "Confirmed exploitable vulnerabilities", value: nestedNumber(reportCounts, "confirmedExploitableVulnerabilities") || numericEvidence(evidence, "confirmedExploitableVulnerabilities") || fallbackConfirmed },
@@ -652,6 +659,7 @@ function extractAttackSurfaceSummary(findings: Record<CategoryKey, ScanFinding[]
       { label: "Crawled pages", value: nestedNumber(reportAttackSurface, "crawledPages") || numericEvidence(evidence, "crawledPages") },
       { label: "Discovered endpoints", value: nestedNumber(reportAttackSurface, "discoveredEndpoints") || numericEvidence(evidence, "discoveredEndpoints") },
       { label: "Tested parameters", value: nestedNumber(reportAttackSurface, "testedParameters") || numericEvidence(evidence, "testedParameters") },
+      { label: "Coverage confidence", value: nestedString(reportCoverageConfidence, "level") || "Unknown" },
       { label: "Active probes", value: numericEvidence(evidence, "activeProbesExecuted") },
       { label: "Duration", value: stringEvidence(evidence, "scanDuration") || "Running" },
     ],
@@ -1277,6 +1285,9 @@ async function downloadReportPdf(
   const pdfReportSummary = pdfAttackSurface?.reportSummary ?? null;
   const pdfReportCounts = nestedRecord(pdfReportSummary, "counts");
   const pdfReportSecurity = nestedRecord(pdfReportSummary, "security");
+  const pdfCoverageConfidence =
+    objectEvidence(pdfReportSummary?.coverageConfidence) ??
+    objectEvidence(pdfAttackSurface?.evidence.coverageConfidence);
   const pdfConfirmedFindings = pdfAllFindings.filter(
     isConfirmedExploitableFinding,
   );
@@ -1333,6 +1344,7 @@ async function downloadReportPdf(
     (isInvalidFixTitle(pdfAttackSurface?.recommendedFirstFix ?? "") ? "" : pdfAttackSurface?.recommendedFirstFix) ||
     "No concrete exploitable vulnerability was confirmed";
   const pdfRecommendedFixReason =
+    nestedString(pdfRecommendedFix, "reason") ||
     nestedString(pdfRecommendedFix, "fixFirstReason") ||
     nestedString(pdfRecommendedFix, "proofSummary") ||
     nestedString(pdfRecommendedFix, "shortDescription") ||
@@ -1355,6 +1367,10 @@ async function downloadReportPdf(
     pdfAttackSurface?.security.explanation ||
     pdfFallbackSecurity.explanation ||
     "Security score is risk-based and capped by confirmed critical exploitable findings and attack path evidence.";
+  const pdfCoverageLevel = nestedString(pdfCoverageConfidence, "level") || "Unknown";
+  const pdfCoverageExplanation =
+    nestedString(pdfCoverageConfidence, "explanation") ||
+    "Coverage confidence was not recorded for this scan.";
   const pdfPrimaryAttackPath = pdfAttackSurface
     ? primaryAttackPathFrom(pdfAttackSurface.evidence, pdfReportSummary)
     : null;
@@ -1406,7 +1422,7 @@ async function downloadReportPdf(
     gapAfter: 0,
   });
   drawTextBlock({
-    text: `Scan mode: ${pdfAttackSurface?.scanMode ?? scan.scanMode ?? "Fast"} | Confirmed exploitable vulnerabilities: ${nestedNumber(pdfReportCounts, "confirmedExploitableVulnerabilities") || pdfConfirmedFindings.length} | Supporting evidence: ${pdfSupportingEvidenceCount} | Likely high-impact: ${nestedNumber(pdfReportCounts, "likelyHighImpactIssues") || pdfLikelyFindings.length} | Informational findings: ${nestedNumber(pdfReportCounts, "informationalFindings") || pdfInfoFindings.length}`,
+    text: `Scan mode: ${pdfAttackSurface?.scanMode ?? scan.scanMode ?? "Fast"} | Coverage Confidence: ${pdfCoverageLevel} | Confirmed exploitable vulnerabilities: ${nestedNumber(pdfReportCounts, "confirmedExploitableVulnerabilities") || pdfConfirmedFindings.length} | Supporting evidence: ${pdfSupportingEvidenceCount} | Likely high-impact: ${nestedNumber(pdfReportCounts, "likelyHighImpactIssues") || pdfLikelyFindings.length} | Informational findings: ${nestedNumber(pdfReportCounts, "informationalFindings") || pdfInfoFindings.length}`,
     fontSize: 11,
     color: palette.muted,
     gapAfter: 20,
@@ -1521,13 +1537,21 @@ async function downloadReportPdf(
     text:
       pdfConfirmedFindings.length > 0
         ? `This scan confirmed ${nestedNumber(pdfReportCounts, "confirmedExploitableVulnerabilities") || pdfConfirmedFindings.length} exploitable vulnerability/vulnerabilities and identified ${nestedNumber(pdfReportCounts, "likelyHighImpactIssues") || pdfLikelyFindings.length} likely high-impact issue(s). The highest priority fix is ${pdfRecommendedFixTitle} because it is the strongest concrete fixable issue by confidence, exposure, and attack-path impact. The report separates confirmed exploitability from supporting evidence and coverage notes.`
-        : `This scan did not confirm a concrete exploitable vulnerability. Review ${nestedNumber(pdfReportCounts, "likelyHighImpactIssues") || pdfLikelyFindings.length} likely high-impact issue(s) and ${nestedNumber(pdfReportCounts, "informationalFindings") || pdfInfoFindings.length} informational coverage note(s) for areas that may require deeper authenticated testing.`,
+        : pdfCoverageLevel !== "High"
+          ? `This scan did not confirm a concrete exploitable vulnerability, but it detected elevated attack-surface risk and limited coverage confidence. Review ${nestedNumber(pdfReportCounts, "likelyHighImpactIssues") || pdfLikelyFindings.length} likely high-impact issue(s), authentication/form surfaces, reflected-input indicators, and coverage notes before treating the target as low risk.`
+          : `This scan did not confirm a concrete exploitable vulnerability. Review ${nestedNumber(pdfReportCounts, "likelyHighImpactIssues") || pdfLikelyFindings.length} likely high-impact issue(s) and ${nestedNumber(pdfReportCounts, "informationalFindings") || pdfInfoFindings.length} informational coverage note(s) for areas that may require deeper authenticated testing.`,
     fontSize: 11,
     color: palette.ink,
     gapAfter: 12,
   });
   drawTextBlock({
     text: `Security Risk: ${pdfSecurityRiskLabel || "Unknown"} | Security Score: ${pdfSecurityScore ?? "--"}/100. ${pdfSecurityExplanation}`,
+    fontSize: 10,
+    color: palette.muted,
+    gapAfter: 12,
+  });
+  drawTextBlock({
+    text: `Coverage Confidence: ${pdfCoverageLevel}. ${pdfCoverageExplanation}`,
     fontSize: 10,
     color: palette.muted,
     gapAfter: 12,
@@ -2579,6 +2603,15 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                       {attackSurfaceSummary.recommendedFirstFix}
                     </span>
                   </p>
+                  {attackSurfaceSummary.coverageConfidence ? (
+                    <p className="mt-1 text-sm leading-7 text-slate-500">
+                      Coverage Confidence:{" "}
+                      <span className="font-semibold text-slate-800">
+                        {nestedString(attackSurfaceSummary.coverageConfidence, "level") || "Unknown"}
+                      </span>
+                      . {nestedString(attackSurfaceSummary.coverageConfidence, "explanation")}
+                    </p>
+                  ) : null}
                 </div>
                 <span className="inline-flex w-fit rounded-full border border-blue-100 bg-blue-50 px-3 py-1 text-[10px] font-bold uppercase text-blue-700">
                   Security report default
@@ -2882,6 +2915,15 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                           {attackSurfaceSummary.recommendedFirstFix}
                         </span>
                       </p>
+                      {attackSurfaceSummary.coverageConfidence ? (
+                        <p className="mt-1 text-sm leading-7 text-slate-600">
+                          Coverage Confidence:{" "}
+                          <span className="font-semibold text-slate-900">
+                            {nestedString(attackSurfaceSummary.coverageConfidence, "level") || "Unknown"}
+                          </span>
+                          . {nestedString(attackSurfaceSummary.coverageConfidence, "explanation")}
+                        </p>
+                      ) : null}
                     </div>
                     <span className="inline-flex w-fit rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[10px] font-bold uppercase text-slate-600">
                       {attackSurfaceSummary.scanMode} mode

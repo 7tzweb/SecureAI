@@ -135,6 +135,8 @@ export interface ScanFinding {
   findingClass?: SecurityFindingCategory;
   status: FindingStatus;
   severity: Severity;
+  computedRiskSeverity?: Severity;
+  scoringTags?: string[];
   confidence?: FindingConfidence;
   scoreWeight?: number;
   shortDescription: string;

@@ -3,6 +3,7 @@ import {
   type ScanFinding,
   type ScanFindingEvidence,
   type SecurityFindingCategory,
+  type Severity,
   type StructuredEvidence,
 } from "@/lib/types";
 import { deriveFindingStatus } from "@/lib/utils";
@@ -208,6 +209,113 @@ function classifyReportRole(input: ScanFinding, findingClass: SecurityFindingCat
   };
 }
 
+function stringifyEvidenceForScoring(evidence: ScanFindingEvidence) {
+  try {
+    return JSON.stringify(evidence).toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function evidenceArrayLength(evidence: ScanFindingEvidence, key: string) {
+  const value = evidence[key];
+  return Array.isArray(value) ? value.length : 0;
+}
+
+function inferScoringTags(input: ScanFinding, evidence: ScanFindingEvidence, structuredEvidence: StructuredEvidence[]) {
+  const text = `${input.checkKey ?? ""} ${input.title} ${input.shortDescription} ${input.whyItMatters} ${input.recommendation}`.toLowerCase();
+  const evidenceText = stringifyEvidenceForScoring(evidence);
+  const combined = `${text} ${evidenceText}`;
+  const tags = new Set(input.scoringTags ?? []);
+
+  const add = (tag: string, condition: boolean) => {
+    if (condition) {
+      tags.add(tag);
+    }
+  };
+
+  add("wordpress", /wordpress|wp-content|wp-includes|wpforms|wp-json/.test(combined));
+  add("auth-surface", /authentication surface|login|signin|password reset|account-recovery|authroutecount|authsurfacedetected/.test(combined));
+  add("password-form", /password field|passwordformcount|haspasswordfield|current-password|new-password/.test(combined));
+  add("upload-form", /file upload|upload form|multipart|wpforms|upload-oriented/.test(combined));
+  add("reflected-input", /reflected input|reflectedparameters|reflection|raw-reflection/.test(combined));
+  add("browser-coverage-failed", /browser-rendered crawl coverage|fetch-only|did not produce a rendered page snapshot|rendered":false/.test(combined));
+  add(
+    "weak-csp",
+    /content-security-policy|csp/.test(combined) &&
+      /weak|missing|unsafe-inline|unsafe-eval|upgrade-insecure-requests|report-only/.test(combined),
+  );
+  add("missing-frame-protection", /x-frame-options|clickjacking|frame-ancestors/.test(combined) && /missing|partial|weaker|not expose/.test(combined));
+  add("missing-hsts", /hsts|strict-transport-security/.test(combined) && /missing/.test(combined));
+  add("missing-x-content-type-options", /x-content-type-options/.test(combined) && /missing|nosniff/.test(combined));
+  add("missing-referrer-policy", /referrer-policy/.test(combined) && /missing/.test(combined));
+  add("version-exposure", /version hints|x-powered-by|generator|php\/?\d|wordpress\s+\d|\b\d+(?:\.\d+){1,3}\b/.test(combined));
+  add("php-version-exposure", /x-powered-by[^"]*php|php\/?\d|php\s*\d/.test(combined));
+  add("sensitive-endpoint", /sensitive endpoint|admin|debug|configuration|protected/.test(combined));
+
+  if (structuredEvidence.some((entry) => entry.type === "browser-execution")) {
+    tags.add("browser-execution");
+  }
+
+  return [...tags];
+}
+
+function severityRank(severity: Severity) {
+  return ["info", "low", "medium", "high", "critical"].indexOf(severity);
+}
+
+function maxSeverity(...severities: Severity[]) {
+  return severities.reduce((highest, severity) =>
+    severityRank(severity) > severityRank(highest) ? severity : highest,
+  "info" as Severity);
+}
+
+function inferComputedRiskSeverity(input: ScanFinding, evidence: ScanFindingEvidence, scoringTags: string[]) {
+  const status = deriveFindingStatus(input);
+  if (status === "pass" || status === "info") {
+    return input.computedRiskSeverity ?? input.severity;
+  }
+
+  const text = `${input.checkKey ?? ""} ${input.title} ${input.shortDescription}`.toLowerCase();
+  const tags = new Set(scoringTags);
+  const reflectedCount = evidenceArrayLength(evidence, "reflectedParameters");
+  const passwordFormCount =
+    typeof evidence.passwordFormCount === "number" ? evidence.passwordFormCount : evidenceArrayLength(evidence, "passwordForms");
+  const authSurface =
+    tags.has("auth-surface") ||
+    evidence.authSurfaceDetected === true ||
+    (typeof evidence.authRouteCount === "number" && evidence.authRouteCount > 0);
+  const browserFailed = tags.has("browser-coverage-failed");
+  const weakCsp = tags.has("weak-csp");
+  const missingFrame = tags.has("missing-frame-protection");
+  const wordpress = tags.has("wordpress");
+  const reflected = tags.has("reflected-input") || reflectedCount > 0;
+  const upload = tags.has("upload-form");
+
+  let computed = input.computedRiskSeverity ?? input.severity;
+
+  if (/authentication surface review/.test(text) && (passwordFormCount > 0 || missingFrame || wordpress || weakCsp)) {
+    computed = maxSeverity(computed, "high");
+  }
+  if (/password field security/.test(text) && (missingFrame || tags.has("missing-hsts") || wordpress || browserFailed)) {
+    computed = maxSeverity(computed, "high");
+  }
+  if (/file upload risk indicators/.test(text) && (wordpress || reflected || upload)) {
+    computed = maxSeverity(computed, "high");
+  }
+  if (/xss evidence review|reflected input exposure/.test(text) && (reflectedCount >= 3 || weakCsp || wordpress || browserFailed)) {
+    computed = maxSeverity(computed, "high");
+  }
+  if (/browser-rendered crawl coverage/.test(text) && (authSurface || reflected || wordpress || upload)) {
+    computed = maxSeverity(computed, browserFailed ? "high" : "medium");
+  }
+  if (/technology fingerprinting|x-powered-by disclosure/.test(text) && tags.has("version-exposure") && (authSurface || wordpress || upload)) {
+    computed = maxSeverity(computed, "medium");
+  }
+
+  return computed;
+}
+
 export function calculateConfidence(finding: ScanFinding): FindingConfidence {
   const confidence = finding.confidence ?? "info";
   const key = `${finding.checkKey ?? ""} ${finding.title}`.toLowerCase();
@@ -281,6 +389,8 @@ export function normalizeFinding(input: ScanFinding): ScanFinding {
     structuredEvidence.find((entry) => entry.method)?.method;
   const status = deriveFindingStatus(input);
   const reportRole = classifyReportRole(input, findingClass);
+  const scoringTags = inferScoringTags(input, maskedEvidence, structuredEvidence);
+  const computedRiskSeverity = inferComputedRiskSeverity(input, maskedEvidence, scoringTags);
   const dataExposure =
     input.dataExposure ??
     (maskedEvidence.dataExposure === true ||
@@ -304,6 +414,8 @@ export function normalizeFinding(input: ScanFinding): ScanFinding {
     ...input,
     findingClass,
     confidence,
+    computedRiskSeverity,
+    scoringTags,
     evidence: maskedEvidence,
     structuredEvidence,
     proofSummary,
@@ -318,6 +430,8 @@ export function normalizeFinding(input: ScanFinding): ScanFinding {
     status,
     confidence,
     findingClass,
+    computedRiskSeverity,
+    scoringTags,
     evidence: {
       ...maskedEvidence,
       proofSummary,
