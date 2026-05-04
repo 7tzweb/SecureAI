@@ -253,10 +253,30 @@ export async function loadAttempt(
 }
 
 export async function loadPageContext(target: NormalizedTarget): Promise<PageContext> {
-  const [https, http] = await Promise.all([
+  let [https, http] = await Promise.all([
     loadAttempt(target.httpsUrl),
     loadAttempt(target.httpUrl),
   ]);
+
+  const shouldRetry =
+    [https, http].some(
+      (attempt) =>
+        attempt &&
+        (
+          attempt.status >= 500 ||
+          /application error|service unavailable|upstream request timeout/i.test(
+            `${attempt.headers.server ?? ""} ${attempt.bodyText.slice(0, 2_000)}`,
+          )
+        ),
+    );
+
+  if (shouldRetry) {
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    [https, http] = await Promise.all([
+      loadAttempt(target.httpsUrl, { timeoutMs: 12_000 }),
+      loadAttempt(target.httpUrl, { timeoutMs: 12_000 }),
+    ]);
+  }
 
   const preferredHttps = https && https.status < 400 && !isLikelyEdgeInterstitial(https) ? https : null;
   const preferredHttp = http && http.status < 400 && !isLikelyEdgeInterstitial(http) ? http : null;

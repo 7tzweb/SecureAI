@@ -1,4 +1,3 @@
-import { average } from "@/lib/utils";
 import {
   categoryKeys,
   type CategoryKey,
@@ -121,6 +120,39 @@ function deriveStatus(categoryState: Record<CategoryKey, CategoryState>): ScanRe
   }
 
   return failed > 0 ? "partial" : "completed";
+}
+
+function computeOverallScore(scores: {
+  securityScore: number | null;
+  seoScore: number | null;
+  performanceScore: number | null;
+}) {
+  const weightedScores = [
+    { score: scores.securityScore, weight: 0.7 },
+    { score: scores.seoScore, weight: 0.15 },
+    { score: scores.performanceScore, weight: 0.15 },
+  ].filter((entry): entry is { score: number; weight: number } => typeof entry.score === "number");
+
+  if (!weightedScores.length) {
+    return null;
+  }
+
+  const weightTotal = weightedScores.reduce((sum, entry) => sum + entry.weight, 0);
+  let overallScore = Math.round(
+    weightedScores.reduce((sum, entry) => sum + entry.score * entry.weight, 0) / weightTotal,
+  );
+
+  if (typeof scores.securityScore === "number") {
+    if (scores.securityScore <= 25) {
+      overallScore = Math.min(overallScore, 45);
+    } else if (scores.securityScore <= 40) {
+      overallScore = Math.min(overallScore, 58);
+    } else if (scores.securityScore <= 60) {
+      overallScore = Math.min(overallScore, 72);
+    }
+  }
+
+  return Math.max(0, Math.min(100, overallScore));
 }
 
 function buildEvent(scan: ScanRecord, category: CategoryKey, message: string) {
@@ -354,11 +386,7 @@ export async function processCategoryJob(scanId: string, category: CategoryKey) 
         progress: computeProgress(categoryStatus),
         latestPhase: `${category} checks completed`,
         updatedAt: finishedAt,
-        overallScore: average([
-          scores.securityScore,
-          scores.seoScore,
-          scores.performanceScore,
-        ]),
+        overallScore: computeOverallScore(scores),
         ...scores,
       };
     });

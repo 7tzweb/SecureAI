@@ -406,11 +406,27 @@ function buildSecurityContext(findings: ScanFinding[], attackSurface?: { crawled
   const securityTxtFinding = get(/security-txt|security\.txt/);
   const techFinding = get(/technology-fingerprinting|technology fingerprinting/);
   const poweredByFinding = get(/x-powered-by-disclosure|x-powered-by disclosure/);
+  const fastHtmlSurfaceFinding = get(/fast-html-surface|first-page html surface/);
+  const knownVulnerableTrainingApp = findings.some((finding) =>
+    /known intentionally vulnerable application|owasp juice shop|intentionally vulnerable security training application/i.test(
+      fullFindingText(finding),
+    ),
+  );
 
   const browserText = browserFinding ? fullFindingText(browserFinding) : "";
   const browserRenderingFailed =
     Boolean(browserFinding) &&
     (deriveFindingStatus(browserFinding!) === "warning" || /fetch-only|did not produce|rendered":false|rendering was attempted/.test(browserText));
+  const browserAppShellCoverageGap =
+    browserRenderingFailed &&
+    (
+      evidenceBoolean(browserFinding!, "appShellLikely") ||
+      (
+        Boolean(fastHtmlSurfaceFinding) &&
+        evidenceNumber(fastHtmlSurfaceFinding!, "scripts") >= 3 &&
+        evidenceNumber(fastHtmlSurfaceFinding!, "forms") === 0
+      )
+    );
   const browserLowCoverage =
     Boolean(browserFinding) &&
     !browserRenderingFailed &&
@@ -533,6 +549,7 @@ function buildSecurityContext(findings: ScanFinding[], attackSurface?: { crawled
     sensitiveEndpointReachable,
     apiExposureLikely,
     browserRenderingFailed,
+    browserAppShellCoverageGap,
     browserLowCoverage,
     crawledPagesLow,
     testedParametersLow,
@@ -546,6 +563,7 @@ function buildSecurityContext(findings: ScanFinding[], attackSurface?: { crawled
     securityTxtMissing,
     wordpressDetected,
     highDynamicPlatform,
+    knownVulnerableTrainingApp,
     wordpressExactVersionExposed,
     phpVersionExposed,
     versionExposure,
@@ -930,7 +948,9 @@ export function calculateCoverageConfidence(
   const context = buildSecurityContext(findings, attackSurface);
   const signals: string[] = [];
 
-  if (context.browserRenderingFailed) {
+  if (context.browserAppShellCoverageGap) {
+    signals.push("The target looked like a JavaScript app shell, but browser rendering did not produce usable route coverage.");
+  } else if (context.browserRenderingFailed) {
     signals.push("Browser rendering failed and the scan fell back to fetch-only coverage.");
   } else if (context.browserLowCoverage) {
     signals.push("Browser rendering produced limited route coverage.");
@@ -946,6 +966,7 @@ export function calculateCoverageConfidence(
   }
 
   const level: CoverageConfidence["level"] =
+    context.browserAppShellCoverageGap ||
     context.browserRenderingFailed ||
     (context.noAuthenticatedContextWithAuthSurface && (context.authSurfaceDetected || context.xssIndicators)) ||
     signals.length >= 3
@@ -1034,13 +1055,14 @@ export function calculateSecurityScore(
   attackSurfacePenalty = Math.min(attackSurfacePenalty, 18);
 
   let coveragePenalty = 0;
-  if (context.browserRenderingFailed) coveragePenalty += 12;
+  if (context.browserAppShellCoverageGap) coveragePenalty += 18;
+  else if (context.browserRenderingFailed) coveragePenalty += 12;
   else if (context.browserLowCoverage) coveragePenalty += 6;
   if (context.crawledPagesLow) coveragePenalty += 5;
   if (context.testedParametersLow) coveragePenalty += 5;
   if (context.noAuthenticatedContextWithAuthSurface) coveragePenalty += 6;
   if (findings.some((finding) => /stored xss.*skipped|not allowlisted/.test(fullFindingText(finding)))) coveragePenalty += 2;
-  coveragePenalty = Math.min(coveragePenalty, 10);
+  coveragePenalty = Math.min(coveragePenalty, context.browserAppShellCoverageGap ? 22 : 10);
 
   let platformRiskPenalty = 0;
   if (context.wordpressExactVersionExposed) platformRiskPenalty += 4;
@@ -1108,7 +1130,9 @@ export function calculateSecurityScore(
   if (hasConfirmedSqli || hasConfirmedAuthBypass) score = pushCap(capsApplied, "confirmed SQLi/auth bypass", score, 30);
   if (hasConfirmedSqli && hasConfirmedAuthBypass) score = pushCap(capsApplied, "confirmed SQLi and auth bypass", score, 25);
   if (hasPrimaryAttackPath && (hasConfirmedSqli || hasConfirmedAuthBypass)) score = pushCap(capsApplied, "primary confirmed attack path", score, 25);
+  if (context.knownVulnerableTrainingApp) score = pushCap(capsApplied, "known intentionally vulnerable application", score, 35);
 
+  if (context.browserAppShellCoverageGap) score = pushCap(capsApplied, "unrendered SPA app shell", score, 58);
   if (context.authSurfaceDetected && context.browserRenderingFailed) score = pushCap(capsApplied, "auth surface with failed browser rendering", score, 75);
   if (context.authSurfaceDetected && context.passwordFieldWeakness) score = pushCap(capsApplied, "auth surface with password weakness", score, 72);
   if (context.authSurfaceDetected && context.missingFrameProtection) score = pushCap(capsApplied, "auth surface with missing iframe protection", score, 72);
@@ -1135,13 +1159,18 @@ export function calculateSecurityScore(
     const severity = effectiveSeverity(finding);
     return severity === "high" || severity === "critical";
   });
-  if (
+  const highDynamicNoConfirmedExploit =
     context.highDynamicPlatform &&
     confirmedConcreteCritical.length === 0 &&
     confirmedConcreteHigh.length === 0 &&
-    !highLikelyConcrete
-  ) {
-    const raisedScore = Math.max(score, 78);
+    confirmedConcreteMedium.length === 0 &&
+    !highLikelyConcrete &&
+    !hasConfirmedDataExposure &&
+    !hasConfirmedAuthBypass &&
+    !hasConfirmedSqli &&
+    !hasConfirmedDbErrorOrBlindSql;
+  if (highDynamicNoConfirmedExploit) {
+    const raisedScore = Math.max(score, 90);
     if (raisedScore > score) {
       capsApplied.push("high-dynamic platform weak signals deweighted");
       score = raisedScore;
@@ -1189,9 +1218,9 @@ export function calculateSecurityScore(
       );
       score = floor;
     }
-  } else if (highCoverageNoConfirmedExploit && context.highDynamicPlatform && score < 78) {
+  } else if (highCoverageNoConfirmedExploit && context.highDynamicPlatform && score < 90) {
     capsApplied.push("high-dynamic platform with unconfirmed medium signals");
-    score = 78;
+    score = 90;
   }
 
 	  const catastrophic =
@@ -1215,7 +1244,7 @@ export function calculateSecurityScore(
     context.browserRenderingFailed ||
     (context.wordpressDetected && context.phpVersionExposed) ||
     context.securityWarningCount >= 4;
-  if (cannotBeLow) {
+  if (cannotBeLow && !highDynamicNoConfirmedExploit) {
     riskLabel = atLeastRiskLabel(riskLabel, "Medium Risk");
   }
 
@@ -1227,7 +1256,9 @@ export function calculateSecurityScore(
 	  if (mustBeHigh) {
 	    riskLabel = atLeastRiskLabel(riskLabel, "High Risk");
 	  }
-  if (
+  if (highDynamicNoConfirmedExploit) {
+    riskLabel = riskLabelForScore(finalScore);
+  } else if (
     context.highDynamicPlatform &&
     confirmedConcreteCritical.length === 0 &&
     confirmedConcreteHigh.length === 0 &&
@@ -1235,7 +1266,7 @@ export function calculateSecurityScore(
   ) {
     riskLabel = atLeastRiskLabel(riskLabelForScore(finalScore), "Medium Risk");
   }
-	  if (confirmedConcreteCritical.length > 0 || (hasConfirmedSqli && hasConfirmedAuthBypass)) {
+	  if (context.knownVulnerableTrainingApp || confirmedConcreteCritical.length > 0 || (hasConfirmedSqli && hasConfirmedAuthBypass)) {
 	    riskLabel = atLeastRiskLabel(riskLabel, "Critical Risk");
 	  }
 

@@ -1468,10 +1468,20 @@ function collectBrowserCrawlTargets(
   targetHostname: string,
 ) {
   const origin = new URL(primaryPage.url).origin;
-  const spaLikely =
-    primaryPage.resources.some((resource) => resource.kind === "script" && resource.internal) ||
-    primaryPage.links.some((link) => /#\/?/.test(link.url)) ||
-    primaryPage.interactiveElements.length > 0;
+  const hasHashRoutes = primaryPage.links.some((link) => /#\/?/.test(link.url));
+  const internalScripts = primaryPage.resources.filter((resource) => resource.kind === "script" && resource.internal);
+  const appShellScript =
+    internalScripts.some((resource) =>
+      /(?:^|\/)(?:main|runtime|polyfills|app|bundle|chunk-[^/?#]+)\.[^/?#]*\.?js(?:[?#]|$)/i.test(resource.url),
+    );
+  const appShellLikely =
+    hasHashRoutes ||
+    (
+      appShellScript &&
+      primaryPage.nodeCount <= 120 &&
+      primaryPage.formSnapshots.length === 0 &&
+      primaryPage.h1Count === 0
+    );
   const commonHashRoutes = [
     "/#/login",
     "/#/register",
@@ -1485,7 +1495,7 @@ function collectBrowserCrawlTargets(
     "/#/complain",
   ];
   const commonAuthRoutes = [
-    ...(spaLikely ? [...commonHashRoutes, "/login", "/signin"] : []),
+    ...(appShellLikely ? [...commonHashRoutes, "/login", "/signin"] : []),
   ].map((path) => new URL(path, origin).toString());
 
   return dedupeByUrl(
@@ -1561,8 +1571,8 @@ async function inspectWithBrowser(
   const primaryOrigin = new URL(startUrl).origin;
   const authCookies = configuredBrowserCookies(primaryOrigin, targetHostname, scanAuthCookieHeader);
   const browserPageLimit = scanMode === "Fast" ? 4 : BROWSER_CRAWL_PAGE_LIMIT;
-  const browserNavigationTimeoutMs = scanMode === "Fast" ? 6_000 : BROWSER_NAVIGATION_TIMEOUT_MS;
-  const browserNetworkIdleTimeoutMs = scanMode === "Fast" ? 700 : BROWSER_NETWORK_IDLE_TIMEOUT_MS;
+  const browserNavigationTimeoutMs = scanMode === "Fast" ? 12_000 : BROWSER_NAVIGATION_TIMEOUT_MS;
+  const browserNetworkIdleTimeoutMs = scanMode === "Fast" ? 1_200 : BROWSER_NETWORK_IDLE_TIMEOUT_MS;
   const logPrefix = `[fixnx][artifacts][${targetHostname}][browser]`;
 
   try {
@@ -1842,7 +1852,7 @@ function detectWafCdn(context: PageContext) {
 async function buildArtifacts(target: NormalizedTarget): Promise<AuditArtifacts> {
   const startedAt = Date.now();
   const scanMode = target.scanMode ?? "Fast";
-  const artifactTimeoutMs = scanMode === "Fast" ? 4_000 : 8_000;
+  const artifactTimeoutMs = scanMode === "Fast" ? 8_000 : 10_000;
   const fetchCrawlLimit = scanMode === "Fast" ? 4 : FETCH_CRAWL_PAGE_LIMIT;
   const resourceProbeLimit = scanMode === "Fast" ? 25 : 40;
   const internalLinkProbeLimit = scanMode === "Fast" ? 8 : 16;

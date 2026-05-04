@@ -253,10 +253,14 @@ function inferScoringTags(input: ScanFinding, evidence: ScanFindingEvidence, str
   add("upload-form", /file upload|upload form|multipart|wpforms|upload-oriented/.test(combined));
   add("reflected-input", /reflected input|reflectedparameters|reflection|raw-reflection/.test(combined));
   add("browser-coverage-failed", /browser-rendered crawl coverage|fetch-only|did not produce a rendered page snapshot|rendered":false/.test(combined));
+  const reportOnlyCspWithPolicy =
+    /content-security-policy-report-only|enforced":false/.test(combined) &&
+    /script-src|default-src|strict-dynamic|nonce-|sha(?:256|384|512)-/.test(combined);
   add(
     "weak-csp",
     /content-security-policy|csp/.test(combined) &&
-      /weak|missing|unsafe-inline|unsafe-eval|upgrade-insecure-requests|report-only/.test(combined),
+      /weak|missing|unsafe-inline|unsafe-eval|upgrade-insecure-requests/.test(combined) &&
+      !reportOnlyCspWithPolicy,
   );
   add("missing-frame-protection", /x-frame-options|clickjacking|frame-ancestors/.test(combined) && /missing|partial|weaker|not expose/.test(combined));
   add("missing-hsts", /hsts|strict-transport-security/.test(combined) && /missing/.test(combined));

@@ -124,7 +124,7 @@ function preliminaryScore(findings: ScanFinding[]) {
 
 async function runFastBaselinePhase(target: NormalizedTarget, scanMode: ReturnType<typeof resolveSecurityScanMode>) {
   const startedAt = Date.now();
-  const timeoutMs = scanMode === "Fast" ? 2_500 : 4_000;
+  const timeoutMs = scanMode === "Fast" ? 6_000 : 8_000;
   const [httpsAttempt, httpAttempt] = await Promise.all([
     loadAttempt(target.httpsUrl, { timeoutMs, followRedirects: true }),
     loadAttempt(target.httpUrl, { timeoutMs, includeBody: false, followRedirects: false }),
@@ -2226,10 +2226,28 @@ export async function runSecurityScan(
     httpsDirectAttempt &&
       ([401, 403, 405].includes(httpsDirectAttempt.status) || isLikelyEdgeInterstitial(httpsDirectAttempt)),
   );
+  const internalScriptCount = primaryPage.resources.filter(
+    (resource) => resource.kind === "script" && resource.internal,
+  ).length;
+  const appShellLikely =
+    internalScriptCount >= 3 &&
+    primaryPage.nodeCount <= 120 &&
+    primaryPage.formSnapshots.length === 0 &&
+    (
+      primaryPage.resources.some((resource) =>
+        resource.kind === "script" &&
+        /(?:^|\/)(?:main|runtime|polyfills|app|bundle|chunk-[^/?#]+)\.[^/?#]*\.?js(?:[?#]|$)/i.test(resource.url),
+      ) ||
+      /<app-root\b|ng-version|data-beasties-container|rel=["']modulepreload/i.test(primaryAttempt.bodyText.slice(0, 120_000))
+    );
+  const knownVulnerableTrainingApp =
+    /owasp juice shop|probably the most modern and sophisticated insecure web application|x-recruiting.*#\/jobs/i.test(
+      `${primaryPage.title} ${primaryPage.description} ${primaryAttempt.headers["x-recruiting"] ?? ""} ${primaryAttempt.bodyText.slice(0, 8_000)}`,
+    );
   const browserCoverageStatus = artifacts.browserInspection.rendered
     ? { status: "pass" as const, severity: "info" as const }
     : artifacts.browserInspection.attempted
-      ? { status: "warning" as const, severity: "low" as const }
+      ? { status: "warning" as const, severity: appShellLikely ? ("high" as const) : ("low" as const) }
       : { status: "info" as const, severity: "info" as const };
   findings.push(
     buildSecurityCheck({
@@ -2254,10 +2272,40 @@ export async function runSecurityScan(
           ? "The scanner used a browser-rendered DOM snapshot for route and resource discovery."
           : "The scan fell back to fetch-only artifacts for JavaScript-dependent coverage.",
         browser: artifacts.browserInspection,
+        appShellLikely,
+        internalScriptCount,
+        nodeCount: primaryPage.nodeCount,
         crawledPages: artifacts.crawledPages.map((page) => page.url),
       },
     }),
   );
+
+  if (knownVulnerableTrainingApp) {
+    findings.push(
+      buildSecurityCheck({
+        checkKey: "known-vulnerable-training-app",
+        title: "Known intentionally vulnerable application",
+        status: "fail",
+        severity: "critical",
+        confidence: "confirmed",
+        scoreWeight: 1,
+        shortDescription:
+          "The target identifies as OWASP Juice Shop, an intentionally vulnerable security training application.",
+        whyItMatters:
+          "An intentionally vulnerable application exposed on a public origin should be treated as critical unless it is an isolated lab environment.",
+        recommendation:
+          "Do not expose intentionally vulnerable training applications on public production infrastructure. Restrict access, isolate the lab, or remove the deployment.",
+        evidence: {
+          checkedUrl: primaryAttempt.finalUrl,
+          expectedLocation: "Application title, description, and response headers",
+          summary: "The sampled response contains OWASP Juice Shop / intentionally insecure application markers.",
+          title: primaryPage.title,
+          description: primaryPage.description,
+          xRecruiting: primaryAttempt.headers["x-recruiting"] ?? null,
+        },
+      }),
+    );
+  }
 
   findings.push(
     buildSecurityCheck({
@@ -2481,23 +2529,35 @@ export async function runSecurityScan(
     .split(";")
     .map((directive) => directive.trim().toLowerCase())
     .filter(Boolean);
+  const cspHasScriptControl = /(^|;)\s*(script-src|default-src)\b/i.test(effectiveCspHeader);
+  const cspHasNonceOrHash = /'(?:nonce-[^']+|sha(?:256|384|512)-[^']+)'/i.test(effectiveCspHeader);
+  const cspHasStrictDynamic = /'strict-dynamic'/i.test(effectiveCspHeader);
+  const cspUnsafeInlineIsMitigated = cspHasNonceOrHash || cspHasStrictDynamic;
   const cspOnlyUpgradeInsecureRequests =
     cspDirectives.length > 0 &&
     cspDirectives.every((directive) => directive === "upgrade-insecure-requests");
   const cspWeak = effectiveCspHeader
-    ? /unsafe-inline|unsafe-eval/i.test(effectiveCspHeader) ||
+    ? /unsafe-eval/i.test(effectiveCspHeader) ||
+      (/unsafe-inline/i.test(effectiveCspHeader) && !cspUnsafeInlineIsMitigated) ||
       cspOnlyUpgradeInsecureRequests ||
-      !/(^|;)\s*(script-src|default-src)\b/i.test(effectiveCspHeader)
+      !cspHasScriptControl
     : false;
+  const cspReportOnlyLooksReviewable =
+    Boolean(cspReportOnlyHeader) &&
+    cspHasScriptControl &&
+    !cspOnlyUpgradeInsecureRequests;
   const cspStatus = cspHeader
     ? cspWeak
       ? { status: "warning" as const, severity: "low" as const }
       : { status: "pass" as const, severity: "info" as const }
     : cspReportOnlyHeader
-      ? { status: "warning" as const, severity: "low" as const }
+      ? {
+          status: cspReportOnlyLooksReviewable ? ("info" as const) : ("warning" as const),
+          severity: cspReportOnlyLooksReviewable ? ("info" as const) : ("low" as const),
+        }
       : primaryAttemptIsInterstitial
         ? { status: "info" as const, severity: "info" as const }
-      : { status: "warning" as const, severity: "low" as const };
+        : { status: "warning" as const, severity: "low" as const };
   findings.push(
     buildSecurityCheck({
       checkKey: "content-security-policy",
