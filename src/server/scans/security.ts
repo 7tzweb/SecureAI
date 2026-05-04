@@ -16,11 +16,12 @@ import {
   isLikelyEdgeInterstitial,
   loadAttempt,
 } from "@/server/scans/helpers";
-import { type CategoryScanResult, type HttpAttempt, type NormalizedTarget } from "@/server/scans/types";
+import { type CategoryScanResult, type HttpAttempt, type NormalizedTarget, type ScanRunOptions } from "@/server/scans/types";
 import { authContextFromSession, AuthContextStore } from "@/security/auth/authContextStore";
 import { analyzeSessionContext } from "@/security/auth/sessionContextAnalyzer";
 import { buildAttackPaths } from "@/security/analysis/attackPathBuilder";
 import { buildReportSummary } from "@/security/reportSummary";
+import { getRecommendationLabel } from "@/security/analysis/riskPrioritizer";
 import {
   controlledXssPayloads,
   createXssMarker,
@@ -29,6 +30,16 @@ import {
 import { verifyIdorOwnership } from "@/security/probes/idorOwnershipVerifier";
 import { buildRoleBasedAccessMatrix } from "@/security/probes/roleBasedAccessTester";
 import { runBlindSqlInjectionProbe } from "@/security/probes/blindSqlInjectionProbe";
+import {
+  buildSqlResponseSignature,
+  classifyParameter,
+  findStrictDbErrorSignature,
+  highDynamicResponseSignal,
+  responseDiffDimensions,
+  type DbErrorFamily,
+  type EvidenceStrength,
+  type ParameterContext,
+} from "@/security/probes/sqlEvidence";
 
 function buildSecurityCheck(input: {
   checkKey: string;
@@ -90,6 +101,360 @@ function createSecurityPhaseLogger(target: NormalizedTarget, scanMode: ReturnTyp
   };
 }
 
+function originFromAttempt(attempt: HttpAttempt | null, fallbackUrl: string) {
+  try {
+    return new URL(attempt?.finalUrl ?? fallbackUrl).origin;
+  } catch {
+    return fallbackUrl;
+  }
+}
+
+function preliminaryScore(findings: ScanFinding[]) {
+  let score = 100;
+  for (const finding of findings) {
+    const status = deriveFindingStatus(finding);
+    if (status === "fail") {
+      score -= finding.severity === "high" || finding.severity === "critical" ? 16 : 8;
+    } else if (status === "warning") {
+      score -= finding.severity === "medium" ? 8 : 4;
+    }
+  }
+  return Math.max(20, Math.min(100, Math.round(score)));
+}
+
+async function runFastBaselinePhase(target: NormalizedTarget, scanMode: ReturnType<typeof resolveSecurityScanMode>) {
+  const startedAt = Date.now();
+  const timeoutMs = scanMode === "Fast" ? 2_500 : 4_000;
+  const [httpsAttempt, httpAttempt] = await Promise.all([
+    loadAttempt(target.httpsUrl, { timeoutMs, followRedirects: true }),
+    loadAttempt(target.httpUrl, { timeoutMs, includeBody: false, followRedirects: false }),
+  ]);
+  const primaryAttempt = httpsAttempt ?? httpAttempt;
+  const primaryOrigin = originFromAttempt(primaryAttempt, target.httpsUrl);
+  const [robotsTxt, sitemapXml, wellKnownSecurityTxt, rootSecurityTxt] = await Promise.all([
+    loadAttempt(`${primaryOrigin}/robots.txt`, { timeoutMs }),
+    loadAttempt(`${primaryOrigin}/sitemap.xml`, { timeoutMs, includeBody: false }),
+    loadAttempt(`${primaryOrigin}/.well-known/security.txt`, { timeoutMs, includeBody: false }),
+    loadAttempt(`${primaryOrigin}/security.txt`, { timeoutMs, includeBody: false }),
+  ]);
+
+  if (!primaryAttempt) {
+    const findings = [
+      buildSecurityCheck({
+        checkKey: "fast-baseline-coverage",
+        title: "Fast baseline coverage",
+        status: "fail",
+        severity: "high",
+        confidence: "confirmed",
+        shortDescription: "The scanner could not fetch the target during the fast baseline phase.",
+        whyItMatters: "Without a baseline response the scanner cannot produce early header, platform, or form evidence.",
+        recommendation: "Verify that the target is reachable from the scanner and rerun the scan.",
+        evidence: {
+          checkedUrl: `${target.httpsUrl}, ${target.httpUrl}`,
+          summary: "No primary HTTP response was available during fast baseline.",
+          preliminary: true,
+        },
+      }),
+    ];
+
+    return {
+      findings,
+      score: preliminaryScore(findings),
+      urlsChecked: 6,
+      durationMs: Date.now() - startedAt,
+    };
+  }
+
+  const headers = primaryAttempt.headers;
+  const bodyText = primaryAttempt.bodyText ?? "";
+  const $ = loadHtml(bodyText);
+  const forms = $("form").toArray();
+  const passwordFields = $('input[type="password"]').length;
+  const scripts = $("script[src]").length;
+  const links = $("a[href]").length;
+  const generator = $('meta[name="generator"]').attr("content")?.trim() ?? "";
+  const poweredBy = headers["x-powered-by"] ?? "";
+  const serverHeader = headers.server ?? "";
+  const cspHeader = headers["content-security-policy"] ?? "";
+  const cspDirectives = cspHeader
+    .split(";")
+    .map((directive) => directive.trim().toLowerCase())
+    .filter(Boolean);
+  const cspOnlyUpgradeInsecureRequests =
+    cspDirectives.length > 0 &&
+    cspDirectives.every((directive) => directive === "upgrade-insecure-requests");
+  const cspWeak =
+    !cspHeader ||
+    cspOnlyUpgradeInsecureRequests ||
+    /unsafe-inline|unsafe-eval/i.test(cspHeader) ||
+    !/(^|;)\s*(script-src|default-src)\b/i.test(cspHeader);
+  const frameOptions = headers["x-frame-options"]?.toUpperCase() ?? "";
+  const contentTypeOptions = headers["x-content-type-options"]?.toLowerCase() ?? "";
+  const referrerPolicy = headers["referrer-policy"] ?? "";
+  const hsts = headers["strict-transport-security"] ?? "";
+  const securityTxtFound = Boolean(
+    (wellKnownSecurityTxt && wellKnownSecurityTxt.status < 400) ||
+      (rootSecurityTxt && rootSecurityTxt.status < 400),
+  );
+  const wordpressDetected =
+    /wordpress|wp-content|wp-includes|wp-json/i.test(`${bodyText} ${generator}`) ||
+    /wp-/i.test(generator);
+
+  const findings = [
+    buildSecurityCheck({
+      checkKey: "fast-baseline-coverage",
+      title: "Fast baseline coverage",
+      status: "info",
+      severity: "info",
+      confidence: "info",
+      shortDescription:
+        `Initial results are ready from ${primaryAttempt.finalUrl}. Browser rendering and active probes are still running.`,
+      whyItMatters:
+        "Fast baseline findings give immediate visibility into high-signal headers, platform hints, and first-page attack surface while deeper checks continue.",
+      recommendation:
+        "Use these preliminary results for early triage, then review the final report after browser and active checks complete.",
+      evidence: {
+        checkedUrl: primaryAttempt.finalUrl,
+        expectedLocation: "Main response, headers, first-page HTML, robots, sitemap, and security.txt",
+        summary: "Fast baseline completed. Deeper checks are still running.",
+        preliminary: true,
+        durationMs: Date.now() - startedAt,
+      },
+    }),
+    buildSecurityCheck({
+      checkKey: "https-enabled",
+      title: "HTTPS enabled",
+      status: httpsAttempt && httpsAttempt.status < 500 ? "pass" : "fail",
+      severity: httpsAttempt && httpsAttempt.status < 500 ? "info" : "high",
+      shortDescription:
+        httpsAttempt && httpsAttempt.status < 500
+          ? "The target returned an HTTPS response during fast baseline."
+          : "The target did not return a usable HTTPS response during fast baseline.",
+      whyItMatters: "HTTPS is the baseline transport control for protecting users and scan evidence.",
+      recommendation:
+        httpsAttempt && httpsAttempt.status < 500
+          ? "Keep HTTPS enabled for all public pages."
+          : "Enable HTTPS and redirect all HTTP traffic to HTTPS.",
+      evidence: {
+        checkedUrl: target.httpsUrl,
+        summary: httpsAttempt ? `HTTPS returned status ${httpsAttempt.status}.` : "HTTPS request failed.",
+        preliminary: true,
+      },
+    }),
+    buildSecurityCheck({
+      checkKey: "http-to-https-redirect",
+      title: "HTTP to HTTPS redirect",
+      status:
+        httpAttempt && [301, 302, 307, 308].includes(httpAttempt.status) && /https:\/\//i.test(httpAttempt.headers.location ?? "")
+          ? "pass"
+          : "warning",
+      severity:
+        httpAttempt && [301, 302, 307, 308].includes(httpAttempt.status) && /https:\/\//i.test(httpAttempt.headers.location ?? "")
+          ? "info"
+          : "medium",
+      confidence: "likely",
+      shortDescription:
+        httpAttempt && [301, 302, 307, 308].includes(httpAttempt.status) && /https:\/\//i.test(httpAttempt.headers.location ?? "")
+          ? "HTTP redirects to HTTPS."
+          : "HTTP did not clearly redirect to HTTPS in the fast baseline sample.",
+      whyItMatters: "Clear HTTPS redirects reduce downgrade and duplicate-content exposure.",
+      recommendation: "Redirect HTTP requests to the canonical HTTPS origin.",
+      evidence: {
+        checkedUrl: target.httpUrl,
+        summary: httpAttempt ? `HTTP returned ${httpAttempt.status}.` : "HTTP request failed.",
+        location: httpAttempt?.headers.location ?? null,
+        preliminary: true,
+      },
+    }),
+    buildSecurityCheck({
+      checkKey: "hsts-header",
+      title: "HSTS header",
+      status: hsts ? "pass" : "warning",
+      severity: hsts ? "info" : "low",
+      confidence: hsts ? "info" : "likely",
+      shortDescription: hsts ? `Strict-Transport-Security is set to "${hsts}".` : "Strict-Transport-Security is missing from the HTTPS response.",
+      whyItMatters: "HSTS helps browsers avoid insecure protocol downgrades after the first secure visit.",
+      recommendation: hsts ? "Keep HSTS configured with a suitable max-age." : "Add a Strict-Transport-Security header on HTTPS responses.",
+      evidence: {
+        checkedUrl: primaryAttempt.finalUrl,
+        value: hsts || null,
+        preliminary: true,
+      },
+    }),
+    buildSecurityCheck({
+      checkKey: "content-security-policy",
+      title: cspWeak ? "Weak Content-Security-Policy" : "Content-Security-Policy",
+      status: cspWeak ? "warning" : "pass",
+      severity: cspWeak ? "low" : "info",
+      confidence: cspWeak ? "likely" : "info",
+      shortDescription: cspHeader
+        ? cspWeak
+          ? `Content-Security-Policy is set, but it is weak: "${cspHeader}".`
+          : `Content-Security-Policy is set to "${cspHeader}".`
+        : "Content-Security-Policy is missing from the main response.",
+      whyItMatters: "A strong CSP reduces XSS impact and limits script, frame, and object loading.",
+      recommendation: cspWeak
+        ? "Add a stronger CSP with script-src, object-src, base-uri, frame-ancestors, and default-src directives where feasible."
+        : "Keep CSP aligned with the application script and framing model.",
+      evidence: {
+        checkedUrl: primaryAttempt.finalUrl,
+        value: cspHeader || null,
+        weakPolicy: cspWeak,
+        onlyUpgradeInsecureRequests: cspOnlyUpgradeInsecureRequests,
+        preliminary: true,
+      },
+    }),
+    buildSecurityCheck({
+      checkKey: "clickjacking-protection",
+      title: "Clickjacking protection",
+      status: frameOptions === "DENY" || frameOptions === "SAMEORIGIN" || /frame-ancestors/i.test(cspHeader) ? "pass" : "warning",
+      severity: passwordFields > 0 && !frameOptions ? "medium" : frameOptions ? "info" : "low",
+      confidence: frameOptions ? "info" : "likely",
+      shortDescription:
+        frameOptions || /frame-ancestors/i.test(cspHeader)
+          ? "A frame embedding control was detected in the fast baseline."
+          : "No clear frame embedding protection was detected in the fast baseline.",
+      whyItMatters: "Login and form pages need anti-framing protection to reduce clickjacking risk.",
+      recommendation: "Set X-Frame-Options or CSP frame-ancestors for pages that should not be framed.",
+      evidence: {
+        checkedUrl: primaryAttempt.finalUrl,
+        xFrameOptions: frameOptions || null,
+        cspFrameAncestors: /frame-ancestors/i.test(cspHeader),
+        passwordFields,
+        preliminary: true,
+      },
+    }),
+    buildSecurityCheck({
+      checkKey: "x-content-type-options",
+      title: "X-Content-Type-Options",
+      status: contentTypeOptions === "nosniff" ? "pass" : "warning",
+      severity: contentTypeOptions === "nosniff" ? "info" : "low",
+      confidence: contentTypeOptions === "nosniff" ? "info" : "likely",
+      shortDescription: contentTypeOptions === "nosniff" ? "X-Content-Type-Options is set to nosniff." : "X-Content-Type-Options is missing from the main response.",
+      whyItMatters: "The nosniff policy helps prevent MIME confusion in browsers.",
+      recommendation: "Set X-Content-Type-Options: nosniff on the main response.",
+      evidence: {
+        checkedUrl: primaryAttempt.finalUrl,
+        value: contentTypeOptions || null,
+        preliminary: true,
+      },
+    }),
+    buildSecurityCheck({
+      checkKey: "referrer-policy",
+      title: "Referrer-Policy",
+      status: referrerPolicy ? "pass" : "warning",
+      severity: referrerPolicy ? "info" : "low",
+      confidence: referrerPolicy ? "info" : "likely",
+      shortDescription: referrerPolicy ? `Referrer-Policy is set to "${referrerPolicy}".` : "Referrer-Policy is missing from the main response.",
+      whyItMatters: "Referrer policy controls how much URL information is sent to other sites.",
+      recommendation: "Add Referrer-Policy, typically strict-origin-when-cross-origin.",
+      evidence: {
+        checkedUrl: primaryAttempt.finalUrl,
+        value: referrerPolicy || null,
+        preliminary: true,
+      },
+    }),
+    buildSecurityCheck({
+      checkKey: "authentication-surface-review",
+      title: "Authentication surface review",
+      status: passwordFields > 0 || /login|signin|wp-login|password/i.test(bodyText) ? "warning" : "info",
+      severity: passwordFields > 0 ? "medium" : "info",
+      confidence: passwordFields > 0 ? "likely" : "info",
+      shortDescription:
+        passwordFields > 0
+          ? `Fast baseline detected ${passwordFields} password field(s) on the first page.`
+          : "No password field was captured in the first-page fast baseline.",
+      whyItMatters: "Authentication surfaces are high-value targets and should be visible early in the scan.",
+      recommendation: "Review login and password routes with anti-framing, CSRF, secure cookies, and authenticated scan coverage.",
+      evidence: {
+        checkedUrl: primaryAttempt.finalUrl,
+        passwordFormCount: passwordFields,
+        authSurfaceDetected: passwordFields > 0,
+        preliminary: true,
+      },
+    }),
+    buildSecurityCheck({
+      checkKey: "fast-html-surface",
+      title: "First-page HTML surface",
+      status: "info",
+      severity: "info",
+      confidence: "info",
+      shortDescription: `Fast baseline found ${forms.length} form(s), ${links} link(s), and ${scripts} script tag(s) on the first page.`,
+      whyItMatters: "Forms, links, and scripts define the first attack surface the scanner can prioritize.",
+      recommendation: "Use browser-rendered and active checks for deeper validation of dynamic routes and form behavior.",
+      evidence: {
+        checkedUrl: primaryAttempt.finalUrl,
+        forms: forms.length,
+        passwordFields,
+        links,
+        scripts,
+        preliminary: true,
+      },
+    }),
+    buildSecurityCheck({
+      checkKey: "technology-fingerprinting",
+      title: "Technology fingerprinting",
+      status: generator || poweredBy || serverHeader || wordpressDetected ? "warning" : "info",
+      severity: generator || poweredBy ? "low" : "info",
+      confidence: generator || poweredBy || serverHeader || wordpressDetected ? "likely" : "info",
+      shortDescription:
+        generator || poweredBy || serverHeader || wordpressDetected
+          ? `Fast baseline detected technology hints: ${[generator, poweredBy && `X-Powered-By: ${poweredBy}`, serverHeader && `Server: ${serverHeader}`, wordpressDetected && "WordPress"].filter(Boolean).join(", ")}.`
+          : "No strong technology hints were detected in the fast baseline.",
+      whyItMatters: "Public platform and version hints help prioritize follow-up checks.",
+      recommendation: "Reduce exact public version disclosure where feasible and verify patch posture for detected platforms.",
+      evidence: {
+        checkedUrl: primaryAttempt.finalUrl,
+        generator: generator || null,
+        poweredBy: poweredBy || null,
+        server: serverHeader || null,
+        wordpressDetected,
+        preliminary: true,
+      },
+      premiumOnly: true,
+    }),
+    buildSecurityCheck({
+      checkKey: "security-txt",
+      title: "security.txt",
+      status: securityTxtFound ? "pass" : "info",
+      severity: "info",
+      confidence: "info",
+      shortDescription: securityTxtFound ? "security.txt is reachable." : "security.txt was not found at standard locations.",
+      whyItMatters: "security.txt gives researchers a standard place to find disclosure and contact instructions.",
+      recommendation: securityTxtFound ? "Keep security.txt current." : "Publish /.well-known/security.txt with disclosure instructions.",
+      evidence: {
+        checkedUrl: `${primaryOrigin}/.well-known/security.txt, ${primaryOrigin}/security.txt`,
+        found: securityTxtFound,
+        preliminary: true,
+      },
+    }),
+    buildSecurityCheck({
+      checkKey: "fast-discovery-files",
+      title: "Discovery files",
+      status: "info",
+      severity: "info",
+      confidence: "info",
+      shortDescription:
+        `Fast baseline checked robots.txt (${robotsTxt?.status ?? "failed"}) and sitemap.xml (${sitemapXml?.status ?? "failed"}).`,
+      whyItMatters: "robots.txt and sitemap.xml can quickly reveal crawl scope and sensitive-looking paths.",
+      recommendation: "Ensure discovery files do not reference unprotected sensitive paths.",
+      evidence: {
+        checkedUrl: `${primaryOrigin}/robots.txt, ${primaryOrigin}/sitemap.xml`,
+        robotsStatus: robotsTxt?.status ?? null,
+        sitemapStatus: sitemapXml?.status ?? null,
+        preliminary: true,
+      },
+    }),
+  ];
+
+  return {
+    findings,
+    score: preliminaryScore(findings),
+    urlsChecked: 6,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
 function cookieName(cookie: string) {
   return cookie.split("=")[0]?.trim() || "Unnamed cookie";
 }
@@ -108,18 +473,65 @@ function parseCookieFlags(cookie: string) {
   };
 }
 
+type CookieSensitivity =
+  | "auth"
+  | "session"
+  | "csrf"
+  | "tracking"
+  | "preference"
+  | "analytics"
+  | "unknown";
+
 function isCsrfCookie(name: string) {
   return /(csrf|xsrf)/i.test(name);
 }
 
-function isSensitiveCookie(name: string) {
-  const lower = name.toLowerCase();
+function isHostedAuthProviderSignal(value: string) {
+  const text = value.toLowerCase();
+  let hostname = "";
+  try {
+    hostname = new URL(value.split("#")[0] || value).hostname.toLowerCase();
+  } catch {
+    hostname = "";
+  }
 
   return (
-    /^(?:phpsessid|jsessionid|sessionid|connect\.sid)$/i.test(name) ||
-    /(?:^|[_.-])(?:session|sess|sid)(?:$|[_.-])/i.test(lower) ||
-    /(?:auth(?:entication)?|access|refresh|id)[_.-]?token|jwt/i.test(lower)
+    /(?:^|\.)accounts\./.test(hostname) ||
+    /(?:^|\.)auth0\.com$|(?:^|\.)okta\.com$|login\.microsoftonline\.com$|(?:^|\.)cognito-idp\./.test(hostname) ||
+    /servicelogin|weblitesignin|oauth2?|openid|saml|identity-provider|idp/.test(text)
   );
+}
+
+function isSensitiveCookie(name: string) {
+  return ["auth", "session", "csrf"].includes(classifyCookieSensitivity(name));
+}
+
+function classifyCookieSensitivity(name: string): CookieSensitivity {
+  const lower = name.toLowerCase();
+
+  if (/(csrf|xsrf)/i.test(name)) {
+    return "csrf";
+  }
+  if (
+    /^(?:phpsessid|jsessionid|sessionid|connect\.sid)$/i.test(name) ||
+    /(?:^|[_.-])(?:session|sess|sid)(?:$|[_.-])/i.test(lower)
+  ) {
+    return "session";
+  }
+  if (/(?:auth(?:entication)?|access|refresh|id)[_.-]?token|jwt|login/i.test(lower)) {
+    return "auth";
+  }
+  if (/^(?:_ga|_gid|_gat|_gcl|nid|1p_jar|ogpc|aec|ide|fr|fbp)$/i.test(name)) {
+    return "analytics";
+  }
+  if (/^(?:consent|socs|preferences?|prefs?|lang|locale|theme)$/i.test(name)) {
+    return "preference";
+  }
+  if (/(?:track|analytics|visitor|utm|campaign|ga|gid)/i.test(lower)) {
+    return "tracking";
+  }
+
+  return "unknown";
 }
 
 function isInfrastructureCookie(name: string) {
@@ -267,22 +679,29 @@ type BrowserXssExecutionResult = {
 type ActiveSqlProbeResult = {
   url: string;
   parameter: string;
+  parameterContext: ParameterContext;
   payload: string;
   status: number;
   baselineStatus: number | null;
   baselineDurationMs: number | null;
   probeDurationMs: number | null;
   sqlError: boolean;
+  dbErrorSignature: string | null;
+  dbErrorFamily: DbErrorFamily | null;
+  dbErrorExcerpt: string | null;
   serverError: boolean;
   baselineRecordCount: number | null;
   probeRecordCount: number | null;
   recordExpansion: boolean;
   timeDelay: boolean;
+  evidenceStrength: EvidenceStrength;
+  falsePositiveRisk: "low" | "medium" | "high";
 };
 
 type BooleanSqlProbeResult = {
   url: string;
   parameter: string;
+  parameterContext: ParameterContext;
   truePayload: string;
   falsePayload: string;
   baselineStatus: number | null;
@@ -294,6 +713,8 @@ type BooleanSqlProbeResult = {
   trueBodyLength: number | null;
   falseBodyLength: number | null;
   responseDifference: boolean;
+  diffDimensions: string[];
+  highDynamic: boolean;
 };
 
 type IdorProbeResult = {
@@ -369,22 +790,6 @@ const sensitivePathPattern =
 const apiPathPattern = /(?:^|\/)(?:api(?:\/v\d+)?|graphql|rest(?:\/v\d+)?|rpc|ajax)(?:\/|$)/i;
 const openRedirectParamPattern = /^(redirect|next|return|returnurl|continue|url|target|dest)$/i;
 const riskyInputParamPattern = /^(q|query|search|keyword|term|id|sort|filter|category|redirect|next|returnurl|continue|url)$/i;
-const sqlErrorPatterns = [
-  /you have an error in your sql syntax/i,
-  /warning:\s*(?:mysql|mysqli|pg_|sqlite_|odbc|pdo)/i,
-  /\b(?:mysql|postgres(?:ql)?|sqlite|sqlserver|oracle)\b.{0,40}\b(?:syntax|error|exception|warning|query|driver|odbc|state)\b/i,
-  /sqlstate/i,
-  /odbc/i,
-  /pdoexception/i,
-  /sequelize[^<\n]{0,80}(?:error|exception)/i,
-  /prisma[^<\n]{0,80}(?:error|exception)/i,
-  /database error/i,
-  /query failed/i,
-  /syntax error at or near/i,
-  /unterminated quoted string/i,
-  /no such table/i,
-  /unknown column/i,
-];
 const strongVerboseErrorPatterns = [
   /stack trace/i,
   /traceback \(most recent call last\)/i,
@@ -716,6 +1121,7 @@ function collectCookieHints(setCookies: string[]) {
   const cookies = setCookies.map((cookie) => ({
     name: cookieName(cookie),
     raw: cookie,
+    sensitivity: classifyCookieSensitivity(cookieName(cookie)),
     infrastructure: isInfrastructureCookie(cookieName(cookie)),
     sensitive:
       isSensitiveCookie(cookieName(cookie)) &&
@@ -794,7 +1200,7 @@ function detectDangerousDomSinks(text: string) {
 }
 
 function looksLikeSqlError(bodyText: string) {
-  return sqlErrorPatterns.some((pattern) => pattern.test(bodyText));
+  return Boolean(findStrictDbErrorSignature(bodyText));
 }
 
 function looksLikeVerboseError(bodyText: string) {
@@ -1543,13 +1949,36 @@ function extractSimpleForms(url: string, bodyText: string, targetHostname: strin
     });
 }
 
-export async function runSecurityScan(target: NormalizedTarget): Promise<CategoryScanResult> {
+export async function runSecurityScan(
+  target: NormalizedTarget,
+  options: ScanRunOptions = {},
+): Promise<CategoryScanResult> {
   const securityStartedAt = Date.now();
   const scanMode = resolveSecurityScanMode(target);
   const budgetMs = securityBudgetMs(scanMode);
   const phase = createSecurityPhaseLogger(target, scanMode);
   const hasBudgetFor = (minimumRemainingMs: number) => Date.now() - securityStartedAt + minimumRemainingMs < budgetMs;
   phase("start", { budgetMs });
+  const fastBaseline = await runFastBaselinePhase(target, scanMode);
+  phase("fast-baseline:complete", {
+    findings: fastBaseline.findings.length,
+    score: fastBaseline.score,
+    durationMs: fastBaseline.durationMs,
+    urlsChecked: fastBaseline.urlsChecked,
+  });
+  await options.onProgress?.({
+    phase: "fast-baseline",
+    message: `Initial results ready. ${fastBaseline.findings.length} baseline checks are visible while deeper checks continue.`,
+    percent: 24,
+    findings: fastBaseline.findings,
+    score: fastBaseline.score,
+    urlsChecked: fastBaseline.urlsChecked,
+  });
+  await options.onProgress?.({
+    phase: "browser-render",
+    message: "Initial results are ready. Rendering the site in a browser and mapping dynamic routes now.",
+    percent: 38,
+  });
   const artifacts = await loadAuditArtifacts(target);
   phase("artifacts:loaded", {
     rendered: artifacts.browserInspection.rendered,
@@ -1742,6 +2171,12 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     attempts: sensitiveEndpointAttempts.length,
     notable: notableSensitiveEndpointAttempts.length,
     elapsedMs: Date.now() - securityStartedAt,
+  });
+  await options.onProgress?.({
+    phase: "attack-surface",
+    message: `Attack surface mapped. ${notableSensitiveEndpointAttempts.length} sensitive endpoint candidate(s) need review while active probes continue.`,
+    percent: 52,
+    urlsChecked: sensitiveEndpointAttempts.length,
   });
   const authSurfaceAttempts = notableSensitiveEndpointAttempts.filter((attempt) =>
     /(login|signin|register|signup|password|reset|forgot|auth|account|accounts|session|identifier)/i.test(
@@ -2387,6 +2822,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const cookies = primaryAttempt.setCookies.map((cookie) => ({
     name: cookieName(cookie),
     raw: cookie,
+    sensitivity: classifyCookieSensitivity(cookieName(cookie)),
     infrastructure: isInfrastructureCookie(cookieName(cookie)),
     sensitive:
       isSensitiveCookie(cookieName(cookie)) &&
@@ -2440,29 +2876,32 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   ];
   cookieChecks.forEach((check) => {
     const sensitiveMissing = check.missing.filter((cookie) => cookie.sensitive);
+    const nonSensitiveMissing = check.missing.filter((cookie) => !cookie.sensitive);
     const status =
       check.items.length === 0
         ? "pass"
         : sensitiveMissing.length > 0
-          ? "fail"
+          ? "warning"
           : check.missing.length > 0
-            ? "warning"
+            ? "info"
             : "pass";
     const severity: Severity =
-      status === "fail" ? "medium" : status === "warning" ? "low" : "info";
+      status === "warning" ? check.flag === "SameSite" ? "low" : "medium" : "info";
+    const nonSensitiveOnly = sensitiveMissing.length === 0 && nonSensitiveMissing.length > 0;
 
     findings.push(
       buildSecurityCheck({
         checkKey: check.checkKey,
-        title: check.title,
+        title: nonSensitiveOnly ? `${check.flag} cookie hardening note` : check.title,
         scoreWeight:
           sensitiveMissing.length > 0
-            ? 1.15
+            ? 0.85
             : check.missing.length > 0
-              ? 0.7
+              ? 0.15
               : 0.4,
         status,
         severity,
+        confidence: sensitiveMissing.length > 0 ? "likely" : "info",
         shortDescription:
           applicationCookies.length === 0 && cookies.length > 0
             ? "Only infrastructure cookies were observed on the sampled response."
@@ -2470,13 +2909,19 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
               ? "No response cookies were set on the primary document."
             : check.missing.length === 0
               ? `All ${check.items.length} sampled response cookies include ${check.flag}.`
+              : nonSensitiveOnly
+                ? `${nonSensitiveMissing.length} sampled non-sensitive cookie(s) are missing ${check.flag}; no sampled auth/session cookie was affected.`
               : `${check.missing.length} of ${check.items.length} sampled response cookies are missing ${check.flag}.`,
-        whyItMatters: check.whyItMatters,
+        whyItMatters: nonSensitiveOnly
+          ? "Cookie flag gaps on tracking, analytics, preference, or unknown cookies are hardening/privacy notes unless they protect an authenticated session."
+          : check.whyItMatters,
         recommendation:
           applicationCookies.length === 0 && cookies.length > 0
             ? "No application cookies were observed on this response, so this check is informational."
             : check.items.length === 0
               ? "No change is required unless your application sets cookies on other routes."
+            : nonSensitiveOnly
+              ? "Review whether these cookies need the flag for privacy or compatibility, but prioritize auth/session cookies first."
             : check.recommendation,
         evidence: {
           checkedUrl: primaryAttempt.finalUrl,
@@ -2486,16 +2931,25 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
               ? "Only infrastructure or edge-network cookies were set on the sampled response."
             : check.items.length === 0
               ? "The primary document response did not set cookies."
+            : nonSensitiveOnly
+              ? `Only non-sensitive sampled cookies are missing ${check.flag}.`
               : `${check.missing.length} sampled cookies are missing ${check.flag}.`,
           cookieCount: check.items.length,
           missingCount: check.missing.length,
+          sensitiveCookies: check.items.filter((cookie) => cookie.sensitive).map((cookie) => cookie.name),
+          sensitiveMissing: sensitiveMissing.map((cookie) => cookie.name),
+          nonSensitiveMissing: nonSensitiveMissing.map((cookie) => cookie.name),
+          cookieSensitivity: check.items.map((cookie) => ({
+            name: cookie.name,
+            sensitivity: cookie.sensitivity,
+          })),
           locations: check.missing.slice(0, 8).map((cookie) =>
             createResponseLocation({
               label: `Cookie ${cookie.name}`,
               url: primaryAttempt.finalUrl,
               path: 'response.headers["set-cookie"]',
               value: cookie.raw,
-              note: `Missing ${check.flag}.`,
+              note: `Missing ${check.flag}. Sensitivity: ${cookie.sensitivity}.`,
             }),
           ),
         },
@@ -2564,6 +3018,12 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         metaCsrfTokenPresent,
         sensitiveFormCount: sensitiveForms.length,
         protectedFormCount: clearlyProtectedForms.length,
+        sensitiveForms: sensitiveForms.map((form) => ({
+          url: form.url,
+          method: form.method,
+          sensitiveKinds: form.sensitiveKinds,
+          csrfFieldNames: form.csrfFieldNames,
+        })),
         locations: unprotectedSensitiveForms
           .slice(0, 8)
           .map((form, index) => ({
@@ -2801,6 +3261,11 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     browserExecutionQueued: shouldRunBrowserXssExecution,
     elapsedMs: Date.now() - securityStartedAt,
   });
+  await options.onProgress?.({
+    phase: "active-probes",
+    message: "Running safe active probes for XSS, SQL injection, authentication, and authorization.",
+    percent: 68,
+  });
   const browserXssExecutionResults = shouldRunBrowserXssExecution
     ? await runBrowserXssExecutionProbes(
         activeXssProbeConfigs.slice(0, scanMode === "Deep" ? 4 : 2),
@@ -2950,18 +3415,22 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const boundedSqlProbePayloads = fastMode
     ? sqlProbePayloads.filter((payload) => !/sleep/i.test(payload))
     : sqlProbePayloads;
-  const sqlProbeConfigs = inputProbeConfigs
-    .filter((config) => riskyInputParamPattern.test(config.parameter))
-    .slice(0, fastMode ? 4 : 6);
-  const sqlProbeResults = (
-    await mapLimited(sqlProbeConfigs, 2, async (config, configIndex) => {
-      const baselineUrl = applyProbeParameter(config.url, config.parameter, sqlProbeToken);
-      const baselineAttempt = await loadAttempt(baselineUrl, {
-        timeoutMs: probeTimeoutMs,
-        followRedirects: false,
-        headers: authHeadersFor(baselineUrl),
-      });
-      const baselineRecordCount = baselineAttempt ? countStructuredRecords(baselineAttempt.bodyText) : null;
+	  const sqlProbeConfigs = inputProbeConfigs
+	    .filter((config) => {
+	      const context = classifyParameter(config.parameter, config.url);
+	      return context === "search" || context === "id" || context === "filter" || context === "sort" || context === "pagination" || context === "unknown";
+	    })
+	    .slice(0, fastMode ? 4 : 6);
+	  const sqlProbeResults = (
+	    await mapLimited(sqlProbeConfigs, 2, async (config, configIndex) => {
+	      const parameterContext = classifyParameter(config.parameter, config.url);
+	      const baselineUrl = applyProbeParameter(config.url, config.parameter, sqlProbeToken);
+	      const baselineAttempt = await loadAttempt(baselineUrl, {
+	        timeoutMs: probeTimeoutMs,
+	        followRedirects: false,
+	        headers: authHeadersFor(baselineUrl),
+	      });
+	      const baselineRecordCount = baselineAttempt ? countStructuredRecords(baselineAttempt.bodyText) : null;
 
       return (
         await mapLimited(
@@ -2980,45 +3449,75 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
             return null;
           }
 
-          const probeRecordCount = countStructuredRecords(attempt.bodyText);
-          const baselineDurationMs = baselineAttempt?.totalDurationMs ?? baselineAttempt?.durationMs ?? null;
-          const probeDurationMs = attempt.totalDurationMs ?? attempt.durationMs ?? null;
-          const recordExpansion =
-            baselineRecordCount !== null &&
-            probeRecordCount !== null &&
+	          const probeRecordCount = countStructuredRecords(attempt.bodyText);
+	          const baselineDurationMs = baselineAttempt?.totalDurationMs ?? baselineAttempt?.durationMs ?? null;
+	          const probeDurationMs = attempt.totalDurationMs ?? attempt.durationMs ?? null;
+	          const probeSignature = buildSqlResponseSignature({
+	            status: attempt.status,
+	            contentType: attempt.headers["content-type"] ?? "",
+	            bodyText: attempt.bodyText,
+	            url: attempt.finalUrl,
+	          });
+	          const dbErrorMatch = findStrictDbErrorSignature(attempt.bodyText);
+	          const recordExpansion =
+	            baselineRecordCount !== null &&
+	            probeRecordCount !== null &&
             probeRecordCount > baselineRecordCount &&
             probeRecordCount >= Math.max(3, baselineRecordCount + 3);
           const timeDelay =
             /sleep|benchmark|pg_sleep|waitfor/i.test(payload) &&
             baselineDurationMs !== null &&
             probeDurationMs !== null &&
-            probeDurationMs - baselineDurationMs >= 1_600 &&
-            probeDurationMs >= 1_900;
+	            probeDurationMs - baselineDurationMs >= 1_600 &&
+	            probeDurationMs >= 1_900;
+	          const dynamicSignal = highDynamicResponseSignal({
+	            url: attempt.finalUrl,
+	            headers: attempt.headers,
+	            bodyText: attempt.bodyText,
+	            signature: probeSignature,
+	          });
+	          const weakContext =
+	            parameterContext === "redirect" ||
+	            parameterContext === "auth-flow" ||
+	            parameterContext === "tracking" ||
+	            (dynamicSignal.highDynamic && !recordExpansion && !dbErrorMatch);
+	          const evidenceStrength: EvidenceStrength = recordExpansion
+	            ? "exploit-proof"
+	            : dbErrorMatch
+	              ? "moderate"
+	              : "weak";
 
-          return {
-            url: attempt.finalUrl,
-            parameter: config.parameter,
-            payload,
-            status: attempt.status,
-            baselineStatus: baselineAttempt?.status ?? null,
+	          return {
+	            url: attempt.finalUrl,
+	            parameter: config.parameter,
+	            parameterContext,
+	            payload,
+	            status: attempt.status,
+	            baselineStatus: baselineAttempt?.status ?? null,
             baselineDurationMs,
             probeDurationMs,
-            sqlError: looksLikeSqlError(attempt.bodyText),
-            serverError: attempt.status >= 500 && (baselineAttempt?.status ?? 200) < 500,
-            baselineRecordCount,
-            probeRecordCount,
-            recordExpansion,
-            timeDelay,
-          } satisfies ActiveSqlProbeResult;
+	            sqlError: Boolean(dbErrorMatch),
+	            dbErrorSignature: dbErrorMatch?.signature ?? null,
+	            dbErrorFamily: dbErrorMatch?.family ?? null,
+	            dbErrorExcerpt: dbErrorMatch?.excerpt ?? null,
+	            serverError: attempt.status >= 500 && (baselineAttempt?.status ?? 200) < 500,
+	            baselineRecordCount,
+	            probeRecordCount,
+	            recordExpansion,
+	            timeDelay,
+	            evidenceStrength,
+	            falsePositiveRisk: weakContext ? "high" : dbErrorMatch ? "medium" : "low",
+	          } satisfies ActiveSqlProbeResult;
           },
         )
       ).filter(isPresent);
     })
   ).flat();
-  const booleanSqlProbeResults = (
-    await mapLimited(sqlProbeConfigs.slice(0, fastMode ? 2 : 4), 2, async (config) => {
-      const baselineUrl = applyProbeParameter(config.url, config.parameter, sqlProbeToken);
-      const truePayload = "' OR 1=1--";
+	  const booleanSqlProbeResults = (
+	    await mapLimited(sqlProbeConfigs.slice(0, fastMode ? 2 : 4), 2, async (config) => {
+	      const parameterContext = classifyParameter(config.parameter, config.url);
+	      const baselineUrl = applyProbeParameter(config.url, config.parameter, sqlProbeToken);
+	      const truePayload = "' OR 1=1--";
       const falsePayload = "' AND 1=2--";
       const trueUrl = applyProbeParameter(config.url, config.parameter, truePayload);
       const falseUrl = applyProbeParameter(config.url, config.parameter, falsePayload);
@@ -3044,32 +3543,71 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       }
 
       const baselineRecordCount = baselineAttempt ? countStructuredRecords(baselineAttempt.bodyText) : null;
-      const trueRecordCount = countStructuredRecords(trueAttempt.bodyText);
-      const falseRecordCount = countStructuredRecords(falseAttempt.bodyText);
-      const recordDifference =
-        trueRecordCount !== null &&
-        falseRecordCount !== null &&
-        trueRecordCount >= Math.max(3, falseRecordCount + 3);
-      const bodyLengthDifference =
-        Math.abs(trueAttempt.bodyText.length - falseAttempt.bodyText.length) > 800 &&
-        trueAttempt.status === falseAttempt.status;
+	      const trueRecordCount = countStructuredRecords(trueAttempt.bodyText);
+	      const falseRecordCount = countStructuredRecords(falseAttempt.bodyText);
+	      const recordDifference =
+	        trueRecordCount !== null &&
+	        falseRecordCount !== null &&
+	        trueRecordCount >= Math.max(3, falseRecordCount + 3);
+	      const trueSignature = buildSqlResponseSignature({
+	        status: trueAttempt.status,
+	        contentType: trueAttempt.headers["content-type"] ?? "",
+	        bodyText: trueAttempt.bodyText,
+	        url: trueAttempt.finalUrl,
+	      });
+	      const falseSignature = buildSqlResponseSignature({
+	        status: falseAttempt.status,
+	        contentType: falseAttempt.headers["content-type"] ?? "",
+	        bodyText: falseAttempt.bodyText,
+	        url: falseAttempt.finalUrl,
+	      });
+	      const highDynamic =
+	        highDynamicResponseSignal({
+	          url: trueAttempt.finalUrl,
+	          headers: trueAttempt.headers,
+	          bodyText: trueAttempt.bodyText,
+	          signature: trueSignature,
+	        }).highDynamic ||
+	        highDynamicResponseSignal({
+	          url: falseAttempt.finalUrl,
+	          headers: falseAttempt.headers,
+	          bodyText: falseAttempt.bodyText,
+	          signature: falseSignature,
+	        }).highDynamic;
+	      const weakParameterContext =
+	        parameterContext === "redirect" || parameterContext === "auth-flow" || parameterContext === "tracking";
+	      const diffDimensions = responseDiffDimensions(trueSignature, falseSignature).filter((dimension) => {
+	        const noisyHtml =
+	          highDynamic ||
+	          trueSignature.isCaptchaOrBotPage ||
+	          falseSignature.isCaptchaOrBotPage ||
+	          trueSignature.isLoginPage ||
+	          falseSignature.isLoginPage ||
+	          trueSignature.isRedirectValidationPage ||
+	          falseSignature.isRedirectValidationPage;
+	        return !noisyHtml || (dimension !== "stable-text" && dimension !== "length-bucket");
+	      });
+	      const strongDiff = diffDimensions.some((dimension) => dimension === "status" || dimension === "record-count" || dimension === "json-shape");
 
-      return {
-        url: trueAttempt.finalUrl,
-        parameter: config.parameter,
-        truePayload,
-        falsePayload,
+	      return {
+	        url: trueAttempt.finalUrl,
+	        parameter: config.parameter,
+	        parameterContext,
+	        truePayload,
+	        falsePayload,
         baselineStatus: baselineAttempt?.status ?? null,
         trueStatus: trueAttempt.status,
         falseStatus: falseAttempt.status,
         baselineRecordCount,
         trueRecordCount,
-        falseRecordCount,
-        trueBodyLength: trueAttempt.bodyText.length,
-        falseBodyLength: falseAttempt.bodyText.length,
-        responseDifference: recordDifference || bodyLengthDifference,
-      } satisfies BooleanSqlProbeResult;
-    })
+	        falseRecordCount,
+	        trueBodyLength: trueAttempt.bodyText.length,
+	        falseBodyLength: falseAttempt.bodyText.length,
+	        responseDifference: !weakParameterContext && (recordDifference || (strongDiff && diffDimensions.length >= 2)),
+	        diffDimensions,
+	        highDynamic,
+	      } satisfies BooleanSqlProbeResult;
+	    })
   ).filter(isPresent);
   phase("sql:active-complete", {
     sqlProbes: sqlProbeResults.length,
@@ -3090,34 +3628,47 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     skipped: blindSqlProbeResults.length === 0 && sqlProbeConfigs.length > 0,
     elapsedMs: Date.now() - securityStartedAt,
   });
-  const sqlErrorResult = sqlProbeResults.find((result) => result.sqlError || result.recordExpansion);
-  const anomalousSqlResult = sqlProbeResults.find((result) => result.serverError);
-  const timeBasedSqlResult = sqlProbeResults.find((result) => result.timeDelay);
-  const repeatedBlindSqlResult = blindSqlProbeResults.find((result) => result.confidence === "CONFIRMED");
-  const likelyBlindSqlResult = blindSqlProbeResults.find((result) => result.confidence === "LIKELY");
-  const booleanSqlResult = booleanSqlProbeResults.find((result) => result.responseDifference);
-  const sqlStatus = sqlErrorResult
-    ? { status: "fail" as const, severity: "critical" as const }
-    : repeatedBlindSqlResult || booleanSqlResult
-      ? { status: "fail" as const, severity: "critical" as const }
-    : timeBasedSqlResult
-      ? { status: "warning" as const, severity: "high" as const }
-    : anomalousSqlResult
-      ? { status: "warning" as const, severity: "high" as const }
-      : { status: "pass" as const, severity: "info" as const };
+	  const recordExpansionSqlResult = sqlProbeResults.find((result) => result.recordExpansion);
+	  const strictDbErrorSqlResult = sqlProbeResults.find((result) => result.sqlError && result.dbErrorSignature);
+	  const anomalousSqlResult = sqlProbeResults.find((result) => result.serverError);
+	  const timeBasedSqlResult = sqlProbeResults.find((result) => result.timeDelay);
+	  const repeatedBlindSqlResult = blindSqlProbeResults.find((result) => result.confidence === "CONFIRMED");
+	  const likelyBlindSqlResult = blindSqlProbeResults.find((result) => result.confidence === "LIKELY");
+	  const booleanSqlResult = booleanSqlProbeResults.find((result) => result.responseDifference);
+	  const sqlEvidenceResult = recordExpansionSqlResult ?? strictDbErrorSqlResult ?? null;
+	  const sqlFindingEvidenceStrength: EvidenceStrength = recordExpansionSqlResult
+	    ? "exploit-proof"
+	    : repeatedBlindSqlResult
+	      ? "strong"
+	      : strictDbErrorSqlResult || booleanSqlResult || likelyBlindSqlResult
+	        ? "moderate"
+	        : "weak";
+	  const sqlFindingFalsePositiveRisk =
+	    sqlEvidenceResult?.falsePositiveRisk ??
+	    likelyBlindSqlResult?.falsePositiveRisk ??
+	    (booleanSqlResult?.highDynamic ? "high" : sqlFindingEvidenceStrength === "weak" ? "high" : "medium");
+	  const sqlStatus = recordExpansionSqlResult || repeatedBlindSqlResult
+	    ? { status: "fail" as const, severity: "critical" as const }
+	    : strictDbErrorSqlResult || booleanSqlResult || likelyBlindSqlResult
+	      ? { status: "warning" as const, severity: "high" as const }
+	    : timeBasedSqlResult
+	      ? { status: "warning" as const, severity: "medium" as const }
+	    : anomalousSqlResult
+	      ? { status: "warning" as const, severity: "medium" as const }
+	      : { status: "pass" as const, severity: "info" as const };
   findings.push(
     buildSecurityCheck({
       checkKey: "sql-injection-risk-indicators",
       title: "SQL injection active probe",
       scoreWeight: 1.6,
       ...sqlStatus,
-      confidence: sqlErrorResult || repeatedBlindSqlResult ? "confirmed" : booleanSqlResult || likelyBlindSqlResult || timeBasedSqlResult || anomalousSqlResult ? "likely" : "info",
-      shortDescription: sqlErrorResult
-        ? sqlErrorResult.sqlError
-          ? `A sampled parameter on ${sqlErrorResult.url} triggered a database-like error response.`
-          : `A SQL-style payload on ${sqlErrorResult.url} expanded the structured response from ${sqlErrorResult.baselineRecordCount ?? 0} to ${sqlErrorResult.probeRecordCount ?? 0} records.`
-        : repeatedBlindSqlResult
-          ? `Repeated blind SQL probes on ${repeatedBlindSqlResult.url} produced stable ${repeatedBlindSqlResult.technique} evidence.`
+	      confidence: recordExpansionSqlResult || repeatedBlindSqlResult ? "confirmed" : booleanSqlResult || likelyBlindSqlResult || strictDbErrorSqlResult || timeBasedSqlResult || anomalousSqlResult ? "likely" : "info",
+	      shortDescription: recordExpansionSqlResult
+	        ? `A SQL-style payload on ${recordExpansionSqlResult.url} expanded the structured response from ${recordExpansionSqlResult.baselineRecordCount ?? 0} to ${recordExpansionSqlResult.probeRecordCount ?? 0} records.`
+	        : strictDbErrorSqlResult
+	          ? `A sampled parameter on ${strictDbErrorSqlResult.url} exposed a strict database error signature, but exploit behavior was not proven.`
+	        : repeatedBlindSqlResult
+	          ? `Repeated blind SQL probes on ${repeatedBlindSqlResult.url} produced stable ${repeatedBlindSqlResult.technique} evidence.`
         : booleanSqlResult
           ? `Boolean SQL payloads on ${booleanSqlResult.url} produced a clear true/false response difference.`
         : timeBasedSqlResult
@@ -3135,16 +3686,19 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         checkedUrl: sqlProbeConfigs.map((config) => config.url).join(", "),
         expectedLocation: "Search, filter, ID, and query parameters should not trigger SQL-like error behavior",
         summary:
-          sqlStatus.status === "pass"
-            ? "No SQL-like error patterns were detected in the sampled responses."
-            : "At least one sampled response behaved like a SQL or backend query handling issue.",
-        probePayloads: sqlProbePayloads.map((payload) => redactValue(payload)),
-        url: sqlErrorResult?.url ?? repeatedBlindSqlResult?.url ?? booleanSqlResult?.url ?? timeBasedSqlResult?.url ?? anomalousSqlResult?.url ?? null,
-        parameter: sqlErrorResult?.parameter ?? repeatedBlindSqlResult?.parameter ?? booleanSqlResult?.parameter ?? timeBasedSqlResult?.parameter ?? anomalousSqlResult?.parameter ?? null,
-        payload: sqlErrorResult?.payload
-          ? redactValue(sqlErrorResult.payload)
-          : repeatedBlindSqlResult
-            ? repeatedBlindSqlResult.technique
+	          sqlStatus.status === "pass"
+	            ? "No SQL injection proof was observed: no record-count, boolean, timing, or strict DB-error exploit evidence was collected."
+	            : recordExpansionSqlResult || repeatedBlindSqlResult
+	              ? "Strong SQL injection evidence was collected."
+	              : "The signal is intentionally kept likely because exploitability proof was incomplete.",
+	        probePayloads: sqlProbePayloads.map((payload) => redactValue(payload)),
+	        url: sqlEvidenceResult?.url ?? repeatedBlindSqlResult?.url ?? booleanSqlResult?.url ?? timeBasedSqlResult?.url ?? anomalousSqlResult?.url ?? null,
+	        parameter: sqlEvidenceResult?.parameter ?? repeatedBlindSqlResult?.parameter ?? booleanSqlResult?.parameter ?? timeBasedSqlResult?.parameter ?? anomalousSqlResult?.parameter ?? null,
+	        parameterContext: sqlEvidenceResult?.parameterContext ?? repeatedBlindSqlResult?.parameterContext ?? booleanSqlResult?.parameterContext ?? null,
+	        payload: sqlEvidenceResult?.payload
+	          ? redactValue(sqlEvidenceResult.payload)
+	          : repeatedBlindSqlResult
+	            ? repeatedBlindSqlResult.technique
           : booleanSqlResult?.truePayload
             ? redactValue(booleanSqlResult.truePayload)
             : timeBasedSqlResult?.payload
@@ -3152,16 +3706,18 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
               : anomalousSqlResult?.payload
                 ? redactValue(anomalousSqlResult.payload)
                 : null,
-        beforeStatus: sqlErrorResult?.baselineStatus ?? repeatedBlindSqlResult?.baseline[0]?.status ?? booleanSqlResult?.falseStatus ?? timeBasedSqlResult?.baselineStatus ?? anomalousSqlResult?.baselineStatus ?? null,
-        afterStatus: sqlErrorResult?.status ?? repeatedBlindSqlResult?.trueCondition?.[0]?.status ?? booleanSqlResult?.trueStatus ?? timeBasedSqlResult?.status ?? anomalousSqlResult?.status ?? null,
-        responseDiff: sqlErrorResult?.recordExpansion
-          ? `${sqlErrorResult.baselineRecordCount ?? 0} to ${sqlErrorResult.probeRecordCount ?? 0} records`
-          : repeatedBlindSqlResult
-            ? repeatedBlindSqlResult.evidenceSummary
-          : booleanSqlResult
-            ? `true=${booleanSqlResult.trueRecordCount ?? booleanSqlResult.trueBodyLength}, false=${booleanSqlResult.falseRecordCount ?? booleanSqlResult.falseBodyLength}`
-          : timeBasedSqlResult
-            ? `${Math.max(0, (timeBasedSqlResult.probeDurationMs ?? 0) - (timeBasedSqlResult.baselineDurationMs ?? 0))} ms slower`
+	        beforeStatus: sqlEvidenceResult?.baselineStatus ?? repeatedBlindSqlResult?.baseline[0]?.status ?? booleanSqlResult?.falseStatus ?? timeBasedSqlResult?.baselineStatus ?? anomalousSqlResult?.baselineStatus ?? null,
+	        afterStatus: sqlEvidenceResult?.status ?? repeatedBlindSqlResult?.trueCondition?.[0]?.status ?? booleanSqlResult?.trueStatus ?? timeBasedSqlResult?.status ?? anomalousSqlResult?.status ?? null,
+	        responseDiff: recordExpansionSqlResult
+	          ? `${recordExpansionSqlResult.baselineRecordCount ?? 0} to ${recordExpansionSqlResult.probeRecordCount ?? 0} records`
+	          : repeatedBlindSqlResult
+	            ? repeatedBlindSqlResult.evidenceSummary
+	          : booleanSqlResult
+	            ? `true=${booleanSqlResult.trueRecordCount ?? booleanSqlResult.trueBodyLength}, false=${booleanSqlResult.falseRecordCount ?? booleanSqlResult.falseBodyLength}; dimensions=${booleanSqlResult.diffDimensions.join(", ") || "none"}`
+	          : strictDbErrorSqlResult
+	            ? `strict DB error signature: ${strictDbErrorSqlResult.dbErrorSignature}`
+	          : timeBasedSqlResult
+	            ? `${Math.max(0, (timeBasedSqlResult.probeDurationMs ?? 0) - (timeBasedSqlResult.baselineDurationMs ?? 0))} ms slower`
             : anomalousSqlResult?.serverError
               ? "probe caused server error while baseline did not"
               : "not detected",
@@ -3169,17 +3725,22 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           url: result.url,
           parameter: result.parameter,
           payload: redactValue(result.payload),
-          status: result.status,
-          baselineStatus: result.baselineStatus,
+	          status: result.status,
+	          parameterContext: result.parameterContext,
+	          baselineStatus: result.baselineStatus,
           baselineDurationMs: result.baselineDurationMs,
           probeDurationMs: result.probeDurationMs,
-          sqlError: result.sqlError,
-          serverError: result.serverError,
+	          sqlError: result.sqlError,
+	          dbErrorSignature: result.dbErrorSignature,
+	          dbErrorFamily: result.dbErrorFamily,
+	          serverError: result.serverError,
           baselineRecordCount: result.baselineRecordCount,
           probeRecordCount: result.probeRecordCount,
           recordExpansion: result.recordExpansion,
-          timeDelay: result.timeDelay,
-        })),
+	          timeDelay: result.timeDelay,
+	          evidenceStrength: result.evidenceStrength,
+	          falsePositiveRisk: result.falsePositiveRisk,
+	        })),
         booleanResults: booleanSqlProbeResults.map((result) => ({
           url: result.url,
           parameter: result.parameter,
@@ -3190,24 +3751,31 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           trueRecordCount: result.trueRecordCount,
           falseRecordCount: result.falseRecordCount,
           trueBodyLength: result.trueBodyLength,
-          falseBodyLength: result.falseBodyLength,
-          responseDifference: result.responseDifference,
-        })),
-        blindSqlResults: blindSqlProbeResults,
-        repeatedProbeConfirmed: Boolean(repeatedBlindSqlResult),
-        confidence: sqlErrorResult
-          ? sqlErrorResult.recordExpansion
-            ? "confirmed-response-difference"
-            : "confirmed-error-based"
-          : repeatedBlindSqlResult
-            ? "confirmed-boolean-repeated"
-          : booleanSqlResult
-            ? "likely-boolean-single-pass"
-          : timeBasedSqlResult
-            ? "suspected-time-based"
-            : anomalousSqlResult
-              ? "suspected-server-error"
-              : "not-detected",
+	          falseBodyLength: result.falseBodyLength,
+	          responseDifference: result.responseDifference,
+	          diffDimensions: result.diffDimensions,
+	          highDynamic: result.highDynamic,
+	        })),
+	        blindSqlResults: blindSqlProbeResults,
+	        repeatedProbeConfirmed: Boolean(repeatedBlindSqlResult),
+	        evidenceStrength: sqlFindingEvidenceStrength,
+	        falsePositiveRisk: sqlFindingFalsePositiveRisk,
+	        dbErrorSignature: strictDbErrorSqlResult?.dbErrorSignature ?? null,
+	        dbErrorFamily: strictDbErrorSqlResult?.dbErrorFamily ?? null,
+	        dbErrorExcerpt: strictDbErrorSqlResult?.dbErrorExcerpt ?? null,
+	        confidence: recordExpansionSqlResult
+	          ? "confirmed-record-count-difference"
+	          : repeatedBlindSqlResult
+	            ? "confirmed-blind-repeated"
+	            : strictDbErrorSqlResult
+	              ? "likely-strict-db-error-without-exploit-diff"
+	              : booleanSqlResult
+	                ? "likely-boolean-multidimension"
+	                : timeBasedSqlResult
+	                  ? "suspected-time-based-single-probe"
+	                  : anomalousSqlResult
+	                    ? "suspected-server-error"
+	                    : "not-detected",
       },
     }),
   );
@@ -3217,8 +3785,8 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       checkKey: "blind-sql-injection-probe",
       title: "Blind SQL injection probe",
       scoreWeight: 1.45,
-      status: repeatedBlindSqlResult ? "fail" : likelyBlindSqlResult || booleanSqlResult || timeBasedSqlResult ? "warning" : "pass",
-      severity: repeatedBlindSqlResult ? "critical" : likelyBlindSqlResult || booleanSqlResult || timeBasedSqlResult ? "high" : "info",
+	      status: repeatedBlindSqlResult ? "fail" : likelyBlindSqlResult || booleanSqlResult || timeBasedSqlResult ? "warning" : "pass",
+	      severity: repeatedBlindSqlResult ? "critical" : likelyBlindSqlResult || booleanSqlResult ? "high" : timeBasedSqlResult ? "medium" : "info",
       confidence: repeatedBlindSqlResult ? "confirmed" : likelyBlindSqlResult || booleanSqlResult || timeBasedSqlResult ? "likely" : "info",
       shortDescription: repeatedBlindSqlResult
         ? `Repeated ${repeatedBlindSqlResult.technique} blind SQL probes produced stable proof on parameter ${repeatedBlindSqlResult.parameter}.`
@@ -3265,9 +3833,26 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           : timeBasedSqlResult
             ? `${Math.max(0, (timeBasedSqlResult.probeDurationMs ?? 0) - (timeBasedSqlResult.baselineDurationMs ?? 0))} ms slower`
             : "not detected",
-        results: blindSqlProbeResults,
-        repeatedProbeConfirmed: Boolean(repeatedBlindSqlResult),
-        baselineMedianMs: repeatedBlindSqlResult?.baselineMedianMs ?? likelyBlindSqlResult?.baselineMedianMs ?? null,
+	        results: blindSqlProbeResults,
+	        repeatedProbeConfirmed: Boolean(repeatedBlindSqlResult),
+	        evidenceStrength: repeatedBlindSqlResult
+	          ? repeatedBlindSqlResult.evidenceStrength ?? "strong"
+	          : likelyBlindSqlResult
+	            ? likelyBlindSqlResult.evidenceStrength ?? "moderate"
+	            : booleanSqlResult
+	              ? "moderate"
+	              : "weak",
+	        falsePositiveRisk: repeatedBlindSqlResult
+	          ? repeatedBlindSqlResult.falsePositiveRisk ?? "low"
+	          : likelyBlindSqlResult
+	            ? likelyBlindSqlResult.falsePositiveRisk ?? "medium"
+	            : booleanSqlResult?.highDynamic
+	              ? "high"
+	              : timeBasedSqlResult
+	                ? "medium"
+	                : "low",
+	        parameterContext: repeatedBlindSqlResult?.parameterContext ?? likelyBlindSqlResult?.parameterContext ?? booleanSqlResult?.parameterContext ?? null,
+	        baselineMedianMs: repeatedBlindSqlResult?.baselineMedianMs ?? likelyBlindSqlResult?.baselineMedianMs ?? null,
         testMedianMs: repeatedBlindSqlResult?.testMedianMs ?? likelyBlindSqlResult?.testMedianMs ?? null,
         controlMedianMs: repeatedBlindSqlResult?.controlMedianMs ?? likelyBlindSqlResult?.controlMedianMs ?? null,
         businessImpact: repeatedBlindSqlResult
@@ -3278,7 +3863,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     }),
   );
 
-  const dbDisclosureResult = sqlProbeResults.find((result) => result.sqlError);
+	  const dbDisclosureResult = sqlProbeResults.find((result) => result.sqlError);
   const dbDisclosureStatus = dbDisclosureResult
     ? { status: "fail" as const, severity: "high" as const }
     : { status: "pass" as const, severity: "info" as const };
@@ -3288,10 +3873,10 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       title: "Database error disclosure",
       scoreWeight: 1.35,
       ...dbDisclosureStatus,
-      confidence: dbDisclosureResult ? "confirmed" : "info",
-      shortDescription: dbDisclosureResult
-        ? "A sampled response exposed a SQL or database-style error message."
-        : "Sampled responses did not expose SQL or database error details.",
+	      confidence: dbDisclosureResult ? "confirmed" : "info",
+	      shortDescription: dbDisclosureResult
+	        ? `A sampled response exposed a strict ${dbDisclosureResult.dbErrorFamily ?? "database"} error signature.`
+	        : "Sampled responses did not expose SQL or database error details.",
       whyItMatters:
         "Database and ORM error messages can reveal backend technologies, query structure, and internal implementation details that help an attacker refine exploitation attempts.",
       recommendation:
@@ -3301,11 +3886,18 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       evidence: {
         checkedUrl: dbDisclosureResult?.url ?? inputProbeConfigs.map((config) => config.url).join(", "),
         expectedLocation: "Browser responses should not expose SQL, ORM, or database exception details",
-        summary:
-          dbDisclosureStatus.status === "pass"
-            ? "No sampled database error strings were exposed."
-            : "A sampled response contained a database or SQL-style error indicator.",
-      },
+	        summary:
+	          dbDisclosureStatus.status === "pass"
+	            ? "No sampled database error strings were exposed."
+	            : `Matched strict database signature: ${dbDisclosureResult?.dbErrorSignature ?? "unknown"}.`,
+	        url: dbDisclosureResult?.url ?? null,
+	        parameter: dbDisclosureResult?.parameter ?? null,
+	        dbErrorSignature: dbDisclosureResult?.dbErrorSignature ?? null,
+	        dbErrorFamily: dbDisclosureResult?.dbErrorFamily ?? null,
+	        excerpt: dbDisclosureResult?.dbErrorExcerpt ?? null,
+	        evidenceStrength: dbDisclosureResult ? "moderate" : "weak",
+	        falsePositiveRisk: dbDisclosureResult ? "low" : "low",
+	      },
     }),
   );
 
@@ -4247,7 +4839,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const authForms = allKnownForms.filter(
     (form) => form.hasPasswordField || form.sensitiveKinds.some((kind) => ["login", "password-reset"].includes(kind)),
   );
-  const authRouteMapSignals = [
+	  const authRouteMapSignals = [
     ...artifacts.browserInspection.routeMap.forms
       .filter((form) => form.sensitiveKinds.some((kind) => ["login", "password-reset", "account"].includes(kind)))
       .map((form) => form.url),
@@ -4258,18 +4850,23 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       .filter((input) =>
         input.sensitiveKinds.some((kind) => ["login", "password-reset", "account"].includes(kind)) ||
         /password|email|username|otp|token/i.test(`${input.name} ${input.type}`),
-      )
-      .map((input) => `${input.sourceUrl}#${input.name}`),
-  ];
-  const authSurfaceDetected =
-    authForms.length > 0 ||
-    authSurfaceAttempts.length > 0 ||
-    Boolean(successfulAuthBypass) ||
-    authRouteMapSignals.length > 0;
-  const authReviewStatus =
-    successfulAuthBypass
-      ? { status: "fail" as const, severity: "critical" as const }
-    : !authSurfaceDetected
+	      )
+	      .map((input) => `${input.sourceUrl}#${input.name}`),
+	  ];
+	  const appOwnedAuthRouteMapSignals = authRouteMapSignals.filter((signal) => !isHostedAuthProviderSignal(signal));
+	  const hostedAuthProviderSignals = authRouteMapSignals.filter(isHostedAuthProviderSignal);
+	  const appOwnedAuthSurfaceAttempts = authSurfaceAttempts.filter((attempt) => !isHostedAuthProviderSignal(attempt.finalUrl));
+	  const authSurfaceDetected =
+	    authForms.length > 0 ||
+	    appOwnedAuthSurfaceAttempts.length > 0 ||
+	    Boolean(successfulAuthBypass) ||
+	    appOwnedAuthRouteMapSignals.length > 0;
+	  const hostedProviderOnlyAuthSurface =
+	    !authSurfaceDetected && hostedAuthProviderSignals.length > 0;
+	  const authReviewStatus =
+	    successfulAuthBypass
+	      ? { status: "fail" as const, severity: "critical" as const }
+	    : !authSurfaceDetected
       ? { status: "info" as const, severity: "info" as const }
       : authForms.some((form) => !form.secure)
         ? { status: "fail" as const, severity: "high" as const }
@@ -4285,10 +4882,12 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       scoreWeight: authReviewStatus.status === "fail" ? 1.0 : 0.75,
       ...authReviewStatus,
       shortDescription:
-        successfulAuthBypass
-          ? "Authentication surface was detected and one active bypass probe returned an authentication success signal."
-        : !authSurfaceDetected
-          ? "No authentication forms or routes were detected in the sampled surface."
+	        successfulAuthBypass
+	          ? "Authentication surface was detected and one active bypass probe returned an authentication success signal."
+	        : !authSurfaceDetected
+	          ? hostedProviderOnlyAuthSurface
+	            ? "Only hosted authentication-provider flow signals were observed; no app-owned login form was captured."
+	            : "No authentication forms or routes were detected in the sampled surface."
           : authReviewStatus.status === "pass"
             ? "Sampled authentication surfaces look protected by HTTPS and baseline browser controls."
             : "Sampled authentication surfaces expose one or more baseline weaknesses.",
@@ -4299,12 +4898,12 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           ? "Keep authentication flows protected by HTTPS, strong session cookies, and iframe restrictions."
           : "Harden authentication routes with HTTPS-only delivery, secure session cookies, anti-clickjacking controls, and explicit CSRF protection where applicable.",
       evidence: {
-        checkedUrl: uniqueUrls([
-          ...authSurfaceAttempts.map((attempt) => attempt.finalUrl),
-          ...authForms.map((form) => form.url),
-          ...authRouteMapSignals,
-          ...authBypassTargets,
-        ]).join(", "),
+	        checkedUrl: uniqueUrls([
+	          ...appOwnedAuthSurfaceAttempts.map((attempt) => attempt.finalUrl),
+	          ...authForms.map((form) => form.url),
+	          ...appOwnedAuthRouteMapSignals,
+	          ...authBypassTargets,
+	        ]).join(", "),
         expectedLocation: "Login, reset, and account-recovery routes and forms",
         summary:
           successfulAuthBypass
@@ -4312,10 +4911,12 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           : authReviewStatus.status === "pass"
             ? "Sampled auth surfaces looked reasonably hardened."
             : "At least one sampled auth surface lacked a baseline control.",
-        authRouteCount: authSurfaceAttempts.length,
-        passwordFormCount: authForms.length,
-        routeMapSignals: authRouteMapSignals.slice(0, 12),
-        authBypassProbeStatus: successfulAuthBypass ? "confirmed" : authBypassReachable ? "tested" : "not-tested",
+	        authRouteCount: appOwnedAuthSurfaceAttempts.length,
+	        passwordFormCount: authForms.length,
+	        routeMapSignals: appOwnedAuthRouteMapSignals.slice(0, 12),
+	        hostedAuthProviderSignals: hostedAuthProviderSignals.slice(0, 8),
+	        hostedProviderOnlyAuthSurface,
+	        authBypassProbeStatus: successfulAuthBypass ? "confirmed" : authBypassReachable ? "tested" : "not-tested",
         clickjackingStatus: clickjackingStatus.status,
       },
     }),
@@ -4368,9 +4969,10 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
             : passwordForms.length === 0
             ? "No password inputs were found."
             : "Password forms were evaluated for HTTPS, action security, and baseline browser controls.",
-        authSurfaceDetected,
-        authRouteMapSignals: authRouteMapSignals.slice(0, 8),
-        passwordForms: passwordForms.map((form) => ({
+	        authSurfaceDetected,
+	        authRouteMapSignals: appOwnedAuthRouteMapSignals.slice(0, 8),
+	        hostedAuthProviderSignals: hostedAuthProviderSignals.slice(0, 8),
+	        passwordForms: passwordForms.map((form) => ({
           url: form.url,
           method: form.method,
           secure: form.secure,
@@ -4412,6 +5014,18 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
           uploadForms.length === 0 && uploadSurfaceAttempts.length === 0
             ? "No upload-oriented form or route was detected."
             : "Upload-oriented surfaces were detected and reviewed for basic protection hints.",
+        uploadFormCount: uploadForms.length,
+        uploadRouteCount: uploadSurfaceAttempts.length,
+        uploadForms: uploadForms.map((form) => ({
+          url: form.url,
+          method: form.method,
+          secure: form.secure,
+          csrfFieldNames: form.csrfFieldNames,
+        })),
+        uploadRoutes: uploadSurfaceAttempts.map((attempt) => ({
+          url: attempt.finalUrl,
+          status: attempt.status,
+        })),
       },
     }),
   );
@@ -5555,15 +6169,57 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const sensitiveRobotsPaths = robotsTxt && robotsTxt.status < 400
     ? extractSensitiveRobotsPaths(robotsTxt.bodyText)
     : [];
+  const robotsPathSamples = (
+    await mapLimited(sensitiveRobotsPaths.slice(0, 5), 2, async (path) => {
+      const url = resolveHttpUrl(path, primaryOrigin);
+      if (!url) {
+        return null;
+      }
+
+      const attempt = await loadAttempt(url, {
+        timeoutMs: lightProbeTimeoutMs,
+        followRedirects: false,
+      });
+      const reachable = Boolean(attempt && [200, 401, 403].includes(attempt.status));
+      const sensitiveKind =
+        attempt && attempt.status >= 200 && attempt.status < 300
+          ? exposedSensitiveFileKind(path, attempt, primaryAttempt)
+          : null;
+      const sensitiveSignals = attempt
+        ? detectSensitiveDataExposure(attempt.bodyText.slice(0, 80_000), path)
+        : [];
+      const sensitiveDataObserved = Boolean(
+        attempt &&
+          reachable &&
+          (sensitiveKind ||
+            looksLikeSensitiveApiPayload(attempt.bodyText) ||
+            sensitiveSignals.some((signal) => signal.severity !== "low")),
+      );
+
+      return {
+        path,
+        url,
+        status: attempt?.status ?? null,
+        disallowPathSampled: true,
+        reachable,
+        sensitiveDataObserved,
+        sensitiveKind,
+        sensitiveSignals: sensitiveSignals.map((signal) => signal.label),
+      };
+    })
+  ).filter(isPresent);
+  const robotsSensitiveExposure = robotsPathSamples.some((sample) => sample.sensitiveDataObserved);
   findings.push(
     buildSecurityCheck({
       checkKey: "robots-txt-presence",
       title: "robots.txt presence",
-      status: sensitiveRobotsPaths.length > 0 ? "warning" : robotsTxt && robotsTxt.status < 400 ? "pass" : "info",
-      severity: sensitiveRobotsPaths.length > 0 ? "low" : "info",
-      confidence: sensitiveRobotsPaths.length > 0 ? "likely" : "info",
+      status: robotsSensitiveExposure ? "warning" : robotsTxt && robotsTxt.status < 400 ? "pass" : "info",
+      severity: robotsSensitiveExposure ? "medium" : "info",
+      confidence: robotsSensitiveExposure ? "confirmed" : "info",
       shortDescription:
-        sensitiveRobotsPaths.length > 0
+        robotsSensitiveExposure
+          ? "robots.txt references at least one sampled sensitive-looking path that returned sensitive data indicators."
+          : sensitiveRobotsPaths.length > 0
           ? `robots.txt is reachable and references ${sensitiveRobotsPaths.length} sensitive-looking path(s).`
           : robotsTxt && robotsTxt.status < 400
           ? "robots.txt is reachable on the primary origin."
@@ -5571,7 +6227,9 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
       whyItMatters:
         "robots.txt is not a direct security control, but its presence often reflects baseline operational hygiene.",
       recommendation:
-        sensitiveRobotsPaths.length > 0
+        robotsSensitiveExposure
+          ? "Remove sensitive data exposure from the reachable path, then keep robots.txt aligned with crawl policy only."
+          : sensitiveRobotsPaths.length > 0
           ? "Do not rely on robots.txt to hide sensitive paths; ensure every referenced sensitive route is protected server-side."
           : robotsTxt && robotsTxt.status < 400
           ? "Keep robots.txt aligned with the intended crawl policy."
@@ -5580,12 +6238,15 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         checkedUrl: `${primaryOrigin}/robots.txt`,
         expectedLocation: "/robots.txt",
         summary:
-          sensitiveRobotsPaths.length > 0
+          robotsSensitiveExposure
+            ? "A sampled robots.txt Disallow path exposed sensitive-looking content."
+            : sensitiveRobotsPaths.length > 0
             ? "robots.txt returned sensitive-looking Disallow entries."
             : robotsTxt && robotsTxt.status < 400
             ? "robots.txt returned a successful response."
             : "robots.txt did not return a successful response.",
         sensitiveDisallowPaths: sensitiveRobotsPaths,
+        samples: robotsPathSamples,
       },
     }),
   );
@@ -5659,14 +6320,14 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     }),
   );
 
-  const attackPathSteps = [
-    sqlErrorResult || booleanSqlResult
-      ? {
-          step: "SQL injection",
-          confidence: "confirmed",
-          evidence: sqlErrorResult?.url ?? booleanSqlResult?.url,
-        }
-      : null,
+	  const attackPathSteps = [
+	    recordExpansionSqlResult || repeatedBlindSqlResult
+	      ? {
+	          step: "SQL injection",
+	          confidence: "confirmed",
+	          evidence: recordExpansionSqlResult?.url ?? repeatedBlindSqlResult?.url,
+	        }
+	      : null,
     successfulAuthBypass
       ? {
           step: "Authentication bypass",
@@ -5824,6 +6485,13 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
   const crawledPageCount =
     artifacts.browserInspection.routeMap.pages.length ||
     (primaryPage ? 1 : 0) + artifacts.crawledPages.length;
+  await options.onProgress?.({
+    phase: "analysis",
+    message: "Prioritizing findings, calculating risk, and preparing the live report summary.",
+    percent: 86,
+    findings,
+    urlsChecked: activeProbesExecuted,
+  });
   const reportSummary = buildReportSummary({
     target: primaryAttempt.finalUrl,
     scanMode,
@@ -5851,6 +6519,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
     title: finding.title,
     riskScore: finding.riskScore ?? 0,
     priorityLabel: finding.priorityLabel ?? "Low priority",
+    recommendationLabel: getRecommendationLabel(finding),
     reason:
       "reason" in finding
         ? finding.reason
@@ -5870,7 +6539,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         `${scanMode} security scan covered ${crawledPageCount} page(s), ${apiClassifications.length} API endpoint(s), and ${inputProbeConfigs.length} tested parameter target(s).`,
       whyItMatters:
         "Coverage metrics make the scan depth explicit, separate confirmed vulnerabilities from weak signals, and show where the attack surface was actually tested.",
-      recommendation: `Start with: ${recommendedFix}`,
+      recommendation: `${reportSummary.recommendedFirstLabel}: ${recommendedFix}`,
       evidence: {
         checkedUrl: primaryAttempt.finalUrl,
         expectedLocation: "Scan coverage, browser route map, active probes, and classified attack surface",
@@ -5898,6 +6567,7 @@ export async function runSecurityScan(target: NormalizedTarget): Promise<Categor
         securityScoreBreakdown: reportSummary.security.breakdown,
         coverageConfidence: reportSummary.coverageConfidence,
         recommendedFirstFix: recommendedFix,
+        recommendedFirstLabel: reportSummary.recommendedFirstLabel,
         recommendedFirstFixId: reportSummary.recommendedFirstFix?.id ?? null,
         recommendedFirstFixReason:
           (reportSummary.recommendedFirstFix && "reason" in reportSummary.recommendedFirstFix

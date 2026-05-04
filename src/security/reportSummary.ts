@@ -8,10 +8,12 @@ import {
   calculateCoverageConfidence,
   calculateSecurityScore,
   chooseRecommendedFirstFix,
+  getRecommendationLabel,
   getTopFixes,
   isConfirmedExploitableVulnerability,
   isConfirmedSupportingEvidence,
   isLikelyHighImpactIssue,
+  type RecommendationLabel,
 } from "@/security/analysis/riskPrioritizer";
 
 export type SecurityRiskLabel = "Low Risk" | "Medium Risk" | "High Risk" | "Critical Risk";
@@ -54,6 +56,7 @@ export type ReportSummary = {
     scanDuration?: string;
   };
   recommendedFirstFix: FixRecommendation | null;
+  recommendedFirstLabel: RecommendationLabel;
   topFixes: FixRecommendation[];
   primaryAttackPath?: AttackPath | null;
   scanModeLimitations: {
@@ -165,6 +168,7 @@ export function buildReportSummary(params: {
     },
     attackSurface: params.attackSurface,
     recommendedFirstFix,
+    recommendedFirstLabel: getRecommendationLabel(recommendedFirstFix),
     topFixes,
     primaryAttackPath: params.attackPaths[0] ?? null,
     scanModeLimitations: scanModeLimitationsFor(params.scanMode),

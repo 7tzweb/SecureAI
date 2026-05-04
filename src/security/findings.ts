@@ -1,4 +1,5 @@
 import {
+  type EvidenceStrength,
   type FindingConfidence,
   type ScanFinding,
   type ScanFindingEvidence,
@@ -185,6 +186,18 @@ function hasRepeatedBlindSqlProof(evidence: ScanFindingEvidence) {
   );
 }
 
+function evidenceStrengthFrom(input: ScanFinding, evidence: ScanFindingEvidence): EvidenceStrength | undefined {
+  const candidate = input.evidenceStrength ?? evidence.evidenceStrength;
+  return candidate === "weak" || candidate === "moderate" || candidate === "strong" || candidate === "exploit-proof"
+    ? candidate
+    : undefined;
+}
+
+function falsePositiveRiskFrom(input: ScanFinding, evidence: ScanFindingEvidence): ScanFinding["falsePositiveRisk"] | undefined {
+  const candidate = input.falsePositiveRisk ?? evidence.falsePositiveRisk;
+  return candidate === "low" || candidate === "medium" || candidate === "high" ? candidate : undefined;
+}
+
 function classifyReportRole(input: ScanFinding, findingClass: SecurityFindingCategory) {
   const text = `${input.checkKey ?? ""} ${input.title} ${input.shortDescription}`.toLowerCase();
   const status = deriveFindingStatus(input);
@@ -322,6 +335,7 @@ export function calculateConfidence(finding: ScanFinding): FindingConfidence {
   const evidence = finding.evidence ?? {};
   const structuredEvidence = finding.structuredEvidence ?? evidenceFromObject(evidence);
   const status = deriveFindingStatus(finding);
+  const evidenceStrength = evidenceStrengthFrom(finding, evidence);
 
   if (status === "pass" || status === "info") {
     return confidence === "confirmed" ? "info" : confidence;
@@ -329,6 +343,19 @@ export function calculateConfidence(finding: ScanFinding): FindingConfidence {
 
   if (confidence !== "confirmed") {
     return confidence;
+  }
+
+  if (/sql injection|sqli|blind.*sql/.test(key)) {
+    if (evidenceStrength === "weak") {
+      return "info";
+    }
+    if (evidenceStrength === "moderate") {
+      return "likely";
+    }
+  }
+
+  if (/database.*error|db.*error|error disclosure/.test(key) && evidenceStrength === "weak") {
+    return "info";
   }
 
   if (/xss/.test(key) && !hasBrowserExecutionProof(evidence, structuredEvidence)) {
@@ -358,11 +385,15 @@ export function normalizeFinding(input: ScanFinding): ScanFinding {
   const maskedEvidence = maskEvidenceValue(input.evidence ?? {}) as ScanFindingEvidence;
   const structuredEvidence = input.structuredEvidence ?? evidenceFromObject(maskedEvidence);
   const findingClass = input.findingClass ?? inferFindingClass(input);
+  const evidenceStrength = evidenceStrengthFrom(input, maskedEvidence);
+  const falsePositiveRisk = falsePositiveRiskFrom(input, maskedEvidence);
   const confidence = calculateConfidence({
     ...input,
     evidence: maskedEvidence,
     structuredEvidence,
     findingClass,
+    evidenceStrength,
+    falsePositiveRisk,
   });
   const proofSummary =
     input.proofSummary ??
@@ -414,6 +445,8 @@ export function normalizeFinding(input: ScanFinding): ScanFinding {
     ...input,
     findingClass,
     confidence,
+    evidenceStrength,
+    falsePositiveRisk,
     computedRiskSeverity,
     scoringTags,
     evidence: maskedEvidence,
@@ -429,11 +462,15 @@ export function normalizeFinding(input: ScanFinding): ScanFinding {
     ...input,
     status,
     confidence,
+    evidenceStrength,
+    falsePositiveRisk,
     findingClass,
     computedRiskSeverity,
     scoringTags,
     evidence: {
       ...maskedEvidence,
+      evidenceStrength,
+      falsePositiveRisk,
       proofSummary,
       riskScore: risk.riskScore,
       priorityLabel: risk.priorityLabel,

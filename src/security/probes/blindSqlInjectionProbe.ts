@@ -1,12 +1,27 @@
-import { createHash } from "node:crypto";
 import { loadAttempt } from "@/server/scans/helpers";
+import {
+  buildSqlResponseSignature,
+  classifyParameter,
+  highDynamicResponseSignal,
+  responseDiffDimensions,
+  type ParameterContext,
+} from "@/security/probes/sqlEvidence";
 
 export type ResponseSignature = {
   status: number;
+  contentType: string;
   length: number;
   normalizedHash: string;
+  stableTextHash: string;
+  lengthBucket: string;
+  stableTextLength: number;
   jsonShape?: string[];
   recordCount?: number | null;
+  importantTokens: string[];
+  isCaptchaOrBotPage?: boolean;
+  isLoginPage?: boolean;
+  isSearchPage?: boolean;
+  isRedirectValidationPage?: boolean;
   responseClass: string;
   durationMs: number;
 };
@@ -15,6 +30,7 @@ export type BlindSqlProbeResult = {
   url: string;
   method: string;
   parameter: string;
+  parameterContext?: ParameterContext;
   technique: "boolean" | "time" | "content-diff" | "status-diff" | "record-count-diff";
   baseline: ResponseSignature[];
   trueCondition?: ResponseSignature[];
@@ -25,6 +41,8 @@ export type BlindSqlProbeResult = {
   controlMedianMs?: number;
   confidence: "INFO" | "LIKELY" | "CONFIRMED";
   evidenceSummary: string;
+  evidenceStrength?: "weak" | "moderate" | "strong" | "exploit-proof";
+  falsePositiveRisk?: "low" | "medium" | "high";
 };
 
 function median(values: number[]) {
@@ -43,13 +61,6 @@ function responseClass(status: number) {
   if (status === 404) return "not-found";
   if (status >= 500) return "server-error";
   return "client-error";
-}
-
-function normalizedHash(body: string) {
-  return createHash("sha256")
-    .update(body.replace(/\b\d{10,}\b/g, "0").replace(/\s+/g, " ").trim().slice(0, 80_000))
-    .digest("hex")
-    .slice(0, 16);
 }
 
 function parseJson(body: string) {
@@ -110,12 +121,27 @@ async function signature(url: string, headers: HeadersInit | undefined, timeoutM
     return null;
   }
   const parsed = parseJson(attempt.bodyText);
+  const sqlSignature = buildSqlResponseSignature({
+    status: attempt.status,
+    contentType: attempt.headers["content-type"] ?? "",
+    bodyText: attempt.bodyText,
+    url,
+  });
   return {
     status: attempt.status,
-    length: attempt.bodyText.length,
-    normalizedHash: normalizedHash(attempt.bodyText),
+    contentType: sqlSignature.contentType,
+    length: sqlSignature.stableTextLength,
+    normalizedHash: sqlSignature.normalizedHash,
+    stableTextHash: sqlSignature.stableTextHash,
+    lengthBucket: sqlSignature.lengthBucket,
+    stableTextLength: sqlSignature.stableTextLength,
     jsonShape: parsed ? jsonShape(parsed).slice(0, 40) : undefined,
-    recordCount: recordCount(attempt.bodyText),
+    recordCount: sqlSignature.recordCount ?? recordCount(attempt.bodyText),
+    importantTokens: sqlSignature.importantTokens,
+    isCaptchaOrBotPage: sqlSignature.isCaptchaOrBotPage,
+    isLoginPage: sqlSignature.isLoginPage,
+    isSearchPage: sqlSignature.isSearchPage,
+    isRedirectValidationPage: sqlSignature.isRedirectValidationPage,
     responseClass: responseClass(attempt.status),
     durationMs: attempt.totalDurationMs ?? attempt.durationMs,
   };
@@ -127,24 +153,17 @@ function stableDifference(left: ResponseSignature[], right: ResponseSignature[])
   }
   const leftFirst = left[0];
   const rightFirst = right[0];
-  let dimensions = 0;
-  if (left.every((entry) => entry.status === leftFirst.status) && right.every((entry) => entry.status === rightFirst.status) && leftFirst.status !== rightFirst.status) {
-    dimensions += 1;
-  }
-  if (
-    leftFirst.recordCount !== null &&
-    rightFirst.recordCount !== null &&
-    Math.abs((leftFirst.recordCount ?? 0) - (rightFirst.recordCount ?? 0)) >= 3
-  ) {
-    dimensions += 1;
-  }
-  if (Math.abs(median(left.map((entry) => entry.length)) - median(right.map((entry) => entry.length))) > 800) {
-    dimensions += 1;
-  }
-  if (leftFirst.normalizedHash !== rightFirst.normalizedHash) {
-    dimensions += 1;
-  }
-  return dimensions;
+  const dimensions = responseDiffDimensions(leftFirst, rightFirst).filter((dimension) => {
+    const noisyHtml =
+      leftFirst.isCaptchaOrBotPage ||
+      rightFirst.isCaptchaOrBotPage ||
+      leftFirst.isLoginPage ||
+      rightFirst.isLoginPage ||
+      leftFirst.isRedirectValidationPage ||
+      rightFirst.isRedirectValidationPage;
+    return !noisyHtml || (dimension !== "stable-text" && dimension !== "length-bucket");
+  });
+  return dimensions.length;
 }
 
 export async function runBlindSqlInjectionProbe(input: {
@@ -161,6 +180,8 @@ export async function runBlindSqlInjectionProbe(input: {
   const results: BlindSqlProbeResult[] = [];
 
   for (const config of input.configs.slice(0, input.maxParameters ?? (mode === "Deep" ? 6 : 4))) {
+    const parameterContext = classifyParameter(config.parameter, config.url);
+    const lowSqlContext = parameterContext === "redirect" || parameterContext === "auth-flow" || parameterContext === "tracking";
     const headers = input.headersFor?.(config.url);
     const baselineUrls = Array.from({ length: repeats }, () => applyParameter(config.url, config.parameter, "fixnx_sql_baseline"));
     const trueUrls = Array.from({ length: repeats }, () => applyParameter(config.url, config.parameter, "' OR 1=1--"));
@@ -178,23 +199,58 @@ export async function runBlindSqlInjectionProbe(input: {
     const controlRows = control.filter((entry): entry is ResponseSignature => Boolean(entry));
     const trueFalseDimensions = stableDifference(trueRows, falseRows);
     const baselineControlDimensions = stableDifference(baselineRows, controlRows);
-    const confirmed = trueRows.length >= 2 && falseRows.length >= 2 && trueFalseDimensions >= 2 && baselineControlDimensions <= 1;
+    const highDynamic = [...baselineRows, ...trueRows, ...falseRows, ...controlRows].some((row) =>
+      highDynamicResponseSignal({
+        url: config.url,
+        bodyText: row.importantTokens?.join(" ") ?? "",
+        signature: {
+          status: row.status,
+          contentType: row.contentType,
+          normalizedHash: row.normalizedHash,
+          stableTextHash: row.stableTextHash,
+          lengthBucket: row.lengthBucket,
+          importantTokens: row.importantTokens ?? [],
+          recordCount: row.recordCount,
+          jsonShape: row.jsonShape,
+          isCaptchaOrBotPage: row.isCaptchaOrBotPage,
+          isLoginPage: row.isLoginPage,
+          isSearchPage: row.isSearchPage,
+          isRedirectValidationPage: row.isRedirectValidationPage,
+          stableTextLength: row.length,
+        },
+      }).highDynamic,
+    );
+    const confirmed =
+      !lowSqlContext &&
+      trueRows.length >= 2 &&
+      falseRows.length >= 2 &&
+      trueFalseDimensions >= 2 &&
+      baselineControlDimensions <= 1;
+    const likely = !lowSqlContext && !highDynamic && trueFalseDimensions >= 2;
+    const contextNote = lowSqlContext
+      ? " Parameter appears to control redirect/auth/tracking flow; response differences are treated as validation behavior, not SQL injection proof."
+      : highDynamic
+        ? " The response surface is highly dynamic, so weak content differences were suppressed."
+        : "";
 
     results.push({
       url: config.url,
       method: "GET",
       parameter: config.parameter,
+      parameterContext,
       technique: trueFalseDimensions >= 2 ? "boolean" : trueFalseDimensions === 1 ? "content-diff" : "boolean",
       baseline: baselineRows,
       trueCondition: trueRows,
       falseCondition: falseRows,
       control: controlRows,
-      confidence: confirmed ? "CONFIRMED" : trueFalseDimensions >= 1 ? "LIKELY" : "INFO",
+      confidence: confirmed ? "CONFIRMED" : likely ? "LIKELY" : "INFO",
       evidenceSummary: confirmed
         ? `Boolean true/false payloads were stable across repeated probes in ${trueFalseDimensions} dimensions.`
-        : trueFalseDimensions >= 1
-          ? "Boolean payloads showed a difference, but repeated proof was not strong enough to confirm exploitability."
-          : "No stable boolean blind SQL behavior was observed.",
+        : likely
+          ? "Boolean payloads showed a multi-dimension difference, but repeated proof was not strong enough to confirm exploitability."
+          : `No stable boolean blind SQL behavior was observed.${contextNote}`,
+      evidenceStrength: confirmed ? "strong" : likely ? "moderate" : "weak",
+      falsePositiveRisk: lowSqlContext || highDynamic ? "high" : trueFalseDimensions > 0 ? "medium" : "low",
     });
 
     if (!includeTime) {
@@ -218,6 +274,7 @@ export async function runBlindSqlInjectionProbe(input: {
       url: config.url,
       method: "GET",
       parameter: config.parameter,
+      parameterContext,
       technique: "time",
       baseline: baselineRows,
       control: controlRows,
@@ -225,10 +282,14 @@ export async function runBlindSqlInjectionProbe(input: {
       baselineMedianMs,
       testMedianMs,
       controlMedianMs,
-      confidence: timeConfirmed ? "CONFIRMED" : testMedianMs >= baselineMedianMs + threshold ? "LIKELY" : "INFO",
+      confidence: lowSqlContext ? "INFO" : timeConfirmed ? "CONFIRMED" : testMedianMs >= baselineMedianMs + threshold ? "LIKELY" : "INFO",
       evidenceSummary: timeConfirmed
         ? "Time-based delay was stable across repeated baseline/control/test probes."
-        : "No stable time-based blind SQL delay was confirmed.",
+        : lowSqlContext
+          ? "No time-based blind SQL delay was confirmed. Parameter context is redirect/auth/tracking, so validation behavior is not treated as SQLi."
+          : "No stable time-based blind SQL delay was confirmed.",
+      evidenceStrength: timeConfirmed ? "strong" : "weak",
+      falsePositiveRisk: lowSqlContext ? "high" : "medium",
     });
   }
 

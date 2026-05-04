@@ -7,6 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint . --max-warnings=0",
+    "test:sql-evidence": "tsx scripts/sql-evidence-regression.ts",
+    "test:report-prioritization": "tsx scripts/report-prioritization-regression.ts",
     "typecheck": "tsc --noEmit",
     "worker": "tsx src/server/worker/index.ts"
   },

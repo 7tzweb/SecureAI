@@ -122,6 +122,22 @@ function isSupportingFinding(finding: ScanFinding) {
   return finding.isExploitSupportingEvidence === true || /authenticated session context|protected api access/.test(key);
 }
 
+function evidenceIsWeak(finding: ScanFinding) {
+  return finding.evidenceStrength === "weak" || finding.evidence?.evidenceStrength === "weak";
+}
+
+function directlyProvesHighImpact(finding: ScanFinding, gained: string[]) {
+  const key = `${finding.checkKey ?? ""} ${finding.title}`.toLowerCase();
+  return (
+    finding.dataExposure === true ||
+    gained.includes("authenticated_context") ||
+    gained.includes("cross_user_data_access") ||
+    gained.includes("browser_code_execution") ||
+    gained.includes("admin_surface_access") ||
+    /authentication bypass|admin compromise|sensitive data exposure|idor confirmed|xss execution confirmed/.test(key)
+  );
+}
+
 function chainOrder(entry: {
   finding: ScanFinding;
   gained: string[];
@@ -188,7 +204,7 @@ export function buildAttackPaths(findings: ScanFinding[]) {
 
   const gained = new Set<string>();
   const confirmedEntries = issues
-    .filter((entry) => entry.finding.confidence === "confirmed")
+    .filter((entry) => entry.finding.confidence === "confirmed" && !evidenceIsWeak(entry.finding))
     .sort((left, right) => chainOrder(left) - chainOrder(right));
   const confirmedChain: typeof confirmedEntries = [];
 
@@ -216,6 +232,21 @@ export function buildAttackPaths(findings: ScanFinding[]) {
     .slice(0, 4);
 
   if (confirmedChain.length + likelyExtensions.length < 2) {
+    return [];
+  }
+
+  const confirmedVulnerabilitySteps = confirmedChain.filter((entry) => !isSupportingFinding(entry.finding));
+  const hasStrongLikelyExtension = likelyExtensions.some(
+    (entry) =>
+      !evidenceIsWeak(entry.finding) &&
+      (entry.finding.severity === "high" || entry.finding.severity === "critical" || (entry.finding.riskScore ?? 0) >= 70),
+  );
+  const hasDirectImpact = confirmedVulnerabilitySteps.some((entry) => directlyProvesHighImpact(entry.finding, entry.gained));
+  if (
+    confirmedVulnerabilitySteps.length < 2 &&
+    !hasDirectImpact &&
+    !(confirmedVulnerabilitySteps.length === 1 && confirmedVulnerabilitySteps[0]?.finding.severity === "critical" && hasStrongLikelyExtension)
+  ) {
     return [];
   }
 

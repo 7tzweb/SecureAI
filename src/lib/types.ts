@@ -3,7 +3,26 @@ export const severityLevels = ["info", "low", "medium", "high", "critical"] as c
 export const findingStatuses = ["pass", "info", "warning", "fail"] as const;
 export const findingConfidences = ["confirmed", "likely", "medium", "low", "info"] as const;
 export const categoryRunStatuses = ["queued", "running", "completed", "failed"] as const;
-export const scanStatuses = ["queued", "running", "partial", "completed", "failed"] as const;
+export const scanStatuses = [
+  "queued",
+  "initializing",
+  "running",
+  "partial-results",
+  "analyzing",
+  "generating-report",
+  "partial",
+  "completed",
+  "failed",
+] as const;
+export const scanPhases = [
+  "init",
+  "fast-baseline",
+  "attack-surface",
+  "browser-render",
+  "active-probes",
+  "analysis",
+  "report",
+] as const;
 export const securityFindingCategories = [
   "injection",
   "xss",
@@ -42,9 +61,11 @@ export type FindingStatus = (typeof findingStatuses)[number];
 export type FindingConfidence = (typeof findingConfidences)[number];
 export type CategoryRunStatus = (typeof categoryRunStatuses)[number];
 export type ScanStatus = (typeof scanStatuses)[number];
+export type ScanPhase = (typeof scanPhases)[number];
 export type ScanMode = "Fast" | "Deep" | "Authenticated";
 export type SecurityFindingCategory = (typeof securityFindingCategories)[number];
 export type EvidenceType = (typeof evidenceTypes)[number];
+export type EvidenceStrength = "weak" | "moderate" | "strong" | "exploit-proof";
 export type SubscriptionStatus = "free" | "premium";
 export type EntitlementLevel = "free" | "premium";
 
@@ -113,6 +134,25 @@ export interface ScanRecord {
   createdAt: string;
   updatedAt: string;
   status: ScanStatus;
+  currentPhase?: ScanPhase;
+  partialSummary?: {
+    securityScore?: number;
+    securityRiskLabel?: string;
+    confirmedCount?: number;
+    likelyCount?: number;
+    warningCount?: number;
+    infoCount?: number;
+    firstFix?: string;
+  };
+  phaseTimings?: Array<{
+    phase: ScanPhase;
+    startedAt: string;
+    endedAt?: string;
+    durationMs?: number;
+    findingsAdded?: number;
+    urlsChecked?: number;
+    errors?: number;
+  }>;
   scanMode?: ScanMode;
   progress: number;
   overallScore: number | null;
@@ -138,6 +178,8 @@ export interface ScanFinding {
   computedRiskSeverity?: Severity;
   scoringTags?: string[];
   confidence?: FindingConfidence;
+  evidenceStrength?: EvidenceStrength;
+  falsePositiveRisk?: "low" | "medium" | "high";
   scoreWeight?: number;
   shortDescription: string;
   whyItMatters: string;

@@ -1,4 +1,4 @@
-import { type ScanFinding } from "@/lib/types";
+import { type ScanFinding, type ScanPhase } from "@/lib/types";
 import type { ScanMode } from "@/lib/types";
 
 export interface NormalizedTarget {
@@ -45,4 +45,18 @@ export interface PageContext {
 export interface CategoryScanResult {
   findings: ScanFinding[];
   score: number;
+}
+
+export interface ScanProgressUpdate {
+  phase: ScanPhase;
+  message: string;
+  percent?: number;
+  findings?: ScanFinding[];
+  score?: number | null;
+  urlsChecked?: number;
+  errors?: number;
+}
+
+export interface ScanRunOptions {
+  onProgress?: (update: ScanProgressUpdate) => Promise<void> | void;
 }

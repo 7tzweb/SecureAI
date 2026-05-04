@@ -51,9 +51,12 @@ export type GroupedFix = {
   affectedUrls: string[];
   reason: string;
   recommendation: string;
+  confidence: FindingConfidence;
+  isFixableVulnerability: boolean;
 };
 
 export type FixRecommendation = ScanFinding | GroupedFix;
+export type RecommendationLabel = "Recommended first fix" | "Recommended first review";
 
 const severityScores: Record<Severity, number> = {
   info: 0,
@@ -73,6 +76,16 @@ const confidenceScores: Record<FindingConfidence, number> = {
 
 function effectiveSeverity(finding: ScanFinding) {
   return finding.computedRiskSeverity ?? finding.severity;
+}
+
+function effectiveEvidenceStrength(finding: ScanFinding) {
+  const evidenceStrength = finding.evidenceStrength ?? finding.evidence?.evidenceStrength;
+  return evidenceStrength === "weak" ||
+    evidenceStrength === "moderate" ||
+    evidenceStrength === "strong" ||
+    evidenceStrength === "exploit-proof"
+    ? evidenceStrength
+    : undefined;
 }
 
 export function severityScore(severity: Severity) {
@@ -185,7 +198,8 @@ export function calculateFindingRisk(finding: ScanFinding) {
             : 3;
   const headerOnly = finding.findingClass === "headers" || /header|hsts|csp|frame|referrer|permissions/i.test(finding.checkKey ?? finding.title);
   const attackPathWeight = finding.attackPathParticipant || evidence.attackPathParticipant === true ? 4 : 0;
-  const score = calculateRiskScore({
+  const evidenceStrength = effectiveEvidenceStrength(finding);
+  let score = calculateRiskScore({
     severityScore: severityScore(severity),
     confidenceScore: confidenceScore(confidence),
     exploitabilityScore: clamp(exploitability, 0, 10),
@@ -199,6 +213,12 @@ export function calculateFindingRisk(finding: ScanFinding) {
     severity,
     confidence,
   });
+
+  if (evidenceStrength === "weak") {
+    score = Math.min(score * 0.5, 45);
+  } else if (evidenceStrength === "moderate") {
+    score = Math.min(score * 0.75, confidence === "confirmed" ? 70 : 62);
+  }
 
   return {
     exploitabilityScore: clamp(exploitability, 0, 10),
@@ -313,10 +333,41 @@ function isLikelyIssue(finding: ScanFinding) {
   return (finding.confidence ?? "info") === "likely" && statusIsIssue(finding);
 }
 
+function isConfirmedFixableRecommendation(item: FixRecommendation) {
+  return item.confidence === "confirmed" && item.isFixableVulnerability === true;
+}
+
+export function getRecommendationLabel(item: FixRecommendation | null | undefined): RecommendationLabel {
+  return item && isConfirmedFixableRecommendation(item)
+    ? "Recommended first fix"
+    : "Recommended first review";
+}
+
 function isHeaderFinding(finding: ScanFinding) {
   return finding.findingClass === "headers" || /header|hsts|content-security-policy|x-frame|clickjacking|content-type|referrer|permissions/i.test(
     `${finding.checkKey ?? ""} ${finding.title}`,
   );
+}
+
+function evidenceNumber(finding: ScanFinding, key: string) {
+  const value = finding.evidence?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function evidenceBoolean(finding: ScanFinding, key: string) {
+  return finding.evidence?.[key] === true;
+}
+
+function evidenceStringArray(finding: ScanFinding, key: string) {
+  const value = finding.evidence?.[key];
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
+function evidenceRecordArray(finding: ScanFinding, key: string) {
+  const value = finding.evidence?.[key];
+  return Array.isArray(value)
+    ? value.filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === "object" && !Array.isArray(entry)))
+    : [];
 }
 
 function hasOnlyUpgradeInsecureRequests(value: string) {
@@ -379,10 +430,44 @@ function buildSecurityContext(findings: ScanFinding[], attackSurface?: { crawled
     Boolean(uploadFinding) &&
     (statusIsIssue(uploadFinding!) ||
       /upload form signals|upload-oriented surfaces were detected|multipart|wpforms/.test(fullFindingText(uploadFinding!)));
+  const uploadGroupingSignal =
+    Boolean(uploadFinding) &&
+    statusIsIssue(uploadFinding!) &&
+    (evidenceNumber(uploadFinding!, "uploadFormCount") > 0 ||
+      evidenceNumber(uploadFinding!, "uploadRouteCount") > 0 ||
+      evidenceRecordArray(uploadFinding!, "uploadForms").length > 0 ||
+      evidenceRecordArray(uploadFinding!, "uploadRoutes").length > 0 ||
+      /upload form signals|upload-oriented surfaces were detected|multipart|wpforms/.test(fullFindingText(uploadFinding!)));
   const xssIndicators =
     Boolean(xssFinding && statusIsIssue(xssFinding)) ||
     reflectedInputCount > 0 ||
     Boolean(reflectedFinding && statusIsIssue(reflectedFinding));
+  const sensitiveFormSignal =
+    findings.some((finding) => {
+      const text = fullFindingText(finding);
+      return (
+        statusIsIssue(finding) &&
+        (/(csrf-protection-sensitive-forms|sensitive form|form handling)/.test(text) ||
+          evidenceNumber(finding, "sensitiveFormCount") > 0 ||
+          evidenceRecordArray(finding, "sensitiveForms").length > 0) &&
+        !/no sensitive forms were detected|sensitiveformcount":0|sensitiveFormCount":0/i.test(text)
+      );
+    });
+  const passwordGroupingSignal =
+    Boolean(passwordFinding) &&
+    statusIsIssue(passwordFinding!) &&
+    (evidenceNumber(passwordFinding!, "passwordFormCount") > 0 ||
+      evidenceRecordArray(passwordFinding!, "passwordForms").length > 0 ||
+      /password input|password forms were evaluated|sampled password forms expose/i.test(fullFindingText(passwordFinding!))) &&
+    !/no password fields were detected|no password input was captured|passwordformcount":0|passwordFormCount":0/i.test(fullFindingText(passwordFinding!));
+  const appOwnedLoginFormSignal =
+    Boolean(authSurfaceFinding) &&
+    statusIsIssue(authSurfaceFinding!) &&
+    !evidenceBoolean(authSurfaceFinding!, "hostedProviderOnlyAuthSurface") &&
+    (evidenceNumber(authSurfaceFinding!, "passwordFormCount") > 0 ||
+      evidenceNumber(authSurfaceFinding!, "authRouteCount") > 0 ||
+      evidenceStringArray(authSurfaceFinding!, "routeMapSignals").length > 0 ||
+      /app-owned login|sampled authentication surfaces expose|auth surfaces looked/.test(fullFindingText(authSurfaceFinding!)));
   const sensitiveEndpointProtected =
     Boolean(sensitiveEndpointFinding) &&
     /protected rather than openly exposed|401|403|405|explicitly protected/.test(fullFindingText(sensitiveEndpointFinding!));
@@ -409,6 +494,10 @@ function buildSecurityContext(findings: ScanFinding[], attackSurface?: { crawled
   const securityTxtMissing = Boolean(securityTxtFinding && /not found|missing|not reachable/.test(fullFindingText(securityTxtFinding)));
 
   const wordpressDetected = /wordpress|wp-content|wp-includes|wpforms|wp-json/.test(allText);
+  const highDynamicPlatform =
+    /hostedprovideronlyauthsurface|hosted authentication-provider|search-provider-server|auth-provider-flow|dynamic-nonce-heavy-page|servicelogin|weblitesignin|server is set to \\"gws\\"|server is set to "gws"/.test(
+      allText,
+    );
   const wordpressExactVersionExposed = /wordpress\s+\d+(?:\.\d+){1,3}/.test(allText);
   const phpVersionExposed = /x-powered-by[^"]*php|php\/?\d+(?:\.\d+){1,3}|php\s+\d+(?:\.\d+){1,3}/.test(allText);
   const versionExposure = wordpressExactVersionExposed || phpVersionExposed || Boolean(techFinding && hasTag(techFinding, "version-exposure")) || Boolean(poweredByFinding && statusIsIssue(poweredByFinding));
@@ -435,6 +524,10 @@ function buildSecurityContext(findings: ScanFinding[], attackSurface?: { crawled
     passwordFieldWeakness,
     passwordFormDetected,
     uploadFormDetected,
+    uploadGroupingSignal,
+    sensitiveFormSignal,
+    passwordGroupingSignal,
+    appOwnedLoginFormSignal,
     xssIndicators,
     sensitiveEndpointProtected,
     sensitiveEndpointReachable,
@@ -452,6 +545,7 @@ function buildSecurityContext(findings: ScanFinding[], attackSurface?: { crawled
     missingReferrer,
     securityTxtMissing,
     wordpressDetected,
+    highDynamicPlatform,
     wordpressExactVersionExposed,
     phpVersionExposed,
     versionExposure,
@@ -474,8 +568,9 @@ function buildSecurityContext(findings: ScanFinding[], attackSurface?: { crawled
 
 export function scoreFixCandidate(finding: ScanFinding, attackPaths: AttackPath[] = []) {
   let score = finding.riskScore ?? 0;
+  const evidenceStrength = effectiveEvidenceStrength(finding);
 
-  if (finding.confidence === "confirmed") score += 20;
+  if (finding.confidence === "confirmed" && evidenceStrength !== "weak") score += 20;
   if (finding.confidence === "likely") score += 5;
 
   const severity = effectiveSeverity(finding);
@@ -517,6 +612,12 @@ export function scoreFixCandidate(finding: ScanFinding, attackPaths: AttackPath[
     score -= 10;
   }
 
+  if (evidenceStrength === "weak") {
+    score -= 20;
+  } else if (evidenceStrength === "moderate") {
+    score -= 6;
+  }
+
   return score;
 }
 
@@ -538,7 +639,7 @@ function groupedFixes(findings: ScanFinding[]): GroupedFix[] {
       context.clickjackingFinding,
       context.reflectedFinding,
       context.xssFinding,
-      context.uploadFinding,
+      context.uploadGroupingSignal ? context.uploadFinding : undefined,
     );
     const riskScore =
       context.wordpressDetected || context.passwordFieldWeakness || context.missingFrameProtection ? 72 : 64;
@@ -547,12 +648,14 @@ function groupedFixes(findings: ScanFinding[]): GroupedFix[] {
       title: "Harden authentication and form attack surface",
       riskScore,
       priorityLabel: groupedFixPriorityLabel(riskScore),
-      findings: related.map((finding) => finding.title),
+      findings: related.map((finding) => finding.id),
       affectedUrls: related.flatMap(findingUrlList).slice(0, 10),
       reason:
         "Login and form endpoints are high-value attack surfaces. The scan found baseline weaknesses, reflected/form signals, or coverage limits that make lower-level header fixes too narrow as the first action.",
       recommendation:
         "Review authentication routes, enforce anti-framing, verify CSRF protection, validate form handling, harden password pages, and run a Deep or Authenticated scan for proof-level authorization checks.",
+      confidence: "likely",
+      isFixableVulnerability: false,
     });
   }
 
@@ -561,32 +664,49 @@ function groupedFixes(findings: ScanFinding[]): GroupedFix[] {
     const riskScore = context.reflectedInputCount >= 5 || context.weakCsp ? 68 : 58;
     groups.push({
       id: "xss-reflection-review",
-      title: "Investigate reflected input and XSS indicators",
+      title: context.weakCsp
+        ? "Review unconfirmed reflected input indicators and CSP/header hardening"
+        : "Review unconfirmed reflected input indicators",
       riskScore,
       priorityLabel: groupedFixPriorityLabel(riskScore),
-      findings: related.map((finding) => finding.title),
+      findings: related.map((finding) => finding.id),
       affectedUrls: related.flatMap(findingUrlList).slice(0, 10),
       reason:
-        "Reflected input and XSS indicators were observed but execution was not proven. They should be reviewed together with output encoding and CSP strength.",
+        "The scanner observed reflected input or DOM patterns, but active XSS probes did not confirm browser execution. Review output encoding and CSP posture for defense-in-depth.",
       recommendation:
         "Review reflected parameters by output context, add regression tests, encode untrusted values, and strengthen CSP with script-src, object-src, base-uri, and frame-ancestors directives.",
+      confidence: "likely",
+      isFixableVulnerability: false,
     });
   }
 
-  if (context.uploadFormDetected) {
-    const related = collect(context.uploadFinding, context.xssFinding, context.reflectedFinding);
+  if (
+    context.uploadGroupingSignal ||
+    context.sensitiveFormSignal ||
+    context.passwordGroupingSignal ||
+    context.appOwnedLoginFormSignal
+  ) {
+    const related = collect(
+      context.uploadFinding,
+      context.authSurfaceFinding,
+      context.passwordFinding,
+      context.xssFinding,
+      context.reflectedFinding,
+    );
     const riskScore = context.wordpressDetected || context.xssIndicators ? 64 : 54;
     groups.push({
       id: "upload-form-handling-review",
       title: "Review upload and form handling protections",
       riskScore,
       priorityLabel: groupedFixPriorityLabel(riskScore),
-      findings: related.map((finding) => finding.title),
+      findings: related.map((finding) => finding.id),
       affectedUrls: related.flatMap(findingUrlList).slice(0, 10),
       reason:
         "Upload and form surfaces can become high-impact when validation, CSRF, output encoding, or storage handling is weak.",
       recommendation:
         "Validate uploads server-side, restrict allowed file types, require CSRF protection, keep forms same-origin over HTTPS, and review rendering of submitted content.",
+      confidence: "likely",
+      isFixableVulnerability: false,
     });
   }
 
@@ -598,12 +718,14 @@ function groupedFixes(findings: ScanFinding[]): GroupedFix[] {
       title: "Fix browser-rendered crawl coverage",
       riskScore,
       priorityLabel: groupedFixPriorityLabel(riskScore),
-      findings: related.map((finding) => finding.title),
+      findings: related.map((finding) => finding.id),
       affectedUrls: related.flatMap(findingUrlList).slice(0, 10),
       reason:
         "The scan had limited browser-rendered coverage, so JavaScript-only routes, login states, and stored-content render locations may be under-tested.",
       recommendation:
         "Enable Playwright rendering in the scan environment, confirm the target can load in Chromium, and rerun with authenticated contexts for protected surfaces.",
+      confidence: "info",
+      isFixableVulnerability: false,
     });
   }
 
@@ -615,12 +737,14 @@ function groupedFixes(findings: ScanFinding[]): GroupedFix[] {
       title: "Strengthen security headers and anti-framing controls",
       riskScore,
       priorityLabel: groupedFixPriorityLabel(riskScore),
-      findings: related.map((finding) => finding.title),
+      findings: related.map((finding) => finding.id),
       affectedUrls: related.flatMap(findingUrlList).slice(0, 10),
       reason:
         "Browser security headers are baseline protections. They become more important when login, form, upload, or reflected-input surfaces are present.",
       recommendation:
         "Add strong iframe protection, HSTS, X-Content-Type-Options, Referrer-Policy, and a meaningful CSP rather than a CSP that only upgrades insecure requests.",
+      confidence: "info",
+      isFixableVulnerability: false,
     });
   }
 
@@ -642,9 +766,43 @@ function scoreFixRecommendation(fix: FixRecommendation, attackPaths: AttackPath[
   return scoreFixCandidate(fix, attackPaths);
 }
 
+function isRobotsTopFixEligible(finding: ScanFinding) {
+  if (!/robots/.test(`${finding.id} ${finding.checkKey ?? ""} ${finding.title}`.toLowerCase())) {
+    return true;
+  }
+
+  return evidenceRecordArray(finding, "samples").some((sample) => {
+    return (
+      sample.disallowPathSampled === true &&
+      sample.reachable === true &&
+      sample.sensitiveDataObserved === true
+    );
+  });
+}
+
+function isCookieTopFixEligible(finding: ScanFinding) {
+  const text = `${finding.id} ${finding.checkKey ?? ""} ${finding.title}`.toLowerCase();
+  if (!/cookie|session-handling/.test(text)) {
+    return true;
+  }
+
+  const sensitiveCookies = evidenceStringArray(finding, "sensitiveCookies");
+  const missingSensitive =
+    evidenceStringArray(finding, "sensitiveMissing").length +
+    evidenceStringArray(finding, "missingSecure").length +
+    evidenceStringArray(finding, "missingHttpOnly").length +
+    evidenceStringArray(finding, "missingSameSite").length;
+
+  return sensitiveCookies.length > 0 && missingSensitive > 0;
+}
+
+function isTopFixEligibleFinding(finding: ScanFinding) {
+  return isRobotsTopFixEligible(finding) && isCookieTopFixEligible(finding);
+}
+
 export function chooseRecommendedFirstFix(findings: ScanFinding[], attackPaths: AttackPath[] = []): FixRecommendation | null {
   const confirmedConcrete = [...findings]
-    .filter((finding) => isConcreteFixableFinding(finding) && finding.confidence === "confirmed")
+    .filter((finding) => isConcreteFixableFinding(finding) && finding.confidence === "confirmed" && effectiveEvidenceStrength(finding) !== "weak")
     .sort((left, right) => scoreFixCandidate(right, attackPaths) - scoreFixCandidate(left, attackPaths))[0];
 
   if (confirmedConcrete) {
@@ -656,25 +814,40 @@ export function chooseRecommendedFirstFix(findings: ScanFinding[], attackPaths: 
 
 export function getTopFixes(findings: ScanFinding[], attackPaths: AttackPath[] = [], limit = 5): FixRecommendation[] {
   const concrete = [...findings]
-    .filter(isConcreteFixableFinding)
-    .sort((left, right) => scoreFixCandidate(right, attackPaths) - scoreFixCandidate(left, attackPaths))
-    .slice(0, limit);
+    .filter((finding) => isConcreteFixableFinding(finding) && isTopFixEligibleFinding(finding))
+    .sort((left, right) => scoreFixCandidate(right, attackPaths) - scoreFixCandidate(left, attackPaths));
   const groups = groupedFixes(findings);
   const hasConfirmedConcrete = concrete.some((finding) => finding.confidence === "confirmed");
+  const candidates =
+    !hasConfirmedConcrete && groups.length > 0
+      ? ([...groups, ...concrete] as FixRecommendation[])
+      : ([...groups, ...concrete] as FixRecommendation[]).sort(
+          (left, right) => scoreFixRecommendation(right, attackPaths) - scoreFixRecommendation(left, attackPaths),
+        );
+  const selected: FixRecommendation[] = [];
+  const coveredFindingIds = new Set<string>();
 
-  if (!hasConfirmedConcrete && groups.length > 0) {
-    return [...groups, ...concrete].slice(0, limit);
+  for (const candidate of candidates) {
+    if (isGroupedFix(candidate)) {
+      selected.push(candidate);
+      candidate.findings.forEach((findingId) => coveredFindingIds.add(findingId));
+    } else if (!coveredFindingIds.has(candidate.id)) {
+      selected.push(candidate);
+    }
+
+    if (selected.length >= limit) {
+      break;
+    }
   }
 
-  return [...groups, ...concrete]
-    .sort((left, right) => scoreFixRecommendation(right, attackPaths) - scoreFixRecommendation(left, attackPaths))
-    .slice(0, limit);
+  return selected;
 }
 
 export function isConfirmedExploitableVulnerability(finding: ScanFinding): boolean {
   return (
     isFixableOrInferred(finding) &&
-    finding.confidence === "confirmed" &&
+	    finding.confidence === "confirmed" &&
+	    effectiveEvidenceStrength(finding) !== "weak" &&
     deriveFindingStatus(finding) === "fail" &&
     finding.isMetaFinding !== true &&
     finding.isExploitSupportingEvidence !== true &&
@@ -804,22 +977,25 @@ export function calculateSecurityScore(
   const confirmedConcreteCritical = findings.filter(
     (finding) =>
       isFixableOrInferred(finding) &&
-      finding.confidence === "confirmed" &&
-      effectiveSeverity(finding) === "critical" &&
+	      finding.confidence === "confirmed" &&
+	      effectiveEvidenceStrength(finding) !== "weak" &&
+	      effectiveSeverity(finding) === "critical" &&
       isConcreteFixableFinding(finding),
   );
   const confirmedConcreteHigh = findings.filter(
     (finding) =>
       isFixableOrInferred(finding) &&
-      finding.confidence === "confirmed" &&
-      effectiveSeverity(finding) === "high" &&
+	      finding.confidence === "confirmed" &&
+	      effectiveEvidenceStrength(finding) !== "weak" &&
+	      effectiveSeverity(finding) === "high" &&
       isConcreteFixableFinding(finding),
   );
   const confirmedConcreteMedium = findings.filter(
     (finding) =>
       isFixableOrInferred(finding) &&
-      finding.confidence === "confirmed" &&
-      effectiveSeverity(finding) === "medium" &&
+	      finding.confidence === "confirmed" &&
+	      effectiveEvidenceStrength(finding) !== "weak" &&
+	      effectiveSeverity(finding) === "medium" &&
       isConcreteFixableFinding(finding),
   );
   const likelyIssues = findings.filter((finding) =>
@@ -900,15 +1076,31 @@ export function calculateSecurityScore(
   const hasConfirmedAuthBypass = findings.some(
     (finding) =>
       normalized(finding.title).includes("authentication bypass") &&
-      finding.confidence === "confirmed" &&
-      isFixableOrInferred(finding),
+	      finding.confidence === "confirmed" &&
+	      effectiveEvidenceStrength(finding) !== "weak" &&
+	      isFixableOrInferred(finding),
   );
   const hasConfirmedSqli = findings.some(
     (finding) =>
       (normalized(finding.title).includes("sql injection") ||
         normalized(finding.findingClass).includes("injection")) &&
+	      finding.confidence === "confirmed" &&
+	      effectiveEvidenceStrength(finding) !== "weak" &&
+	      isFixableOrInferred(finding),
+  );
+  const hasConfirmedDbErrorOrBlindSql = findings.some(
+    (finding) =>
+      /(database error|db error|error disclosure|blind sql)/i.test(`${finding.checkKey ?? ""} ${finding.title}`) &&
       finding.confidence === "confirmed" &&
+      effectiveEvidenceStrength(finding) !== "weak" &&
       isFixableOrInferred(finding),
+  );
+  const hasConfirmedDataExposure = findings.some(
+    (finding) =>
+      finding.confidence === "confirmed" &&
+      effectiveEvidenceStrength(finding) !== "weak" &&
+      statusIsIssue(finding) &&
+      (finding.dataExposure === true || finding.evidence?.dataExposure === true),
   );
   const hasPrimaryAttackPath = attackPaths.length > 0;
 
@@ -935,11 +1127,74 @@ export function calculateSecurityScore(
   if (context.reflectedInputCount >= 5) score = pushCap(capsApplied, "five or more reflected inputs", score, 75);
   if (context.likelyMediumSecurityFindings >= 4) score = pushCap(capsApplied, "four or more likely medium security findings", score, 72);
   if (context.likelySecurityWarnings >= 6) score = pushCap(capsApplied, "six or more likely security warnings", score, 68);
-  if (context.browserRenderingFailed && context.noAuthenticatedContextWithAuthSurface && context.authSurfaceDetected) {
-    score = pushCap(capsApplied, "weak coverage on authentication surface", score, 70);
+	  if (context.browserRenderingFailed && context.noAuthenticatedContextWithAuthSurface && context.authSurfaceDetected) {
+	    score = pushCap(capsApplied, "weak coverage on authentication surface", score, 70);
+	  }
+
+  const highLikelyConcrete = likelyIssues.some((finding) => {
+    const severity = effectiveSeverity(finding);
+    return severity === "high" || severity === "critical";
+  });
+  if (
+    context.highDynamicPlatform &&
+    confirmedConcreteCritical.length === 0 &&
+    confirmedConcreteHigh.length === 0 &&
+    !highLikelyConcrete
+  ) {
+    const raisedScore = Math.max(score, 78);
+    if (raisedScore > score) {
+      capsApplied.push("high-dynamic platform weak signals deweighted");
+      score = raisedScore;
+    }
   }
 
-  const catastrophic =
+  const confirmedExploitableCount = findings.filter(isConfirmedExploitableVulnerability).length;
+  const likelyHighImpactIssues = findings.filter(isLikelyHighImpactIssue).length;
+  const coverageConfidence = calculateCoverageConfidence(findings, attackSurface);
+  const highCoverageNoConfirmedExploit =
+    confirmedExploitableCount === 0 &&
+    likelyHighImpactIssues === 0 &&
+    coverageConfidence.level === "High" &&
+    attackPaths.length === 0 &&
+    !hasConfirmedDataExposure &&
+    !hasConfirmedAuthBypass &&
+    !hasConfirmedSqli &&
+    !hasConfirmedDbErrorOrBlindSql;
+  const manyMediumLikelySignals =
+    context.likelyMediumSecurityFindings >= 4 ||
+    context.reflectedInputCount >= 6 ||
+    context.likelySecurityWarnings >= 6;
+  const onlyLowHeaderCookieHardening =
+    highCoverageNoConfirmedExploit &&
+    !context.authSurfaceDetected &&
+    !context.passwordFieldWeakness &&
+    !context.uploadFormDetected &&
+    !context.xssIndicators &&
+    context.reflectedInputCount === 0 &&
+    !highLikelyConcrete &&
+    findings
+      .filter(statusIsIssue)
+      .every((finding) => {
+        const text = `${finding.checkKey ?? ""} ${finding.title}`.toLowerCase();
+        return effectiveSeverity(finding) === "low" && /header|hsts|csp|frame|referrer|permissions|cookie|security\.txt/.test(text);
+      });
+
+  if (highCoverageNoConfirmedExploit && !manyMediumLikelySignals) {
+    const floor = onlyLowHeaderCookieHardening ? 85 : 82;
+    if (score < floor) {
+      capsApplied.push(
+        onlyLowHeaderCookieHardening
+          ? "high coverage with only low hardening notes"
+          : "high coverage without confirmed exploitable vulnerabilities",
+      );
+      score = floor;
+    }
+  } else if (highCoverageNoConfirmedExploit && context.highDynamicPlatform && score < 78) {
+    capsApplied.push("high-dynamic platform with unconfirmed medium signals");
+    score = 78;
+  }
+
+	  const catastrophic =
     confirmedConcreteCritical.length >= 5 ||
     findings.some(
       (finding) =>
@@ -969,12 +1224,20 @@ export function calculateSecurityScore(
     (context.wordpressDetected && context.authSurfaceDetected && context.reflectedInputCount > 0) ||
     (context.browserRenderingFailed && context.authSurfaceDetected && context.xssIndicators) ||
     (context.uploadFormDetected && context.xssIndicators);
-  if (mustBeHigh) {
-    riskLabel = atLeastRiskLabel(riskLabel, "High Risk");
+	  if (mustBeHigh) {
+	    riskLabel = atLeastRiskLabel(riskLabel, "High Risk");
+	  }
+  if (
+    context.highDynamicPlatform &&
+    confirmedConcreteCritical.length === 0 &&
+    confirmedConcreteHigh.length === 0 &&
+    !highLikelyConcrete
+  ) {
+    riskLabel = atLeastRiskLabel(riskLabelForScore(finalScore), "Medium Risk");
   }
-  if (confirmedConcreteCritical.length > 0 || (hasConfirmedSqli && hasConfirmedAuthBypass)) {
-    riskLabel = atLeastRiskLabel(riskLabel, "Critical Risk");
-  }
+	  if (confirmedConcreteCritical.length > 0 || (hasConfirmedSqli && hasConfirmedAuthBypass)) {
+	    riskLabel = atLeastRiskLabel(riskLabel, "Critical Risk");
+	  }
 
   return {
     baseScore: 100,

@@ -3,7 +3,7 @@
 import type { CSSProperties } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { startTransition, useEffect, useMemo, useState } from "react";
-import { CheckCircle2, Clock3, Download, FileText, History, Shield, Wrench, X } from "lucide-react";
+import { CheckCircle2, Clock3, Download, FileText, History, Search, Shield, Wrench, X } from "lucide-react";
 import { PaypalCreditsDialog } from "@/components/billing/paypal-credits-dialog";
 import { FindingCard } from "@/components/results/finding-card";
 import { useAuth } from "@/components/providers/auth-provider";
@@ -282,6 +282,16 @@ function arrayRecords(value: unknown) {
   return Array.isArray(value)
     ? value.filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === "object" && !Array.isArray(entry)))
     : [];
+}
+
+function recommendationLabelFrom(item: Record<string, unknown> | null, explicitLabel?: string) {
+  if (explicitLabel === "Recommended first fix" || explicitLabel === "Recommended first review") {
+    return explicitLabel;
+  }
+
+  return item?.confidence === "confirmed" && item?.isFixableVulnerability === true
+    ? "Recommended first fix"
+    : "Recommended first review";
 }
 
 function getScanModeLimitations(scanMode: string) {
@@ -582,6 +592,7 @@ function extractAttackSurfaceSummary(findings: Record<CategoryKey, ScanFinding[]
   const reportAttackSurface = nestedRecord(reportSummary, "attackSurface");
   const reportCoverageConfidence = objectEvidence(reportSummary?.coverageConfidence) ?? objectEvidence(evidence.coverageConfidence);
   const reportRecommendedFix = objectEvidence(reportSummary?.recommendedFirstFix);
+  const reportRecommendedLabel = nestedString(reportSummary, "recommendedFirstLabel");
   const primaryAttackPath = primaryAttackPathFrom(evidence, reportSummary);
   const scanModeLimitations =
     objectEvidence(reportSummary?.scanModeLimitations) ?? getScanModeLimitations(stringEvidence(evidence, "scanMode") || "Fast");
@@ -628,6 +639,10 @@ function extractAttackSurfaceSummary(findings: Record<CategoryKey, ScanFinding[]
       safeEvidenceRecommendedFix ||
       fallbackRecommendedFix?.title ||
       "No concrete exploitable vulnerability was confirmed",
+    recommendedFirstLabel: recommendationLabelFrom(
+      reportRecommendedFix,
+      reportRecommendedLabel || stringEvidence(evidence, "recommendedFirstLabel"),
+    ),
     recommendedFirstFixReason:
       stringEvidence(evidence, "recommendedFirstFixReason") ||
       nestedString(reportRecommendedFix, "reason") ||
@@ -1339,6 +1354,11 @@ async function downloadReportPdf(
   const pdfRecommendedFix =
     objectEvidence(pdfReportSummary?.recommendedFirstFix) ??
     (pdfTopFixes[0] ?? null);
+  const pdfRecommendedLabel = recommendationLabelFrom(
+    pdfRecommendedFix,
+    nestedString(pdfReportSummary, "recommendedFirstLabel") ||
+      pdfAttackSurface?.recommendedFirstLabel,
+  );
   const pdfRecommendedFixTitle =
     nestedString(pdfRecommendedFix, "title") ||
     (isInvalidFixTitle(pdfAttackSurface?.recommendedFirstFix ?? "") ? "" : pdfAttackSurface?.recommendedFirstFix) ||
@@ -1520,7 +1540,7 @@ async function downloadReportPdf(
     doc.setFontSize(9);
     doc.setTextColor(...palette.primary);
     doc.text(
-      `Recommended first fix: ${compactPdfValue(pdfRecommendedFixTitle, 150)}`,
+      `${pdfRecommendedLabel}: ${compactPdfValue(pdfRecommendedFixTitle, 150)}`,
       marginX + 16,
       boxY + 102,
     );
@@ -1586,7 +1606,7 @@ async function downloadReportPdf(
   doc.setFont("helvetica", "bold");
   doc.setFontSize(16);
   doc.setTextColor(...palette.ink);
-  doc.text("Recommended First Fix", marginX, cursorY);
+  doc.text(pdfRecommendedLabel, marginX, cursorY);
   cursorY += 20;
   drawTextBlock({
     text: pdfRecommendedFixTitle,
@@ -1607,7 +1627,7 @@ async function downloadReportPdf(
     doc.setFont("helvetica", "bold");
     doc.setFontSize(16);
     doc.setTextColor(...palette.ink);
-    doc.text("Top 5 Fixes", marginX, cursorY);
+    doc.text("Top Reviews/Fixes", marginX, cursorY);
     cursorY += 20;
     pdfTopFixes.forEach((fix, index) => {
       ensureSpace(42);
@@ -1911,6 +1931,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
   const [confirmedOnly, setConfirmedOnly] = useState(false);
   const [attackPathOnly, setAttackPathOnly] = useState(false);
   const [publicOnly, setPublicOnly] = useState(false);
+  const [recentScanQuery, setRecentScanQuery] = useState("");
   const [displayProgress, setDisplayProgress] = useState(0);
   const [progressSession, setProgressSession] = useState<ProgressSessionState>({
     scanId: null,
@@ -2162,6 +2183,8 @@ export function ResultsClient({ scanId }: { scanId: string }) {
         : scan?.latestPhase ?? "Preparing scan.");
   const progressNarrative = allResultsReady
     ? "All scan results are loaded and the report is ready."
+    : scan?.status === "partial-results"
+      ? "Initial results are ready. Deeper browser and active checks are still updating this report live."
     : visibleProgress >= liveProgressHoldPercent
       ? "Finalizing evidence and report output before marking the scan complete."
       : "Live checks are running across discovery, security, SEO, and performance.";
@@ -2226,6 +2249,24 @@ export function ResultsClient({ scanId }: { scanId: string }) {
     }
     return true;
   });
+  const filteredRecentScans = useMemo(() => {
+    const query = recentScanQuery.trim().toLowerCase();
+    if (!query) {
+      return state.recentScans;
+    }
+
+    return state.recentScans.filter((recent) =>
+      [
+        recent.targetHostname,
+        recent.status,
+        recent.id,
+        formatRelative(recent.createdAt),
+      ]
+        .join(" ")
+        .toLowerCase()
+        .includes(query),
+    );
+  }, [recentScanQuery, state.recentScans]);
 
   const handleChangeTab = (tab: CategoryKey) => {
     const nextParams = new URLSearchParams(searchParams.toString());
@@ -2376,29 +2417,46 @@ export function ResultsClient({ scanId }: { scanId: string }) {
             </div>
 
             <div className="min-h-0 flex-1">
+              <label className="relative mb-3 block px-1">
+                <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="search"
+                  value={recentScanQuery}
+                  onChange={(event) => setRecentScanQuery(event.target.value)}
+                  placeholder="Search scans"
+                  className="h-10 w-full rounded-full border border-white/70 bg-white/70 pl-10 pr-4 text-sm font-medium text-slate-700 shadow-sm outline-none transition-all placeholder:text-slate-400 focus:border-blue-200 focus:bg-white focus:ring-4 focus:ring-blue-100/70"
+                  aria-label="Search recent scans"
+                />
+              </label>
               <span className="mb-4 block px-4 text-[10px] font-bold uppercase tracking-[0.24em] text-slate-400">
                 Your Scans
               </span>
               <div className="soft-scrollbar max-h-[320px] space-y-1 overflow-y-auto pr-2">
                 {state.recentScans.length ? (
-                  state.recentScans.map((recent) => (
-                    <button
-                      key={recent.id}
-                      type="button"
-                      onClick={() => router.push(`/scans/${recent.id}`)}
-                      className={cn(
-                        "w-full rounded-[1rem] p-3 text-left transition-all hover:bg-white/60",
-                        recent.id === scanId && "bg-white/70 shadow-sm",
-                      )}
-                    >
-                      <p className="text-sm font-medium text-slate-900">{recent.targetHostname}</p>
-                      <p className="mt-1 text-[11px] text-slate-500">
-                        {recent.id === scanId
-                          ? `Current scan • ${recent.progress}%`
-                          : `Last scan ${formatRelative(recent.createdAt)}`}
-                      </p>
-                    </button>
-                  ))
+                  filteredRecentScans.length ? (
+                    filteredRecentScans.map((recent) => (
+                      <button
+                        key={recent.id}
+                        type="button"
+                        onClick={() => router.push(`/scans/${recent.id}`)}
+                        className={cn(
+                          "w-full rounded-[1rem] p-3 text-left transition-all hover:bg-white/60",
+                          recent.id === scanId && "bg-white/70 shadow-sm",
+                        )}
+                      >
+                        <p className="text-sm font-medium text-slate-900">{recent.targetHostname}</p>
+                        <p className="mt-1 text-[11px] text-slate-500">
+                          {recent.id === scanId
+                            ? `Current scan • ${recent.progress}%`
+                            : `Last scan ${formatRelative(recent.createdAt)}`}
+                        </p>
+                      </button>
+                    ))
+                  ) : (
+                    <div className="rounded-[1rem] bg-white/50 p-4 text-sm text-slate-500">
+                      No scans match this search.
+                    </div>
+                  )
                 ) : (
                   <div className="rounded-[1rem] bg-white/50 p-4 text-sm text-slate-500">
                     Recent scans will appear here.
@@ -2512,6 +2570,12 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                     </span>
                   ))}
                 </div>
+                {scan.status === "partial-results" ? (
+                  <div className="mt-4 rounded-[1.25rem] border border-emerald-100 bg-emerald-50/80 px-4 py-3 text-sm leading-6 text-emerald-800">
+                    <span className="font-semibold">Initial results are ready.</span>{" "}
+                    You can review the findings now while deeper checks continue in the background.
+                  </div>
+                ) : null}
                 <div className="mt-6 grid gap-3 md:grid-cols-3">
                   {categoryCards.map((item) => (
                     <div key={item.category} className="rounded-[1.3rem] bg-white/55 p-4">
@@ -2598,7 +2662,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                     Attack Surface Summary
                   </p>
                   <p className="mt-2 text-sm leading-7 text-slate-500">
-                    Scan mode {attackSurfaceSummary.scanMode}. First fix:{" "}
+                    Scan mode {attackSurfaceSummary.scanMode}. {attackSurfaceSummary.recommendedFirstLabel}:{" "}
                     <span className="font-semibold text-slate-800">
                       {attackSurfaceSummary.recommendedFirstFix}
                     </span>
@@ -2910,7 +2974,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                         Attack Surface Summary
                       </p>
                       <p className="mt-2 text-sm leading-7 text-slate-600">
-                        Recommended first fix:{" "}
+                        {attackSurfaceSummary.recommendedFirstLabel}:{" "}
                         <span className="font-semibold text-slate-900">
                           {attackSurfaceSummary.recommendedFirstFix}
                         </span>
