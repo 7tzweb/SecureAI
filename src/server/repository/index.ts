@@ -20,7 +20,7 @@ export function getRepository() {
 
   if (serverConfig.nodeEnv === "production") {
     throw serviceUnavailable(
-      "Persistent Firestore storage is not configured. Set Firebase Admin credentials before running production billing or scan history.",
+      "Persistent Firestore storage is not configured. Set FIREBASE_SERVICE_ACCOUNT_JSON or a deployed Firebase Admin credentials path before running production billing or scan history.",
     );
   }
 

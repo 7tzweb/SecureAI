@@ -29,6 +29,11 @@
 *.pdf
 serviceAccountKey.json
 
+# local-only admin workspace
+/src/app/local-admin/
+/src/app/api/local-admin/
+/src/app/r/
+
 # debug
 npm-debug.log*
 yarn-debug.log*

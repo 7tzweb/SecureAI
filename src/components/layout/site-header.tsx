@@ -4,7 +4,7 @@ import Link from "next/link";
 import Image from "next/image";
 import { usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Clock3, ExternalLink, Loader2, Plus, UserCircle2, X } from "lucide-react";
+import { Clock3, ExternalLink, Loader2, LogOut, Plus, UserCircle2, X } from "lucide-react";
 import logoImage from "../../../logomain.png";
 import { PaypalCreditsDialog } from "@/components/billing/paypal-credits-dialog";
 import { StartAuditForm } from "@/components/landing/start-audit-form";
@@ -195,6 +195,19 @@ export function SiteHeader() {
     }
   };
 
+  const handleSignOut = async () => {
+    setActionError(null);
+    setAccountOpen(false);
+    setMobileScanOpen(false);
+    setQuota(null);
+
+    try {
+      await signOut();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Unable to log out.");
+    }
+  };
+
   return (
     <header className="fixed top-0 z-50 w-full border-b border-white/20 bg-white/72 shadow-[0_8px_30px_rgb(0_0_0_/_0.04)] backdrop-blur-[30px]">
       <div
@@ -308,13 +321,24 @@ export function SiteHeader() {
                         </p>
                         <p className="mt-1 break-all text-xs text-slate-500">{user.email ?? "Google account"}</p>
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => router.push("/history")}
-                        className="rounded-full border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-50"
-                      >
-                        Scans
-                      </button>
+                      <div className="flex shrink-0 items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void handleSignOut()}
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-600 transition-colors hover:bg-slate-50 sm:hidden"
+                          aria-label="Log out"
+                          title="Log out"
+                        >
+                          <LogOut className="h-4 w-4" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => router.push("/history")}
+                          className="rounded-full border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-50"
+                        >
+                          Scans
+                        </button>
+                      </div>
                     </div>
 
                     <div className="mt-4 rounded-[1.25rem] bg-slate-50 p-4">
@@ -379,7 +403,12 @@ export function SiteHeader() {
 
           {status === "signed-in" ? (
             <>
-              <Button variant="outline" size="sm" onClick={() => void signOut()}>
+              <Button
+                variant="outline"
+                size="sm"
+                className="hidden sm:inline-flex"
+                onClick={() => void handleSignOut()}
+              >
                 Log out
               </Button>
             </>

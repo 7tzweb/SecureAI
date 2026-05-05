@@ -54,6 +54,8 @@ These fallbacks are for development convenience only. Production deployment shou
 
 See `.env.example` for the full list.
 
+For hosted production, prefer `FIREBASE_SERVICE_ACCOUNT_JSON` as one-line raw or base64 service account JSON. Only use `FIREBASE_SERVICE_ACCOUNT_PATH` or `GOOGLE_APPLICATION_CREDENTIALS` when that JSON file is actually deployed with the server runtime.
+
 - `NEXT_PUBLIC_APP_URL`
 - `NEXT_PUBLIC_FIREBASE_API_KEY`
 - `NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN`
