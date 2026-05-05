@@ -9,6 +9,7 @@ import {
 } from "@/lib/types";
 import { forbidden, notFound } from "@/server/api/errors";
 import { type Repository } from "@/server/repository/types";
+import { accountEmailsMatch, normalizeAccountEmail } from "@/server/users/account";
 
 type StorePayload = {
   scans: Record<string, ScanRecord>;
@@ -31,6 +32,13 @@ const globalState = globalThis as typeof globalThis & {
     payments: Map<string, PaymentRecord>;
   };
 };
+
+function normalizeUserRecord(user: UserRecord): UserRecord {
+  return {
+    ...user,
+    normalizedEmail: normalizeAccountEmail(user.email),
+  };
+}
 
 function emptyStore(): StorePayload {
   return {
@@ -92,6 +100,63 @@ function withStoreLock<T>(operation: () => Promise<T>): Promise<T> {
     .finally(() => {
       release();
     });
+}
+
+function listUsersByEmailFromStore(store: StorePayload, email: string) {
+  const normalizedEmail = normalizeAccountEmail(email);
+  if (!normalizedEmail) {
+    return [];
+  }
+
+  return Object.values(store.users)
+    .filter(
+      (user) =>
+        accountEmailsMatch(user.normalizedEmail, normalizedEmail) ||
+        accountEmailsMatch(user.email, normalizedEmail),
+    )
+    .map(normalizeUserRecord);
+}
+
+function accountUserIds(store: StorePayload, userId: string, userEmail?: string | null) {
+  const ids = new Set<string>([userId]);
+  listUsersByEmailFromStore(store, userEmail ?? "").forEach((user) => ids.add(user.uid));
+  return ids;
+}
+
+function scanBelongsToAccount(
+  store: StorePayload,
+  scan: ScanRecord,
+  userId: string,
+  userEmail?: string | null,
+) {
+  if (scan.createdByUserId === userId) {
+    return true;
+  }
+
+  const normalizedEmail = normalizeAccountEmail(userEmail);
+  if (!normalizedEmail) {
+    return false;
+  }
+
+  if (accountEmailsMatch(scan.createdByUserEmail, normalizedEmail)) {
+    return true;
+  }
+
+  const owner = scan.createdByUserId ? store.users[scan.createdByUserId] : null;
+  return Boolean(owner && accountEmailsMatch(owner.email, normalizedEmail));
+}
+
+function listScansForAccount(store: StorePayload, userId: string, userEmail?: string | null) {
+  const userIds = accountUserIds(store, userId, userEmail);
+  const normalizedEmail = normalizeAccountEmail(userEmail);
+
+  return Object.values(store.scans)
+    .filter(
+      (scan) =>
+        Boolean(scan.createdByUserId && userIds.has(scan.createdByUserId)) ||
+        Boolean(normalizedEmail && accountEmailsMatch(scan.createdByUserEmail, normalizedEmail)),
+    )
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 }
 
 export function createFileRepository(): Repository {
@@ -181,19 +246,17 @@ export function createFileRepository(): Repository {
       });
     },
 
-    async listUserScans(userId) {
+    async listUserScans(userId, userEmail) {
       return withStoreLock(async () => {
         const store = await readStore();
-        return Object.values(store.scans)
-          .filter((scan) => scan.createdByUserId === userId)
-          .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+        return listScansForAccount(store, userId, userEmail);
       });
     },
 
-    async countUserScans(userId) {
+    async countUserScans(userId, userEmail) {
       return withStoreLock(async () => {
         const store = await readStore();
-        return Object.values(store.scans).filter((scan) => scan.createdByUserId === userId).length;
+        return listScansForAccount(store, userId, userEmail).length;
       });
     },
 
@@ -215,20 +278,21 @@ export function createFileRepository(): Repository {
       });
     },
 
-    async claimScan(scanId, userId) {
+    async claimScan(scanId, userId, userEmail) {
       return withStoreLock(async () => {
         const store = await readStore();
         const scan = store.scans[scanId];
         if (!scan) {
           throw notFound("Scan not found.");
         }
-        if (scan.createdByUserId && scan.createdByUserId !== userId) {
+        if (scan.createdByUserId && !scanBelongsToAccount(store, scan, userId, userEmail)) {
           throw forbidden("This scan belongs to another account.");
         }
 
         const next = {
           ...scan,
           createdByUserId: userId,
+          createdByUserEmail: normalizeAccountEmail(userEmail),
           isAnonymous: false,
           visibility: "private" as const,
         };
@@ -238,18 +302,23 @@ export function createFileRepository(): Repository {
       });
     },
 
-    async unlockScan(scanId, userId) {
+    async unlockScan(scanId, userId, userEmail) {
       return withStoreLock(async () => {
         const store = await readStore();
         const scan = store.scans[scanId];
         if (!scan) {
           throw notFound("Scan not found.");
         }
-        if (scan.createdByUserId !== userId) {
+        if (!scanBelongsToAccount(store, scan, userId, userEmail)) {
           throw forbidden("Only the scan owner can unlock premium access.");
         }
 
-        const next = { ...scan, premiumUnlocked: true };
+        const next = {
+          ...scan,
+          createdByUserId: userId,
+          createdByUserEmail: normalizeAccountEmail(userEmail) ?? scan.createdByUserEmail ?? null,
+          premiumUnlocked: true,
+        };
         store.scans[scanId] = next;
         await writeStore(store);
         return next;
@@ -259,16 +328,25 @@ export function createFileRepository(): Repository {
     async upsertUser(user) {
       return withStoreLock(async () => {
         const store = await readStore();
-        store.users[user.uid] = user;
+        const next = normalizeUserRecord(user);
+        store.users[user.uid] = next;
         await writeStore(store);
-        return user;
+        return next;
       });
     },
 
     async getUser(uid) {
       return withStoreLock(async () => {
         const store = await readStore();
-        return store.users[uid] ?? null;
+        const user = store.users[uid];
+        return user ? normalizeUserRecord(user) : null;
+      });
+    },
+
+    async listUsersByEmail(email) {
+      return withStoreLock(async () => {
+        const store = await readStore();
+        return listUsersByEmailFromStore(store, email);
       });
     },
 
@@ -280,19 +358,19 @@ export function createFileRepository(): Repository {
           throw notFound("User not found.");
         }
 
-        const next: UserRecord = {
+        const next: UserRecord = normalizeUserRecord({
           ...user,
           subscriptionStatus,
           entitlementLevel,
           stripeCustomerId: stripeCustomerId ?? user.stripeCustomerId,
-        };
+        });
         store.users[uid] = next;
         await writeStore(store);
         return next;
       });
     },
 
-    async addUserScanCredits(uid, credits) {
+    async addUserScanCredits(uid, credits, userEmail) {
       return withStoreLock(async () => {
         const store = await readStore();
         const user = store.users[uid];
@@ -300,10 +378,11 @@ export function createFileRepository(): Repository {
           throw notFound("User not found.");
         }
 
-        const next: UserRecord = {
+        const next: UserRecord = normalizeUserRecord({
           ...user,
+          email: user.email ?? normalizeAccountEmail(userEmail),
           purchasedScanCredits: (user.purchasedScanCredits ?? 0) + credits,
-        };
+        });
         store.users[uid] = next;
         await writeStore(store);
         return next;
@@ -316,6 +395,41 @@ export function createFileRepository(): Repository {
         store.payments[payment.checkoutSessionId] = payment;
         await writeStore(store);
         return payment;
+      });
+    },
+
+    async completeScanCreditPayment(payment) {
+      return withStoreLock(async () => {
+        const store = await readStore();
+        const existingPayment = store.payments[payment.checkoutSessionId] ?? null;
+        const alreadyPaid = existingPayment?.paymentStatus === "paid";
+        const now = payment.updatedAt;
+        const nextPayment: PaymentRecord = {
+          ...(existingPayment ?? payment),
+          ...payment,
+          createdAt: existingPayment?.createdAt ?? payment.createdAt,
+          paymentStatus: "paid",
+          creditedAt: existingPayment?.creditedAt ?? (alreadyPaid ? existingPayment?.updatedAt ?? now : now),
+          updatedAt: now,
+        };
+
+        if (!alreadyPaid) {
+          const user = store.users[payment.userId];
+          if (!user) {
+            throw notFound("User not found.");
+          }
+
+          store.users[payment.userId] = normalizeUserRecord({
+            ...user,
+            email: user.email ?? normalizeAccountEmail(payment.userEmail),
+            purchasedScanCredits:
+              (user.purchasedScanCredits ?? 0) + (payment.creditsPurchased ?? 0),
+          });
+        }
+
+        store.payments[payment.checkoutSessionId] = nextPayment;
+        await writeStore(store);
+        return nextPayment;
       });
     },
 

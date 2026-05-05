@@ -25,7 +25,7 @@ export async function POST(request: NextRequest) {
     const repository = getRepository();
     const stripe = getStripeClient();
     const returnPath = parsed.returnPath?.startsWith("/") ? parsed.returnPath : "/history";
-    const quota = await getScanQuotaSummary(user.uid);
+    const quota = await getScanQuotaSummary(user.uid, user.email);
 
     if (parsed.purpose === "scan-plan" && quota.hasUnlimitedPlan) {
       return NextResponse.json({
@@ -42,7 +42,7 @@ export async function POST(request: NextRequest) {
 
     const scan =
       parsed.purpose === "report-upgrade" && parsed.scanId
-        ? await requireOwnedScan(parsed.scanId, user.uid)
+        ? await requireOwnedScan(parsed.scanId, user.uid, user.email)
         : null;
 
     const successUrl = new URL(returnPath, serverConfig.appUrl);
@@ -74,6 +74,7 @@ export async function POST(request: NextRequest) {
     await repository.upsertPayment({
       id: randomUUID(),
       userId: user.uid,
+      userEmail: user.email,
       scanId: scan?.id ?? `plan:${user.uid}`,
       stripeCustomerId,
       checkoutSessionId: session.id,

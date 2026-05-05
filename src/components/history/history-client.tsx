@@ -14,7 +14,7 @@ import { formatDateTime, formatRelative, formatScore } from "@/lib/utils";
 
 export function HistoryClient() {
   const router = useRouter();
-  const { user, isConfigured, signInWithGoogle, status } = useAuth();
+  const { user, isConfigured, signInWithGoogle, ensureServerSession, status } = useAuth();
   const [scans, setScans] = useState<ScanRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -37,6 +37,7 @@ export function HistoryClient() {
       }
 
       try {
+        await ensureServerSession();
         const response = await fetch("/api/me/scans", { cache: "no-store" });
         const payload = (await response.json().catch(() => null)) as
           | { scans?: ScanRecord[]; error?: string }
@@ -64,7 +65,7 @@ export function HistoryClient() {
     return () => {
       cancelled = true;
     };
-  }, [user]);
+  }, [ensureServerSession, user]);
 
   return (
     <div className="workspace-gradient min-h-screen text-[var(--ink)]">

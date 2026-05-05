@@ -8,7 +8,7 @@ export const runtime = "nodejs";
 export async function GET(request: NextRequest) {
   try {
     const sessionUser = await getOptionalSessionUser(request);
-    const scans = await listRecentScansForSidebar(sessionUser?.uid ?? null);
+    const scans = await listRecentScansForSidebar(sessionUser);
     return NextResponse.json({ scans });
   } catch (error) {
     return handleRouteError(error);

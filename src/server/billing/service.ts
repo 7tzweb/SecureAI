@@ -121,7 +121,7 @@ export async function finalizeCheckoutSession(session: Stripe.Checkout.Session) 
       throw badRequest("Scan upgrade is missing scanId metadata.");
     }
 
-    await unlockPremiumForScan(scanId, userId);
+    await unlockPremiumForScan(scanId, userId, user?.email ?? payment?.userEmail ?? null);
   }
 }
 

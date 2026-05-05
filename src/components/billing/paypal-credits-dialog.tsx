@@ -131,7 +131,7 @@ export function PaypalCreditsDialog({
   onClose,
   onApproved,
 }: PaypalCreditsDialogProps) {
-  const { user } = useAuth();
+  const { user, ensureServerSession } = useAuth();
   const buttonsRef = useRef<HTMLDivElement | null>(null);
   const creditsRef = useRef<number | null>(quota?.upgradeScanCredits ?? 20);
   const [error, setError] = useState<string | null>(null);
@@ -200,6 +200,7 @@ export function PaypalCreditsDialog({
       setError(null);
 
       try {
+        await ensureServerSession();
         const configResponse = await fetch("/api/billing/paypal/config", {
           cache: "no-store",
         });
@@ -227,6 +228,7 @@ export function PaypalCreditsDialog({
               throw new Error(`Minimum purchase is ${minimumCredits} credits.`);
             }
 
+            await ensureServerSession();
             const response = await fetch("/api/billing/paypal/order", {
               method: "POST",
               headers: {
@@ -243,6 +245,7 @@ export function PaypalCreditsDialog({
             }
 
             setStatus("capturing");
+            await ensureServerSession();
             const response = await fetch("/api/billing/paypal/capture", {
               method: "POST",
               headers: {
@@ -282,7 +285,7 @@ export function PaypalCreditsDialog({
       cancelled = true;
       buttons?.close?.();
     };
-  }, [minimumCredits, onApproved, open, resetDialogState]);
+  }, [ensureServerSession, minimumCredits, onApproved, open, resetDialogState]);
 
   if (!open || typeof document === "undefined") {
     return null;

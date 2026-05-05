@@ -9,9 +9,98 @@ import {
 import { forbidden, notFound } from "@/server/api/errors";
 import { getFirebaseAdminDb } from "@/server/firebase-admin";
 import { type Repository } from "@/server/repository/types";
+import { accountEmailsMatch, normalizeAccountEmail } from "@/server/users/account";
+
+function normalizeUserRecord(user: UserRecord): UserRecord {
+  return {
+    ...user,
+    normalizedEmail: normalizeAccountEmail(user.email),
+  };
+}
+
+function uniqueUsers(users: UserRecord[]) {
+  const byUid = new Map<string, UserRecord>();
+  users.forEach((user) => {
+    byUid.set(user.uid, normalizeUserRecord(user));
+  });
+  return [...byUid.values()];
+}
+
+function uniqueScans(scans: ScanRecord[]) {
+  const byId = new Map<string, ScanRecord>();
+  scans.forEach((scan) => {
+    byId.set(scan.id, scan);
+  });
+  return [...byId.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+}
+
+function chunks<T>(items: T[], size: number) {
+  const result: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    result.push(items.slice(index, index + size));
+  }
+  return result;
+}
 
 export function createFirestoreRepository(): Repository {
   const db = getFirebaseAdminDb();
+
+  async function listUsersByEmail(email: string) {
+    const normalizedEmail = normalizeAccountEmail(email);
+    if (!normalizedEmail) {
+      return [];
+    }
+
+    const [normalizedSnapshot, legacySnapshot] = await Promise.all([
+      db.collection("users").where("normalizedEmail", "==", normalizedEmail).get(),
+      db.collection("users").where("email", "==", normalizedEmail).get(),
+    ]);
+
+    return uniqueUsers(
+      [...normalizedSnapshot.docs, ...legacySnapshot.docs].map((doc) => doc.data() as UserRecord),
+    );
+  }
+
+  async function accountUserIds(userId: string, userEmail?: string | null) {
+    const ids = new Set<string>([userId]);
+    const normalizedEmail = normalizeAccountEmail(userEmail);
+    if (normalizedEmail) {
+      const users = await listUsersByEmail(normalizedEmail);
+      users.forEach((user) => ids.add(user.uid));
+    }
+    return [...ids];
+  }
+
+  async function scanBelongsToAccount(
+    scan: ScanRecord,
+    userId: string,
+    userEmail?: string | null,
+  ) {
+    if (scan.createdByUserId === userId) {
+      return true;
+    }
+
+    const normalizedEmail = normalizeAccountEmail(userEmail);
+    if (!normalizedEmail) {
+      return false;
+    }
+
+    if (accountEmailsMatch(scan.createdByUserEmail, normalizedEmail)) {
+      return true;
+    }
+
+    if (!scan.createdByUserId) {
+      return false;
+    }
+
+    const ownerSnapshot = await db.collection("users").doc(scan.createdByUserId).get();
+    if (!ownerSnapshot.exists) {
+      return false;
+    }
+
+    const owner = ownerSnapshot.data() as UserRecord;
+    return accountEmailsMatch(owner.email, normalizedEmail);
+  }
 
   return {
     async createScan(scan) {
@@ -91,24 +180,55 @@ export function createFirestoreRepository(): Repository {
       return snapshot.docs.map((doc) => doc.data() as ScanEvent);
     },
 
-    async listUserScans(userId) {
-      const snapshot = await db
-        .collection("scans")
-        .where("createdByUserId", "==", userId)
-        .orderBy("createdAt", "desc")
-        .get();
+    async listUserScans(userId, userEmail) {
+      const userIds = await accountUserIds(userId, userEmail);
+      const scanSnapshots = await Promise.all(
+        chunks(userIds, 10).map((chunk) =>
+          chunk.length === 1
+            ? db.collection("scans").where("createdByUserId", "==", chunk[0]).get()
+            : db.collection("scans").where("createdByUserId", "in", chunk).get(),
+        ),
+      );
+      const scans = scanSnapshots.flatMap((snapshot) =>
+        snapshot.docs.map((doc) => doc.data() as ScanRecord),
+      );
 
-      return snapshot.docs.map((doc) => doc.data() as ScanRecord);
+      const normalizedEmail = normalizeAccountEmail(userEmail);
+      if (normalizedEmail) {
+        const emailSnapshot = await db
+          .collection("scans")
+          .where("createdByUserEmail", "==", normalizedEmail)
+          .get();
+        scans.push(...emailSnapshot.docs.map((doc) => doc.data() as ScanRecord));
+      }
+
+      return uniqueScans(scans);
     },
 
-    async countUserScans(userId) {
-      const snapshot = await db
-        .collection("scans")
-        .where("createdByUserId", "==", userId)
-        .count()
-        .get();
+    async countUserScans(userId, userEmail) {
+      const userIds = await accountUserIds(userId, userEmail);
+      const scanSnapshots = await Promise.all(
+        chunks(userIds, 10).map((chunk) =>
+          chunk.length === 1
+            ? db.collection("scans").where("createdByUserId", "==", chunk[0]).get()
+            : db.collection("scans").where("createdByUserId", "in", chunk).get(),
+        ),
+      );
+      const scanIds = new Set<string>();
+      scanSnapshots.forEach((snapshot) => {
+        snapshot.docs.forEach((doc) => scanIds.add(doc.id));
+      });
 
-      return snapshot.data().count;
+      const normalizedEmail = normalizeAccountEmail(userEmail);
+      if (normalizedEmail) {
+        const emailSnapshot = await db
+          .collection("scans")
+          .where("createdByUserEmail", "==", normalizedEmail)
+          .get();
+        emailSnapshot.docs.forEach((doc) => scanIds.add(doc.id));
+      }
+
+      return scanIds.size;
     },
 
     async countAnonymousScans(anonymousClientId) {
@@ -131,7 +251,7 @@ export function createFirestoreRepository(): Repository {
       return snapshot.docs.map((doc) => doc.data() as ScanRecord);
     },
 
-    async claimScan(scanId, userId) {
+    async claimScan(scanId, userId, userEmail) {
       const ref = db.collection("scans").doc(scanId);
       const snapshot = await ref.get();
       if (!snapshot.exists) {
@@ -139,13 +259,14 @@ export function createFirestoreRepository(): Repository {
       }
 
       const scan = snapshot.data() as ScanRecord;
-      if (scan.createdByUserId && scan.createdByUserId !== userId) {
+      if (scan.createdByUserId && !(await scanBelongsToAccount(scan, userId, userEmail))) {
         throw forbidden("This scan belongs to another account.");
       }
 
       const next = {
         ...scan,
         createdByUserId: userId,
+        createdByUserEmail: normalizeAccountEmail(userEmail),
         isAnonymous: false,
         visibility: "private" as const,
       };
@@ -153,7 +274,7 @@ export function createFirestoreRepository(): Repository {
       return next;
     },
 
-    async unlockScan(scanId, userId) {
+    async unlockScan(scanId, userId, userEmail) {
       const ref = db.collection("scans").doc(scanId);
       const snapshot = await ref.get();
       if (!snapshot.exists) {
@@ -161,24 +282,32 @@ export function createFirestoreRepository(): Repository {
       }
 
       const scan = snapshot.data() as ScanRecord;
-      if (scan.createdByUserId !== userId) {
+      if (!(await scanBelongsToAccount(scan, userId, userEmail))) {
         throw forbidden("Only the scan owner can unlock premium access.");
       }
 
-      const next = { ...scan, premiumUnlocked: true };
+      const next = {
+        ...scan,
+        createdByUserId: userId,
+        createdByUserEmail: normalizeAccountEmail(userEmail) ?? scan.createdByUserEmail ?? null,
+        premiumUnlocked: true,
+      };
       await ref.set(next, { merge: true });
       return next;
     },
 
     async upsertUser(user) {
-      await db.collection("users").doc(user.uid).set(user, { merge: true });
-      return user;
+      const next = normalizeUserRecord(user);
+      await db.collection("users").doc(user.uid).set(next, { merge: true });
+      return next;
     },
 
     async getUser(uid) {
       const snapshot = await db.collection("users").doc(uid).get();
-      return snapshot.exists ? (snapshot.data() as UserRecord) : null;
+      return snapshot.exists ? normalizeUserRecord(snapshot.data() as UserRecord) : null;
     },
+
+    listUsersByEmail,
 
     async updateUserEntitlement(uid, subscriptionStatus, entitlementLevel, stripeCustomerId = null) {
       const ref = db.collection("users").doc(uid);
@@ -187,18 +316,18 @@ export function createFirestoreRepository(): Repository {
         throw notFound("User not found.");
       }
 
-      const user = snapshot.data() as UserRecord;
-      const next = {
+      const user = normalizeUserRecord(snapshot.data() as UserRecord);
+      const next = normalizeUserRecord({
         ...user,
         subscriptionStatus,
         entitlementLevel,
         stripeCustomerId: stripeCustomerId ?? user.stripeCustomerId,
-      };
+      });
       await ref.set(next, { merge: true });
       return next;
     },
 
-    async addUserScanCredits(uid, credits) {
+    async addUserScanCredits(uid, credits, userEmail) {
       const ref = db.collection("users").doc(uid);
 
       return db.runTransaction(async (transaction) => {
@@ -207,11 +336,12 @@ export function createFirestoreRepository(): Repository {
           throw notFound("User not found.");
         }
 
-        const user = snapshot.data() as UserRecord;
-        const next = {
+        const user = normalizeUserRecord(snapshot.data() as UserRecord);
+        const next = normalizeUserRecord({
           ...user,
+          email: user.email ?? normalizeAccountEmail(userEmail),
           purchasedScanCredits: (user.purchasedScanCredits ?? 0) + credits,
-        };
+        });
         transaction.set(ref, next, { merge: true });
         return next;
       });
@@ -220,6 +350,49 @@ export function createFirestoreRepository(): Repository {
     async upsertPayment(payment) {
       await db.collection("payments").doc(payment.checkoutSessionId).set(payment, { merge: true });
       return payment;
+    },
+
+    async completeScanCreditPayment(payment) {
+      const paymentRef = db.collection("payments").doc(payment.checkoutSessionId);
+      const userRef = db.collection("users").doc(payment.userId);
+
+      return db.runTransaction(async (transaction) => {
+        const [paymentSnapshot, userSnapshot] = await Promise.all([
+          transaction.get(paymentRef),
+          transaction.get(userRef),
+        ]);
+        const existingPayment = paymentSnapshot.exists
+          ? (paymentSnapshot.data() as PaymentRecord)
+          : null;
+        const alreadyPaid = existingPayment?.paymentStatus === "paid";
+        const now = payment.updatedAt;
+        const nextPayment: PaymentRecord = {
+          ...(existingPayment ?? payment),
+          ...payment,
+          createdAt: existingPayment?.createdAt ?? payment.createdAt,
+          paymentStatus: "paid",
+          creditedAt: existingPayment?.creditedAt ?? (alreadyPaid ? existingPayment?.updatedAt ?? now : now),
+          updatedAt: now,
+        };
+
+        if (!alreadyPaid) {
+          if (!userSnapshot.exists) {
+            throw notFound("User not found.");
+          }
+
+          const user = normalizeUserRecord(userSnapshot.data() as UserRecord);
+          const nextUser = normalizeUserRecord({
+            ...user,
+            email: user.email ?? normalizeAccountEmail(payment.userEmail),
+            purchasedScanCredits:
+              (user.purchasedScanCredits ?? 0) + (payment.creditsPurchased ?? 0),
+          });
+          transaction.set(userRef, nextUser, { merge: true });
+        }
+
+        transaction.set(paymentRef, nextPayment, { merge: true });
+        return nextPayment;
+      });
     },
 
     async getPaymentByCheckoutSessionId(checkoutSessionId) {

@@ -14,7 +14,7 @@ export async function POST(
     const user = await requireSessionUser(request);
     assertRateLimit("claim-scan", user.uid);
     const { scanId } = await params;
-    const scan = await claimScanToUser(scanId, user.uid);
+    const scan = await claimScanToUser(scanId, user);
     return NextResponse.json({ scan });
   } catch (error) {
     return handleRouteError(error);

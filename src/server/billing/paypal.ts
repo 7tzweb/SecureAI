@@ -271,6 +271,7 @@ export async function createPayPalScanCreditOrder(
   await getRepository().upsertPayment({
     id: randomUUID(),
     userId,
+    userEmail: userEmail ?? null,
     scanId: `credits:${userId}`,
     stripeCustomerId: null,
     checkoutSessionId: order.id,
@@ -300,7 +301,7 @@ export async function capturePayPalScanCreditOrder(
   }
 
   if (existingPayment?.paymentStatus === "paid") {
-    return getScanQuotaSummary(userId);
+    return getScanQuotaSummary(userId, userEmail);
   }
 
   const profile = getPayPalProfile(userEmail);
@@ -346,12 +347,13 @@ export async function capturePayPalScanCreditOrder(
   }
 
   const now = new Date().toISOString();
-  await repository.upsertPayment({
+  await repository.completeScanCreditPayment({
     ...(existingPayment ?? {
       id: randomUUID(),
       createdAt: now,
     }),
     userId,
+    userEmail: userEmail ?? existingPayment?.userEmail ?? null,
     scanId: `credits:${userId}`,
     stripeCustomerId: null,
     checkoutSessionId: orderId,
@@ -361,9 +363,9 @@ export async function capturePayPalScanCreditOrder(
     paypalOrderId: orderId,
     creditsPurchased: expectedCredits,
     amountUsd: expectedAmountUsd,
+    creditedAt: now,
     updatedAt: now,
   });
 
-  await repository.addUserScanCredits(userId, expectedCredits);
-  return getScanQuotaSummary(userId);
+  return getScanQuotaSummary(userId, userEmail);
 }

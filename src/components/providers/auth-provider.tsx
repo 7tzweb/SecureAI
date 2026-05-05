@@ -9,6 +9,7 @@ import {
 } from "firebase/auth";
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useMemo,
@@ -60,9 +61,51 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const unsubscribe = onIdTokenChanged(auth, (nextUser) => {
       setUser(nextUser);
       setStatus(nextUser ? "signed-in" : "signed-out");
+
+      void (async () => {
+        if (!nextUser) {
+          await fetch("/api/auth/session", { method: "DELETE" });
+          return;
+        }
+
+        const idToken = await nextUser.getIdToken();
+        await syncServerSession(idToken);
+      })().catch(() => undefined);
     });
 
     return unsubscribe;
+  }, []);
+
+  const signInWithGoogle = useCallback(async () => {
+    const auth = getFirebaseAuth();
+    if (!auth) {
+      throw new Error("Firebase client configuration is missing.");
+    }
+
+    const credential = await signInWithPopup(auth, new GoogleAuthProvider());
+    const idToken = await credential.user.getIdToken();
+    await syncServerSession(idToken);
+    return credential.user;
+  }, []);
+
+  const ensureServerSession = useCallback(async () => {
+    const auth = getFirebaseAuth();
+    if (!auth?.currentUser) {
+      throw new Error("Google sign-in is required before this session can be synced.");
+    }
+
+    const idToken = await auth.currentUser.getIdToken(true);
+    await syncServerSession(idToken);
+    return auth.currentUser;
+  }, []);
+
+  const signOut = useCallback(async () => {
+    const auth = getFirebaseAuth();
+    if (auth) {
+      await firebaseSignOut(auth);
+    }
+
+    await fetch("/api/auth/session", { method: "DELETE" });
   }, []);
 
   const value = useMemo<AuthContextValue>(
@@ -70,37 +113,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       user,
       status,
       isConfigured: hasFirebaseClientConfig,
-      signInWithGoogle: async () => {
-        const auth = getFirebaseAuth();
-        if (!auth) {
-          throw new Error("Firebase client configuration is missing.");
-        }
-
-        const credential = await signInWithPopup(auth, new GoogleAuthProvider());
-        const idToken = await credential.user.getIdToken();
-        await syncServerSession(idToken);
-        return credential.user;
-      },
-      ensureServerSession: async () => {
-        const auth = getFirebaseAuth();
-        if (!auth?.currentUser) {
-          throw new Error("Google sign-in is required before this session can be synced.");
-        }
-
-        const idToken = await auth.currentUser.getIdToken(true);
-        await syncServerSession(idToken);
-        return auth.currentUser;
-      },
-      signOut: async () => {
-        const auth = getFirebaseAuth();
-        if (auth) {
-          await firebaseSignOut(auth);
-        }
-
-        await fetch("/api/auth/session", { method: "DELETE" });
-      },
+      signInWithGoogle,
+      ensureServerSession,
+      signOut,
     }),
-    [status, user],
+    [ensureServerSession, signInWithGoogle, signOut, status, user],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

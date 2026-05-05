@@ -7,9 +7,41 @@ const firebaseProjectId =
   process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID ??
   process.env.VITE_FIREBASE_PROJECT_ID ??
   "";
+const firebaseServiceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON ?? "";
+
+function parseFirebaseServiceAccountJson(value: string) {
+  if (!value) {
+    return null;
+  }
+
+  const candidates = [value, Buffer.from(value, "base64").toString("utf8")];
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate) as {
+        project_id?: string;
+        client_email?: string;
+        private_key?: string;
+      };
+    } catch {
+      // Try the next supported representation.
+    }
+  }
+
+  return null;
+}
+
+const firebaseServiceAccount = parseFirebaseServiceAccountJson(firebaseServiceAccountJson);
 const firebaseServiceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH ?? "";
-const firebaseClientEmail = process.env.FIREBASE_CLIENT_EMAIL ?? "";
-const firebasePrivateKey = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n") ?? "";
+const googleApplicationCredentialsPath = process.env.GOOGLE_APPLICATION_CREDENTIALS ?? "";
+const googleApplicationCredentialsResolvedPath = googleApplicationCredentialsPath
+  ? resolve(/* turbopackIgnore: true */ process.cwd(), googleApplicationCredentialsPath)
+  : "";
+const firebaseClientEmail =
+  process.env.FIREBASE_CLIENT_EMAIL ?? firebaseServiceAccount?.client_email ?? "";
+const firebasePrivateKey =
+  process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n") ??
+  firebaseServiceAccount?.private_key?.replace(/\\n/g, "\n") ??
+  "";
 const firebaseServiceAccountResolvedPath = firebaseServiceAccountPath
   ? resolve(/* turbopackIgnore: true */ process.cwd(), firebaseServiceAccountPath)
   : "";
@@ -28,9 +60,12 @@ const paypalSandboxClientSecret =
 
 export const serverConfig = {
   appUrl: process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000",
-  firebaseProjectId,
+  firebaseProjectId: firebaseProjectId || firebaseServiceAccount?.project_id || "",
+  firebaseServiceAccountJson,
   firebaseServiceAccountPath,
   firebaseServiceAccountResolvedPath,
+  googleApplicationCredentialsPath,
+  googleApplicationCredentialsResolvedPath,
   firebaseClientEmail,
   firebasePrivateKey,
   redisUrl: process.env.REDIS_URL ?? "",
@@ -50,7 +85,7 @@ export const serverConfig = {
   sessionSecret:
     process.env.SESSION_SECRET ??
     process.env.GOOGLE_OAUTH_CLIENT_SECRET ??
-    process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n") ??
+    firebasePrivateKey ??
     "",
   nodeEnv: process.env.NODE_ENV ?? "development",
 };
@@ -59,11 +94,22 @@ const hasFirebaseServiceAccountFile = Boolean(
   serverConfig.firebaseServiceAccountResolvedPath &&
     existsSync(serverConfig.firebaseServiceAccountResolvedPath),
 );
+const hasGoogleApplicationCredentialsFile = Boolean(
+  serverConfig.googleApplicationCredentialsResolvedPath &&
+    existsSync(serverConfig.googleApplicationCredentialsResolvedPath),
+);
+
+export const hasFirebaseApplicationDefaultConfig = Boolean(
+  serverConfig.firebaseProjectId &&
+    (hasGoogleApplicationCredentialsFile || process.env.FIREBASE_USE_APPLICATION_DEFAULT === "true"),
+);
 
 export const hasFirebaseAdminConfig = Boolean(
   serverConfig.firebaseProjectId &&
     (hasFirebaseServiceAccountFile ||
-      (serverConfig.firebaseClientEmail && serverConfig.firebasePrivateKey)),
+      Boolean(firebaseServiceAccount) ||
+      (serverConfig.firebaseClientEmail && serverConfig.firebasePrivateKey) ||
+      hasFirebaseApplicationDefaultConfig),
 );
 
 export const hasRedisConfig = Boolean(serverConfig.redisUrl);

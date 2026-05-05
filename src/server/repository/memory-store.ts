@@ -7,6 +7,7 @@ import {
 } from "@/lib/types";
 import { forbidden, notFound } from "@/server/api/errors";
 import { type Repository } from "@/server/repository/types";
+import { accountEmailsMatch, normalizeAccountEmail } from "@/server/users/account";
 
 type MemoryState = {
   scans: Map<string, ScanRecord>;
@@ -20,6 +21,13 @@ const globalState = globalThis as typeof globalThis & {
   __cyberAuditMemoryStore?: MemoryState;
 };
 
+function normalizeUserRecord(user: UserRecord): UserRecord {
+  return {
+    ...user,
+    normalizedEmail: normalizeAccountEmail(user.email),
+  };
+}
+
 function getState(): MemoryState {
   if (!globalState.__cyberAuditMemoryStore) {
     globalState.__cyberAuditMemoryStore = {
@@ -32,6 +40,63 @@ function getState(): MemoryState {
   }
 
   return globalState.__cyberAuditMemoryStore;
+}
+
+function listUsersByEmailFromState(state: MemoryState, email: string) {
+  const normalizedEmail = normalizeAccountEmail(email);
+  if (!normalizedEmail) {
+    return [];
+  }
+
+  return [...state.users.values()]
+    .filter(
+      (user) =>
+        accountEmailsMatch(user.normalizedEmail, normalizedEmail) ||
+        accountEmailsMatch(user.email, normalizedEmail),
+    )
+    .map(normalizeUserRecord);
+}
+
+function accountUserIds(state: MemoryState, userId: string, userEmail?: string | null) {
+  const ids = new Set<string>([userId]);
+  listUsersByEmailFromState(state, userEmail ?? "").forEach((user) => ids.add(user.uid));
+  return ids;
+}
+
+function scanBelongsToAccount(
+  state: MemoryState,
+  scan: ScanRecord,
+  userId: string,
+  userEmail?: string | null,
+) {
+  if (scan.createdByUserId === userId) {
+    return true;
+  }
+
+  const normalizedEmail = normalizeAccountEmail(userEmail);
+  if (!normalizedEmail) {
+    return false;
+  }
+
+  if (accountEmailsMatch(scan.createdByUserEmail, normalizedEmail)) {
+    return true;
+  }
+
+  const owner = scan.createdByUserId ? state.users.get(scan.createdByUserId) : null;
+  return Boolean(owner && accountEmailsMatch(owner.email, normalizedEmail));
+}
+
+function listScansForAccount(state: MemoryState, userId: string, userEmail?: string | null) {
+  const userIds = accountUserIds(state, userId, userEmail);
+  const normalizedEmail = normalizeAccountEmail(userEmail);
+
+  return [...state.scans.values()]
+    .filter(
+      (scan) =>
+        Boolean(scan.createdByUserId && userIds.has(scan.createdByUserId)) ||
+        Boolean(normalizedEmail && accountEmailsMatch(scan.createdByUserEmail, normalizedEmail)),
+    )
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 }
 
 export function createMemoryRepository(): Repository {
@@ -93,14 +158,12 @@ export function createMemoryRepository(): Repository {
       return (state.events.get(scanId) ?? []).slice(0, limit);
     },
 
-    async listUserScans(userId) {
-      return [...state.scans.values()]
-        .filter((scan) => scan.createdByUserId === userId)
-        .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    async listUserScans(userId, userEmail) {
+      return listScansForAccount(state, userId, userEmail);
     },
 
-    async countUserScans(userId) {
-      return [...state.scans.values()].filter((scan) => scan.createdByUserId === userId).length;
+    async countUserScans(userId, userEmail) {
+      return listScansForAccount(state, userId, userEmail).length;
     },
 
     async countAnonymousScans(anonymousClientId) {
@@ -115,18 +178,19 @@ export function createMemoryRepository(): Repository {
         .slice(0, limit);
     },
 
-    async claimScan(scanId, userId) {
+    async claimScan(scanId, userId, userEmail) {
       const scan = state.scans.get(scanId);
       if (!scan) {
         throw notFound("Scan not found.");
       }
-      if (scan.createdByUserId && scan.createdByUserId !== userId) {
+      if (scan.createdByUserId && !scanBelongsToAccount(state, scan, userId, userEmail)) {
         throw forbidden("This scan belongs to another account.");
       }
 
       const next = {
         ...scan,
         createdByUserId: userId,
+        createdByUserEmail: normalizeAccountEmail(userEmail),
         isAnonymous: false,
         visibility: "private" as const,
       };
@@ -134,27 +198,38 @@ export function createMemoryRepository(): Repository {
       return next;
     },
 
-    async unlockScan(scanId, userId) {
+    async unlockScan(scanId, userId, userEmail) {
       const scan = state.scans.get(scanId);
       if (!scan) {
         throw notFound("Scan not found.");
       }
-      if (scan.createdByUserId !== userId) {
+      if (!scanBelongsToAccount(state, scan, userId, userEmail)) {
         throw forbidden("Only the scan owner can unlock premium access.");
       }
 
-      const next = { ...scan, premiumUnlocked: true };
+      const next = {
+        ...scan,
+        createdByUserId: userId,
+        createdByUserEmail: normalizeAccountEmail(userEmail) ?? scan.createdByUserEmail ?? null,
+        premiumUnlocked: true,
+      };
       state.scans.set(scanId, next);
       return next;
     },
 
     async upsertUser(user) {
-      state.users.set(user.uid, user);
-      return user;
+      const next = normalizeUserRecord(user);
+      state.users.set(user.uid, next);
+      return next;
     },
 
     async getUser(uid) {
-      return state.users.get(uid) ?? null;
+      const user = state.users.get(uid);
+      return user ? normalizeUserRecord(user) : null;
+    },
+
+    async listUsersByEmail(email) {
+      return listUsersByEmailFromState(state, email);
     },
 
     async updateUserEntitlement(uid, subscriptionStatus, entitlementLevel, stripeCustomerId = null) {
@@ -163,26 +238,27 @@ export function createMemoryRepository(): Repository {
         throw notFound("User not found.");
       }
 
-      const next: UserRecord = {
+      const next: UserRecord = normalizeUserRecord({
         ...user,
         subscriptionStatus,
         entitlementLevel,
         stripeCustomerId: stripeCustomerId ?? user.stripeCustomerId,
-      };
+      });
       state.users.set(uid, next);
       return next;
     },
 
-    async addUserScanCredits(uid, credits) {
+    async addUserScanCredits(uid, credits, userEmail) {
       const user = state.users.get(uid);
       if (!user) {
         throw notFound("User not found.");
       }
 
-      const next: UserRecord = {
+      const next: UserRecord = normalizeUserRecord({
         ...user,
+        email: user.email ?? normalizeAccountEmail(userEmail),
         purchasedScanCredits: (user.purchasedScanCredits ?? 0) + credits,
-      };
+      });
       state.users.set(uid, next);
       return next;
     },
@@ -190,6 +266,40 @@ export function createMemoryRepository(): Repository {
     async upsertPayment(payment) {
       state.payments.set(payment.checkoutSessionId, payment);
       return payment;
+    },
+
+    async completeScanCreditPayment(payment) {
+      const existingPayment = state.payments.get(payment.checkoutSessionId) ?? null;
+      const alreadyPaid = existingPayment?.paymentStatus === "paid";
+      const now = payment.updatedAt;
+      const nextPayment: PaymentRecord = {
+        ...(existingPayment ?? payment),
+        ...payment,
+        createdAt: existingPayment?.createdAt ?? payment.createdAt,
+        paymentStatus: "paid",
+        creditedAt: existingPayment?.creditedAt ?? (alreadyPaid ? existingPayment?.updatedAt ?? now : now),
+        updatedAt: now,
+      };
+
+      if (!alreadyPaid) {
+        const user = state.users.get(payment.userId);
+        if (!user) {
+          throw notFound("User not found.");
+        }
+
+        state.users.set(
+          payment.userId,
+          normalizeUserRecord({
+            ...user,
+            email: user.email ?? normalizeAccountEmail(payment.userEmail),
+            purchasedScanCredits:
+              (user.purchasedScanCredits ?? 0) + (payment.creditsPurchased ?? 0),
+          }),
+        );
+      }
+
+      state.payments.set(payment.checkoutSessionId, nextPayment);
+      return nextPayment;
     },
 
     async getPaymentByCheckoutSessionId(checkoutSessionId) {

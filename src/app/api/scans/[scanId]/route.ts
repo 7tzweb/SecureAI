@@ -12,7 +12,7 @@ export async function GET(
   try {
     const { scanId } = await params;
     const sessionUser = await getOptionalSessionUser(request);
-    const summary = await getScanSummary(scanId, sessionUser?.uid ?? null);
+    const summary = await getScanSummary(scanId, sessionUser);
     if (!summary) {
       throw notFound("Scan not found.");
     }

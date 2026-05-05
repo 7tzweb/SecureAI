@@ -5,7 +5,9 @@ import {
   type ScanEvent,
   type ScanFinding,
   type ScanRecord,
+  type SessionUser,
   type ScanSummaryResponse,
+  type UserRecord,
 } from "@/lib/types";
 import { emptyCategoryState } from "@/lib/utils";
 import { badRequest, notFound, paymentRequired } from "@/server/api/errors";
@@ -13,6 +15,11 @@ import { getQueueDriver } from "@/server/queue";
 import { getRepository } from "@/server/repository";
 import { setScanAuthContext, type ScanAuthContext } from "@/server/scans/auth-context";
 import { validateTarget } from "@/server/scans/helpers";
+import {
+  accountEmailsMatch,
+  normalizeAccountEmail,
+  type AccountIdentity,
+} from "@/server/users/account";
 
 export const FREE_SCAN_LIMIT = 3;
 export const ANONYMOUS_SCAN_LIMIT = 3;
@@ -29,8 +36,34 @@ function buildEvent(input: Omit<ScanEvent, "id" | "createdAt">): ScanEvent {
   };
 }
 
-function canAccessFixes(scan: ScanRecord, sessionUserId: string | null) {
-  return Boolean(sessionUserId && scan.createdByUserId === sessionUserId);
+async function scanBelongsToAccount(scan: ScanRecord, sessionUser: AccountIdentity | null) {
+  if (!sessionUser) {
+    return false;
+  }
+
+  if (scan.createdByUserId === sessionUser.uid) {
+    return true;
+  }
+
+  const normalizedEmail = normalizeAccountEmail(sessionUser.email);
+  if (!normalizedEmail) {
+    return false;
+  }
+
+  if (accountEmailsMatch(scan.createdByUserEmail, normalizedEmail)) {
+    return true;
+  }
+
+  if (!scan.createdByUserId) {
+    return false;
+  }
+
+  const owner = await getRepository().getUser(scan.createdByUserId);
+  return accountEmailsMatch(owner?.email, normalizedEmail);
+}
+
+async function canAccessFixes(scan: ScanRecord, sessionUser: AccountIdentity | null) {
+  return scanBelongsToAccount(scan, sessionUser);
 }
 
 function hasPrivilegedScanAllowance(email: string | null | undefined) {
@@ -83,17 +116,32 @@ function redactFindings(findings: ScanFinding[], viewerCanAccessFixes: boolean) 
   );
 }
 
-export async function getScanQuotaSummary(userId: string): Promise<ScanQuotaSummary> {
-  const repository = getRepository();
-  const [user, usedScans] = await Promise.all([
-    repository.getUser(userId),
-    repository.countUserScans(userId),
-  ]);
+function uniqueUsersByUid(users: UserRecord[]) {
+  const byUid = new Map<string, UserRecord>();
+  users.forEach((user) => byUid.set(user.uid, user));
+  return [...byUid.values()];
+}
 
-  const privilegedAllowance = hasPrivilegedScanAllowance(user?.email);
+export async function getScanQuotaSummary(
+  userId: string,
+  userEmail?: string | null,
+): Promise<ScanQuotaSummary> {
+  const repository = getRepository();
+  const normalizedEmail = normalizeAccountEmail(userEmail);
+  const [user, usersByEmail, usedScans] = await Promise.all([
+    repository.getUser(userId),
+    normalizedEmail ? repository.listUsersByEmail(normalizedEmail) : Promise.resolve([]),
+    repository.countUserScans(userId, normalizedEmail),
+  ]);
+  const accountUsers = uniqueUsersByUid([...(user ? [user] : []), ...usersByEmail]);
+
+  const privilegedAllowance =
+    hasPrivilegedScanAllowance(user?.email) || hasPrivilegedScanAllowance(normalizedEmail);
   const hasUnlimitedPlan = privilegedAllowance;
   const freeLimit = privilegedAllowance ? PRIVILEGED_SCAN_LIMIT : FREE_SCAN_LIMIT;
-  const purchasedScanCredits = privilegedAllowance ? 0 : (user?.purchasedScanCredits ?? 0);
+  const purchasedScanCredits = privilegedAllowance
+    ? 0
+    : accountUsers.reduce((sum, accountUser) => sum + (accountUser.purchasedScanCredits ?? 0), 0);
   const totalScanAllowance = hasUnlimitedPlan
     ? PRIVILEGED_SCAN_LIMIT
     : freeLimit + purchasedScanCredits;
@@ -113,8 +161,8 @@ export async function getScanQuotaSummary(userId: string): Promise<ScanQuotaSumm
   };
 }
 
-async function assertCanCreateScan(userId: string) {
-  const quota = await getScanQuotaSummary(userId);
+async function assertCanCreateScan(userId: string, userEmail?: string | null) {
+  const quota = await getScanQuotaSummary(userId, userEmail);
   if (!quota.canCreateScans) {
     throw paymentRequired(
       `You reached your ${quota.freeLimit} free scans. Buy ${quota.upgradeScanCredits} more scan credits for $${quota.upgradePriceUsd.toFixed(2)} to continue.`,
@@ -145,11 +193,12 @@ async function assertCanCreateAnonymousScan(anonymousClientId: string) {
 export async function createScan(
   targetInput: string,
   userId: string | null,
+  userEmail: string | null,
   anonymousClientId: string | null,
   authContext: ScanAuthContext = {},
 ) {
   if (userId) {
-    await assertCanCreateScan(userId);
+    await assertCanCreateScan(userId, userEmail);
   } else if (anonymousClientId) {
     await assertCanCreateAnonymousScan(anonymousClientId);
   } else {
@@ -168,6 +217,7 @@ export async function createScan(
     normalizedTarget: target.normalizedTarget,
     targetHostname: target.targetHostname,
     createdByUserId: userId,
+    createdByUserEmail: userId ? normalizeAccountEmail(userEmail) : null,
     anonymousClientId: userId ? null : anonymousClientId,
     createdAt: now,
     updatedAt: now,
@@ -218,7 +268,7 @@ export async function createScan(
   return scan;
 }
 
-export async function getScanSummary(scanId: string, sessionUserId: string | null) {
+export async function getScanSummary(scanId: string, sessionUser: SessionUser | null) {
   const repository = getRepository();
   const initialScan = await repository.getScan(scanId);
   const scan = initialScan ? await resumeIncompleteScanIfStale(initialScan) : null;
@@ -226,13 +276,13 @@ export async function getScanSummary(scanId: string, sessionUserId: string | nul
     return null;
   }
 
-  const viewerCanAccessFixes = canAccessFixes(scan, sessionUserId);
+  const viewerCanAccessFixes = await canAccessFixes(scan, sessionUser);
   const response: ScanSummaryResponse = {
     scan,
     viewerCanAccessFixes,
     session: {
-      isAuthenticated: Boolean(sessionUserId),
-      userId: sessionUserId,
+      isAuthenticated: Boolean(sessionUser),
+      userId: sessionUser?.uid ?? null,
     },
   };
   return response;
@@ -240,7 +290,7 @@ export async function getScanSummary(scanId: string, sessionUserId: string | nul
 
 export async function getScanFindings(
   scanId: string,
-  sessionUserId: string | null,
+  sessionUser: SessionUser | null,
   category?: CategoryKey,
 ) {
   const repository = getRepository();
@@ -250,7 +300,7 @@ export async function getScanFindings(
   }
 
   const findings = await repository.listFindings(scanId, category);
-  const viewerCanAccessFixes = canAccessFixes(scan, sessionUserId);
+  const viewerCanAccessFixes = await canAccessFixes(scan, sessionUser);
   return {
     viewerCanAccessFixes,
     findings: redactFindings(findings, viewerCanAccessFixes),
@@ -261,7 +311,7 @@ export async function getScanEvents(scanId: string) {
   return getRepository().listEvents(scanId);
 }
 
-export async function claimScanToUser(scanId: string, userId: string) {
+export async function claimScanToUser(scanId: string, user: SessionUser) {
   const repository = getRepository();
   const currentScan = await repository.getScan(scanId);
   if (!currentScan) {
@@ -269,10 +319,10 @@ export async function claimScanToUser(scanId: string, userId: string) {
   }
 
   if (!currentScan.createdByUserId) {
-    await assertCanCreateScan(userId);
+    await assertCanCreateScan(user.uid, user.email);
   }
 
-  const scan = await repository.claimScan(scanId, userId);
+  const scan = await repository.claimScan(scanId, user.uid, user.email);
   await repository.addEvent(
     scanId,
     buildEvent({
@@ -281,29 +331,34 @@ export async function claimScanToUser(scanId: string, userId: string) {
       phase: "claim",
       progress: scan.progress,
       metadata: {
-        userId,
+        userId: user.uid,
+        userEmail: normalizeAccountEmail(user.email),
       },
     }),
   );
   return scan;
 }
 
-export async function listScansForUser(userId: string) {
-  return getRepository().listUserScans(userId);
+export async function listScansForUser(userId: string, userEmail?: string | null) {
+  return getRepository().listUserScans(userId, userEmail);
 }
 
-export async function listRecentScansForSidebar(sessionUserId: string | null, limit = 8) {
-  if (!sessionUserId) {
+export async function listRecentScansForSidebar(sessionUser: SessionUser | null, limit = 8) {
+  if (!sessionUser) {
     return [];
   }
 
-  const scans = await getRepository().listUserScans(sessionUserId);
+  const scans = await getRepository().listUserScans(sessionUser.uid, sessionUser.email);
   return scans.slice(0, limit);
 }
 
-export async function unlockPremiumForScan(scanId: string, userId: string) {
+export async function unlockPremiumForScan(
+  scanId: string,
+  userId: string,
+  userEmail?: string | null,
+) {
   const repository = getRepository();
-  const scan = await repository.unlockScan(scanId, userId);
+  const scan = await repository.unlockScan(scanId, userId, userEmail);
   await repository.addEvent(
     scanId,
     buildEvent({
@@ -313,19 +368,24 @@ export async function unlockPremiumForScan(scanId: string, userId: string) {
       progress: scan.progress,
       metadata: {
         userId,
+        userEmail: normalizeAccountEmail(userEmail),
       },
     }),
   );
   return scan;
 }
 
-export async function requireOwnedScan(scanId: string, userId: string) {
+export async function requireOwnedScan(
+  scanId: string,
+  userId: string,
+  userEmail?: string | null,
+) {
   const repository = getRepository();
   const scan = await repository.getScan(scanId);
   if (!scan) {
     throw notFound("Scan not found.");
   }
-  if (scan.createdByUserId !== userId) {
+  if (!(await scanBelongsToAccount(scan, { uid: userId, email: userEmail }))) {
     throw notFound("Scan not found.");
   }
   return scan;

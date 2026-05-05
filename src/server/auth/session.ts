@@ -7,6 +7,7 @@ import { unauthorized, serviceUnavailable } from "@/server/api/errors";
 import { hasFirebaseAdminConfig, hasSessionAuthConfig, serverConfig } from "@/server/config";
 import { getFirebaseAdminAuth } from "@/server/firebase-admin";
 import { getRepository } from "@/server/repository";
+import { normalizeAccountEmail } from "@/server/users/account";
 
 export const SESSION_COOKIE_NAME = "cyberaudit_session";
 const SESSION_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 5;
@@ -45,6 +46,7 @@ function toUserRecord(sessionUser: SessionUser): UserRecord {
   return {
     uid: sessionUser.uid,
     email: sessionUser.email,
+    normalizedEmail: normalizeAccountEmail(sessionUser.email),
     displayName: sessionUser.displayName,
     photoURL: sessionUser.photoURL,
     createdAt: timestamp,

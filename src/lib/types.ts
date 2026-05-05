@@ -130,6 +130,7 @@ export interface ScanRecord {
   normalizedTarget: string;
   targetHostname: string;
   createdByUserId: string | null;
+  createdByUserEmail?: string | null;
   anonymousClientId: string | null;
   createdAt: string;
   updatedAt: string;
@@ -227,6 +228,7 @@ export interface ScanEvent {
 export interface UserRecord {
   uid: string;
   email: string | null;
+  normalizedEmail?: string | null;
   displayName: string | null;
   photoURL: string | null;
   createdAt: string;
@@ -241,6 +243,7 @@ export interface UserRecord {
 export interface PaymentRecord {
   id: string;
   userId: string;
+  userEmail?: string | null;
   scanId: string;
   stripeCustomerId: string | null;
   checkoutSessionId: string;
@@ -250,6 +253,7 @@ export interface PaymentRecord {
   paypalOrderId?: string | null;
   creditsPurchased?: number;
   amountUsd?: number;
+  creditedAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }

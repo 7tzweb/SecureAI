@@ -21,19 +21,25 @@ export async function POST(request: NextRequest) {
     assertRateLimit("create-scan", identifier);
 
     const parsed = createScanSchema.parse(await request.json());
-    const scan = await createScan(parsed.target, sessionUser?.uid ?? null, anonymousClientId, {
-      scanMode: parsed.scanMode,
-      authCookieHeader: parsed.authCookieHeader,
-      secondaryAuthCookieHeader: parsed.secondaryAuthCookieHeader,
-      authLoginUrl: parsed.authLoginUrl,
-      authUsername: parsed.authUsername,
-      authPassword: parsed.authPassword,
-      authRoleLabel: parsed.authRoleLabel,
-      secondaryAuthLoginUrl: parsed.secondaryAuthLoginUrl,
-      secondaryAuthUsername: parsed.secondaryAuthUsername,
-      secondaryAuthPassword: parsed.secondaryAuthPassword,
-      secondaryAuthRoleLabel: parsed.secondaryAuthRoleLabel,
-    });
+    const scan = await createScan(
+      parsed.target,
+      sessionUser?.uid ?? null,
+      sessionUser?.email ?? null,
+      anonymousClientId,
+      {
+        scanMode: parsed.scanMode,
+        authCookieHeader: parsed.authCookieHeader,
+        secondaryAuthCookieHeader: parsed.secondaryAuthCookieHeader,
+        authLoginUrl: parsed.authLoginUrl,
+        authUsername: parsed.authUsername,
+        authPassword: parsed.authPassword,
+        authRoleLabel: parsed.authRoleLabel,
+        secondaryAuthLoginUrl: parsed.secondaryAuthLoginUrl,
+        secondaryAuthUsername: parsed.secondaryAuthUsername,
+        secondaryAuthPassword: parsed.secondaryAuthPassword,
+        secondaryAuthRoleLabel: parsed.secondaryAuthRoleLabel,
+      },
+    );
     const response = NextResponse.json({ scan }, { status: 201 });
 
     if (!sessionUser && !existingAnonymousId && anonymousClientId) {

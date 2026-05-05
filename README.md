@@ -45,7 +45,7 @@ The app is built to run locally even before external services are configured.
 - Without Firebase Admin credentials, storage falls back to the local file-backed repository.
 - Without Redis, scan jobs run through an in-process async queue.
 - Without Firebase client credentials, Google login buttons remain disabled.
-- Without a Firebase service account file, Google sessions still work through Firebase token verification, but Firestore stays disabled.
+- Without Firebase Admin credentials, Google sessions still work through Firebase token verification, but Firestore stays disabled and local development uses the file-backed store.
 - Without PayPal configuration, scan credit purchases remain disabled.
 
 These fallbacks are for development convenience only. Production deployment should use Firestore, Redis/BullMQ, Firebase Auth, and PayPal.
@@ -70,6 +70,9 @@ See `.env.example` for the full list.
 - `VITE_API_BASE_URL`
 - `FIREBASE_PROJECT_ID`
 - `FIREBASE_SERVICE_ACCOUNT_PATH`
+- `FIREBASE_SERVICE_ACCOUNT_JSON`
+- `GOOGLE_APPLICATION_CREDENTIALS`
+- `FIREBASE_USE_APPLICATION_DEFAULT`
 - `FIREBASE_CLIENT_EMAIL`
 - `FIREBASE_PRIVATE_KEY`
 - `GOOGLE_OAUTH_CLIENT_ID`

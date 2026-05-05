@@ -1,10 +1,14 @@
 import "server-only";
 
-import { readFileSync } from "node:fs";
-import { cert, getApps, initializeApp } from "firebase-admin/app";
+import { existsSync, readFileSync } from "node:fs";
+import { applicationDefault, cert, getApps, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getFirestore } from "firebase-admin/firestore";
-import { hasFirebaseAdminConfig, serverConfig } from "@/server/config";
+import {
+  hasFirebaseAdminConfig,
+  hasFirebaseApplicationDefaultConfig,
+  serverConfig,
+} from "@/server/config";
 
 export function getFirebaseAdminApp() {
   if (!hasFirebaseAdminConfig) {
@@ -15,7 +19,20 @@ export function getFirebaseAdminApp() {
     return getApps()[0]!;
   }
 
-  if (serverConfig.firebaseServiceAccountResolvedPath) {
+  if (serverConfig.firebaseClientEmail && serverConfig.firebasePrivateKey) {
+    return initializeApp({
+      credential: cert({
+        projectId: serverConfig.firebaseProjectId,
+        clientEmail: serverConfig.firebaseClientEmail,
+        privateKey: serverConfig.firebasePrivateKey,
+      }),
+    });
+  }
+
+  if (
+    serverConfig.firebaseServiceAccountResolvedPath &&
+    existsSync(serverConfig.firebaseServiceAccountResolvedPath)
+  ) {
     const serviceAccount = JSON.parse(
       readFileSync(serverConfig.firebaseServiceAccountResolvedPath, "utf8"),
     ) as {
@@ -30,6 +47,13 @@ export function getFirebaseAdminApp() {
         clientEmail: serviceAccount.client_email ?? serverConfig.firebaseClientEmail,
         privateKey: serviceAccount.private_key ?? serverConfig.firebasePrivateKey,
       }),
+    });
+  }
+
+  if (hasFirebaseApplicationDefaultConfig) {
+    return initializeApp({
+      credential: applicationDefault(),
+      projectId: serverConfig.firebaseProjectId,
     });
   }
 

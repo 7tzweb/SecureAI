@@ -2049,6 +2049,10 @@ export function ResultsClient({ scanId }: { scanId: string }) {
 
     const loadWorkspace = async () => {
       try {
+        if (status === "signed-in" && user) {
+          await ensureServerSession();
+        }
+
         const next = await fetchWorkspaceData(scanId);
         if (!cancelled) {
           startTransition(() => {
@@ -2084,7 +2088,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
         window.clearTimeout(timer);
       }
     };
-  }, [scanId, status, user?.uid]);
+  }, [ensureServerSession, scanId, status, user]);
 
   const scan = state.scan;
   const progressTarget = scan ? Math.max(0, Math.min(100, scan.progress)) : 0;
@@ -2403,8 +2407,14 @@ export function ResultsClient({ scanId }: { scanId: string }) {
     try {
       const sessionUser =
         user && status === "signed-in" ? await ensureServerSession() : await signInWithGoogle();
+      const normalizedSessionEmail = sessionUser.email?.trim().toLowerCase() ?? null;
       const shouldClaimScan =
-        Boolean(scan?.isAnonymous) || Boolean(scan?.createdByUserId === sessionUser.uid);
+        Boolean(scan?.isAnonymous) ||
+        Boolean(scan?.createdByUserId === sessionUser.uid) ||
+        Boolean(
+          normalizedSessionEmail &&
+            scan?.createdByUserEmail?.trim().toLowerCase() === normalizedSessionEmail,
+        );
 
       if (shouldClaimScan) {
         const claimResponse = await fetch(`/api/scans/${scanId}/claim`, { method: "POST" });

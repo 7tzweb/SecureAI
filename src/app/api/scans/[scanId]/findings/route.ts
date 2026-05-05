@@ -17,7 +17,7 @@ export async function GET(
       category: request.nextUrl.searchParams.get("category") ?? undefined,
     });
 
-    const findings = await getScanFindings(scanId, sessionUser?.uid ?? null, query.category);
+    const findings = await getScanFindings(scanId, sessionUser, query.category);
     if (!findings) {
       throw notFound("Scan not found.");
     }
