@@ -42,6 +42,27 @@ function chunks<T>(items: T[], size: number) {
   return result;
 }
 
+function stripUndefinedForFirestore<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) =>
+      typeof item === "undefined" ? null : stripUndefinedForFirestore(item),
+    ) as T;
+  }
+
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const sanitized: Record<string, unknown> = {};
+  Object.entries(value as Record<string, unknown>).forEach(([key, entry]) => {
+    if (typeof entry !== "undefined") {
+      sanitized[key] = stripUndefinedForFirestore(entry);
+    }
+  });
+
+  return sanitized as T;
+}
+
 export function createFirestoreRepository(): Repository {
   const db = getFirebaseAdminDb();
 
@@ -104,7 +125,7 @@ export function createFirestoreRepository(): Repository {
 
   return {
     async createScan(scan) {
-      await db.collection("scans").doc(scan.id).set(scan);
+      await db.collection("scans").doc(scan.id).set(stripUndefinedForFirestore(scan));
       return scan;
     },
 
@@ -122,7 +143,7 @@ export function createFirestoreRepository(): Repository {
 
       const existing = snapshot.data() as ScanRecord;
       const next = { ...existing, ...patch };
-      await ref.set(next, { merge: true });
+      await ref.set(stripUndefinedForFirestore(next), { merge: true });
       return next;
     },
 
@@ -137,7 +158,7 @@ export function createFirestoreRepository(): Repository {
 
         const current = snapshot.data() as ScanRecord;
         const next = mutator(current);
-        transaction.set(ref, next, { merge: true });
+        transaction.set(ref, stripUndefinedForFirestore(next), { merge: true });
         return next;
       });
     },
@@ -149,7 +170,7 @@ export function createFirestoreRepository(): Repository {
 
       current.docs.forEach((doc) => batch.delete(doc.ref));
       findings.forEach((finding) => {
-        batch.set(findingsRef.doc(finding.id), finding);
+        batch.set(findingsRef.doc(finding.id), stripUndefinedForFirestore(finding));
       });
 
       await batch.commit();
@@ -165,7 +186,12 @@ export function createFirestoreRepository(): Repository {
     },
 
     async addEvent(scanId, event) {
-      await db.collection("scans").doc(scanId).collection("events").doc(event.id).set(event);
+      await db
+        .collection("scans")
+        .doc(scanId)
+        .collection("events")
+        .doc(event.id)
+        .set(stripUndefinedForFirestore(event));
     },
 
     async listEvents(scanId, limit = 25) {
@@ -270,7 +296,7 @@ export function createFirestoreRepository(): Repository {
         isAnonymous: false,
         visibility: "private" as const,
       };
-      await ref.set(next, { merge: true });
+      await ref.set(stripUndefinedForFirestore(next), { merge: true });
       return next;
     },
 
@@ -292,13 +318,16 @@ export function createFirestoreRepository(): Repository {
         createdByUserEmail: normalizeAccountEmail(userEmail) ?? scan.createdByUserEmail ?? null,
         premiumUnlocked: true,
       };
-      await ref.set(next, { merge: true });
+      await ref.set(stripUndefinedForFirestore(next), { merge: true });
       return next;
     },
 
     async upsertUser(user) {
       const next = normalizeUserRecord(user);
-      await db.collection("users").doc(user.uid).set(next, { merge: true });
+      await db
+        .collection("users")
+        .doc(user.uid)
+        .set(stripUndefinedForFirestore(next), { merge: true });
       return next;
     },
 
@@ -323,7 +352,7 @@ export function createFirestoreRepository(): Repository {
         entitlementLevel,
         stripeCustomerId: stripeCustomerId ?? user.stripeCustomerId,
       });
-      await ref.set(next, { merge: true });
+      await ref.set(stripUndefinedForFirestore(next), { merge: true });
       return next;
     },
 
@@ -342,13 +371,16 @@ export function createFirestoreRepository(): Repository {
           email: user.email ?? normalizeAccountEmail(userEmail),
           purchasedScanCredits: (user.purchasedScanCredits ?? 0) + credits,
         });
-        transaction.set(ref, next, { merge: true });
+        transaction.set(ref, stripUndefinedForFirestore(next), { merge: true });
         return next;
       });
     },
 
     async upsertPayment(payment) {
-      await db.collection("payments").doc(payment.checkoutSessionId).set(payment, { merge: true });
+      await db
+        .collection("payments")
+        .doc(payment.checkoutSessionId)
+        .set(stripUndefinedForFirestore(payment), { merge: true });
       return payment;
     },
 
@@ -387,10 +419,10 @@ export function createFirestoreRepository(): Repository {
             purchasedScanCredits:
               (user.purchasedScanCredits ?? 0) + (payment.creditsPurchased ?? 0),
           });
-          transaction.set(userRef, nextUser, { merge: true });
+          transaction.set(userRef, stripUndefinedForFirestore(nextUser), { merge: true });
         }
 
-        transaction.set(paymentRef, nextPayment, { merge: true });
+        transaction.set(paymentRef, stripUndefinedForFirestore(nextPayment), { merge: true });
         return nextPayment;
       });
     },

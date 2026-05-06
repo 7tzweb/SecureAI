@@ -26,6 +26,7 @@ import {
   getConfidenceStyles,
   getScoreTone,
   getStatusStyles,
+  sortFindings,
   titleCaseCategory,
 } from "@/lib/utils";
 
@@ -1367,7 +1368,9 @@ async function downloadReportPdf(
   const pdfFindings = Object.fromEntries(
     categoryKeys.map((category) => [
       category,
-      findings[category].filter((finding) => !isAttackSurfaceSummaryFinding(finding)),
+      sortFindings(
+        findings[category].filter((finding) => !isAttackSurfaceSummaryFinding(finding)),
+      ),
     ]),
   ) as Record<CategoryKey, ScanFinding[]>;
   const pdfAllFindings = categoryKeys.flatMap((category) => pdfFindings[category]);
@@ -1980,10 +1983,13 @@ async function fetchWorkspaceData(scanId: string) {
   findingsPayload.findings.forEach((finding) => {
     grouped[finding.category].push(finding);
   });
+  const sortedGrouped = Object.fromEntries(
+    categoryKeys.map((category) => [category, sortFindings(grouped[category])]),
+  ) as Record<CategoryKey, ScanFinding[]>;
 
   return {
     scan: summary.scan,
-    findings: grouped,
+    findings: sortedGrouped,
     events: eventsPayload.events,
     recentScans: recentPayload.scans,
     viewerCanAccessFixes: findingsPayload.viewerCanAccessFixes,
@@ -2344,24 +2350,34 @@ export function ResultsClient({ scanId }: { scanId: string }) {
       failCount: item.failCount,
     })),
   ];
-  const activeFindings = rawActiveFindings.filter((finding) => {
-    if (severityFilter !== "all" && finding.severity !== severityFilter) {
-      return false;
-    }
-    if (confidenceFilter !== "all" && (finding.confidence ?? "info") !== confidenceFilter) {
-      return false;
-    }
-    if (confirmedOnly && (finding.confidence ?? "info") !== "confirmed") {
-      return false;
-    }
-    if (attackPathOnly && !finding.attackPathParticipant) {
-      return false;
-    }
-    if (publicOnly && !finding.publicEndpoint) {
-      return false;
-    }
-    return true;
-  });
+  const activeFindings = sortFindings(
+    rawActiveFindings.filter((finding) => {
+      if (severityFilter !== "all" && finding.severity !== severityFilter) {
+        return false;
+      }
+      if (confidenceFilter !== "all" && (finding.confidence ?? "info") !== confidenceFilter) {
+        return false;
+      }
+      if (confirmedOnly && (finding.confidence ?? "info") !== "confirmed") {
+        return false;
+      }
+      if (attackPathOnly && !finding.attackPathParticipant) {
+        return false;
+      }
+      if (publicOnly && !finding.publicEndpoint) {
+        return false;
+      }
+      return true;
+    }),
+  );
+  const reportFindingsByCategory = Object.fromEntries(
+    categoryKeys.map((category) => [
+      category,
+      sortFindings(
+        state.findings[category].filter((finding) => !isAttackSurfaceSummaryFinding(finding)),
+      ),
+    ]),
+  ) as Record<CategoryKey, ScanFinding[]>;
   const filteredRecentScans = useMemo(() => {
     const query = recentScanQuery.trim().toLowerCase();
     if (!query) {
@@ -3281,13 +3297,13 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                           {category === "security" ? "Security Report" : `${titleCaseCategory(category)} Appendix`}
                         </h3>
                         <p className="mt-1 text-sm text-slate-500">
-                      {state.findings[category].filter((finding) => !isAttackSurfaceSummaryFinding(finding)).length} checks in this category
+                          {reportFindingsByCategory[category].length} checks in this category
                         </p>
                       </div>
                     </div>
 
                     <div className="mt-4 space-y-4">
-                      {state.findings[category].filter((finding) => !isAttackSurfaceSummaryFinding(finding)).map((finding) => (
+                      {reportFindingsByCategory[category].map((finding) => (
                         <article
                           key={`report-card-${finding.id}`}
                           className={cn(
