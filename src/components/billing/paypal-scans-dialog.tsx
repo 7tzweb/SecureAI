@@ -5,6 +5,7 @@ import { createPortal } from "react-dom";
 import { Loader2, X } from "lucide-react";
 import { useAuth } from "@/components/providers/auth-provider";
 import { Button } from "@/components/ui/button";
+import { defaultScanPack, getScanPack, scanPacks } from "@/lib/scan-packs";
 import { type ScanQuotaSummary } from "@/lib/types";
 
 type PayPalApproveData = {
@@ -37,7 +38,7 @@ declare global {
   }
 }
 
-type PaypalCreditsDialogProps = {
+type PaypalScansDialogProps = {
   open: boolean;
   quota: ScanQuotaSummary | null;
   onClose: () => void;
@@ -125,46 +126,36 @@ async function parseJsonResponse<T>(response: Response) {
   return payload as T;
 }
 
-export function PaypalCreditsDialog({
+export function PaypalScansDialog({
   open,
   quota,
   onClose,
   onApproved,
-}: PaypalCreditsDialogProps) {
+}: PaypalScansDialogProps) {
   const { user, ensureServerSession } = useAuth();
   const buttonsRef = useRef<HTMLDivElement | null>(null);
-  const creditsRef = useRef<number | null>(quota?.upgradeScanCredits ?? 20);
+  const scansRef = useRef<number | null>(defaultScanPack.scans);
   const [error, setError] = useState<string | null>(null);
-  const [creditsInput, setCreditsInput] = useState(String(quota?.upgradeScanCredits ?? 20));
+  const [selectedScans, setSelectedScans] = useState<number>(defaultScanPack.scans);
   const [checkoutMode, setCheckoutMode] = useState<"live" | "sandbox" | null>(null);
   const [status, setStatus] = useState<"idle" | "loading" | "ready" | "capturing" | "complete">(
     "idle",
   );
-  const minimumCredits = quota?.upgradeScanCredits ?? 20;
-  const basePriceUsd = quota?.upgradePriceUsd ?? 10;
-  const pricePerCreditUsd = basePriceUsd / minimumCredits;
-  const parsedCredits = Number.parseInt(creditsInput, 10);
-  const hasValidCreditsInput = Number.isInteger(parsedCredits) && parsedCredits >= minimumCredits;
-  const selectedCredits = hasValidCreditsInput ? parsedCredits : minimumCredits;
-  const totalPriceUsd = Number((selectedCredits * pricePerCreditUsd).toFixed(2));
-  const quickSelectOptions = [
-    minimumCredits,
-    minimumCredits * 2,
-    minimumCredits * 5,
-    minimumCredits * 10,
-  ];
+  const defaultScans = quota?.upgradeScans ?? defaultScanPack.scans;
+  const defaultPack = getScanPack(defaultScans) ?? defaultScanPack;
+  const selectedPack = getScanPack(selectedScans) ?? defaultPack;
 
   useEffect(() => {
-    creditsRef.current = hasValidCreditsInput ? parsedCredits : null;
-  }, [hasValidCreditsInput, parsedCredits]);
+    scansRef.current = selectedPack.scans;
+  }, [selectedPack.scans]);
 
   const resetDialogState = useCallback(() => {
-    creditsRef.current = minimumCredits;
-    setCreditsInput(String(minimumCredits));
+    scansRef.current = defaultScanPack.scans;
+    setSelectedScans(defaultScanPack.scans);
     setCheckoutMode(null);
     setError(null);
     setStatus("idle");
-  }, [minimumCredits]);
+  }, []);
 
   const handleClose = () => {
     resetDialogState();
@@ -224,8 +215,8 @@ export function PaypalCreditsDialog({
             label: "paypal",
           },
           createOrder: async () => {
-            if (!creditsRef.current) {
-              throw new Error(`Minimum purchase is ${minimumCredits} credits.`);
+            if (!scansRef.current) {
+              throw new Error("Select a scan pack.");
             }
 
             await ensureServerSession();
@@ -234,7 +225,7 @@ export function PaypalCreditsDialog({
               headers: {
                 "Content-Type": "application/json",
               },
-              body: JSON.stringify({ credits: creditsRef.current }),
+              body: JSON.stringify({ scans: scansRef.current }),
             });
             const payload = await parseJsonResponse<{ orderId: string }>(response);
             return payload.orderId;
@@ -285,7 +276,7 @@ export function PaypalCreditsDialog({
       cancelled = true;
       buttons?.close?.();
     };
-  }, [ensureServerSession, minimumCredits, onApproved, open, resetDialogState]);
+  }, [ensureServerSession, onApproved, open, resetDialogState]);
 
   if (!open || typeof document === "undefined") {
     return null;
@@ -297,10 +288,10 @@ export function PaypalCreditsDialog({
         <div className="w-full max-w-[480px] rounded-[1.5rem] border border-white/70 bg-white p-5 shadow-[0_24px_80px_rgba(15,23,42,0.24)]">
           <div className="flex items-start justify-between gap-4">
             <div>
-              <p className="text-sm font-semibold text-slate-900">Buy more credits</p>
+              <p className="text-sm font-semibold text-slate-900">Buy more scans</p>
               <p className="mt-1 text-sm leading-6 text-slate-500">
-                Start at {minimumCredits} credits for ${basePriceUsd.toFixed(2)} and choose the amount you
-                want for this Google account.
+                Start at {defaultPack.scans} scans for ${defaultPack.priceUsd.toFixed(2)} and choose a pack
+                for this Google account.
               </p>
             </div>
             <button
@@ -315,47 +306,33 @@ export function PaypalCreditsDialog({
 
           <div className="mt-5 rounded-[1.25rem] bg-slate-50 p-4">
             <div className="flex items-center justify-between gap-4">
-              <label htmlFor="paypal-credits-input" className="text-sm font-medium text-slate-700">
-                Credits to buy
-              </label>
-              <p className="text-xs font-medium text-slate-500">${pricePerCreditUsd.toFixed(2)} per credit</p>
+              <p className="text-sm font-medium text-slate-700">Scans to buy</p>
+              <p className="text-xs font-medium text-slate-500">Total ${selectedPack.priceUsd.toFixed(2)}</p>
             </div>
 
-            <div className="mt-3 flex items-center gap-3">
-              <input
-                id="paypal-credits-input"
-                type="number"
-                min={minimumCredits}
-                step={1}
-                inputMode="numeric"
-                value={creditsInput}
-                onChange={(event) => setCreditsInput(event.target.value)}
-                className="h-12 w-full rounded-2xl border border-slate-200 bg-white px-4 text-base font-semibold text-slate-900 outline-none transition-colors focus:border-[var(--primary)]"
-              />
-              <div className="min-w-[118px] rounded-2xl border border-slate-200 bg-white px-4 py-3 text-right">
-                <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-slate-400">Total</p>
-                <p className="mt-1 text-lg font-semibold text-slate-900">${totalPriceUsd.toFixed(2)}</p>
-              </div>
+            <div className="mt-3 grid gap-2 sm:grid-cols-3">
+              {scanPacks.map((pack) => {
+                const selected = pack.scans === selectedPack.scans;
+                return (
+                  <button
+                    key={pack.scans}
+                    type="button"
+                    onClick={() => setSelectedScans(pack.scans)}
+                    className={`rounded-2xl border px-4 py-3 text-left transition-colors ${
+                      selected
+                        ? "border-[var(--primary)] bg-white shadow-sm"
+                        : "border-slate-200 bg-white text-slate-700 hover:bg-slate-100"
+                    }`}
+                    aria-pressed={selected}
+                  >
+                    <span className="block text-sm font-semibold text-slate-900">{pack.scans} scans</span>
+                    <span className="mt-1 block text-xs font-medium text-slate-500">
+                      ${pack.priceUsd.toFixed(2)}
+                    </span>
+                  </button>
+                );
+              })}
             </div>
-
-            <div className="mt-3 flex flex-wrap gap-2">
-              {quickSelectOptions.map((credits) => (
-                <button
-                  key={credits}
-                  type="button"
-                  onClick={() => setCreditsInput(String(credits))}
-                  className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-100"
-                >
-                  {credits} credits
-                </button>
-              ))}
-            </div>
-
-            {!hasValidCreditsInput ? (
-              <p className="mt-3 text-sm font-medium text-[var(--danger)]">
-                Minimum purchase is {minimumCredits} credits.
-              </p>
-            ) : null}
 
             {checkoutMode === "sandbox" ? (
               <p className="mt-3 text-sm font-medium text-amber-700">
@@ -375,7 +352,7 @@ export function PaypalCreditsDialog({
 
             {status === "complete" ? (
               <p className="mt-3 text-sm font-medium text-emerald-700">
-                Payment complete. Credits were added to your account.
+                Payment complete. Scans were added to your account.
               </p>
             ) : null}
 

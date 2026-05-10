@@ -37,6 +37,7 @@ function normalizeUserRecord(user: UserRecord): UserRecord {
   return {
     ...user,
     normalizedEmail: normalizeAccountEmail(user.email),
+    purchasedScans: user.purchasedScans ?? user.purchasedScanCredits ?? 0,
   };
 }
 
@@ -370,7 +371,7 @@ export function createFileRepository(): Repository {
       });
     },
 
-    async addUserScanCredits(uid, credits, userEmail) {
+    async addUserScans(uid, scans, userEmail) {
       return withStoreLock(async () => {
         const store = await readStore();
         const user = store.users[uid];
@@ -381,7 +382,7 @@ export function createFileRepository(): Repository {
         const next: UserRecord = normalizeUserRecord({
           ...user,
           email: user.email ?? normalizeAccountEmail(userEmail),
-          purchasedScanCredits: (user.purchasedScanCredits ?? 0) + credits,
+          purchasedScans: (user.purchasedScans ?? user.purchasedScanCredits ?? 0) + scans,
         });
         store.users[uid] = next;
         await writeStore(store);
@@ -398,7 +399,7 @@ export function createFileRepository(): Repository {
       });
     },
 
-    async completeScanCreditPayment(payment) {
+    async completeScanPayment(payment) {
       return withStoreLock(async () => {
         const store = await readStore();
         const existingPayment = store.payments[payment.checkoutSessionId] ?? null;
@@ -409,7 +410,10 @@ export function createFileRepository(): Repository {
           ...payment,
           createdAt: existingPayment?.createdAt ?? payment.createdAt,
           paymentStatus: "paid",
-          creditedAt: existingPayment?.creditedAt ?? (alreadyPaid ? existingPayment?.updatedAt ?? now : now),
+          addedToAccountAt:
+            existingPayment?.addedToAccountAt ??
+            existingPayment?.creditedAt ??
+            (alreadyPaid ? existingPayment?.updatedAt ?? now : now),
           updatedAt: now,
         };
 
@@ -422,8 +426,9 @@ export function createFileRepository(): Repository {
           store.users[payment.userId] = normalizeUserRecord({
             ...user,
             email: user.email ?? normalizeAccountEmail(payment.userEmail),
-            purchasedScanCredits:
-              (user.purchasedScanCredits ?? 0) + (payment.creditsPurchased ?? 0),
+            purchasedScans:
+              (user.purchasedScans ?? user.purchasedScanCredits ?? 0) +
+              (payment.scansPurchased ?? payment.creditsPurchased ?? 0),
           });
         }
 

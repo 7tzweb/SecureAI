@@ -15,6 +15,7 @@ function normalizeUserRecord(user: UserRecord): UserRecord {
   return {
     ...user,
     normalizedEmail: normalizeAccountEmail(user.email),
+    purchasedScans: user.purchasedScans ?? user.purchasedScanCredits ?? 0,
   };
 }
 
@@ -356,7 +357,7 @@ export function createFirestoreRepository(): Repository {
       return next;
     },
 
-    async addUserScanCredits(uid, credits, userEmail) {
+    async addUserScans(uid, scans, userEmail) {
       const ref = db.collection("users").doc(uid);
 
       return db.runTransaction(async (transaction) => {
@@ -369,7 +370,7 @@ export function createFirestoreRepository(): Repository {
         const next = normalizeUserRecord({
           ...user,
           email: user.email ?? normalizeAccountEmail(userEmail),
-          purchasedScanCredits: (user.purchasedScanCredits ?? 0) + credits,
+          purchasedScans: (user.purchasedScans ?? user.purchasedScanCredits ?? 0) + scans,
         });
         transaction.set(ref, stripUndefinedForFirestore(next), { merge: true });
         return next;
@@ -384,7 +385,7 @@ export function createFirestoreRepository(): Repository {
       return payment;
     },
 
-    async completeScanCreditPayment(payment) {
+    async completeScanPayment(payment) {
       const paymentRef = db.collection("payments").doc(payment.checkoutSessionId);
       const userRef = db.collection("users").doc(payment.userId);
 
@@ -403,7 +404,10 @@ export function createFirestoreRepository(): Repository {
           ...payment,
           createdAt: existingPayment?.createdAt ?? payment.createdAt,
           paymentStatus: "paid",
-          creditedAt: existingPayment?.creditedAt ?? (alreadyPaid ? existingPayment?.updatedAt ?? now : now),
+          addedToAccountAt:
+            existingPayment?.addedToAccountAt ??
+            existingPayment?.creditedAt ??
+            (alreadyPaid ? existingPayment?.updatedAt ?? now : now),
           updatedAt: now,
         };
 
@@ -416,8 +420,9 @@ export function createFirestoreRepository(): Repository {
           const nextUser = normalizeUserRecord({
             ...user,
             email: user.email ?? normalizeAccountEmail(payment.userEmail),
-            purchasedScanCredits:
-              (user.purchasedScanCredits ?? 0) + (payment.creditsPurchased ?? 0),
+            purchasedScans:
+              (user.purchasedScans ?? user.purchasedScanCredits ?? 0) +
+              (payment.scansPurchased ?? payment.creditsPurchased ?? 0),
           });
           transaction.set(userRef, stripUndefinedForFirestore(nextUser), { merge: true });
         }

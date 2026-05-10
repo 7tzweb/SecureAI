@@ -4,7 +4,7 @@ import type { CSSProperties } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { startTransition, useEffect, useMemo, useState } from "react";
 import { CheckCircle2, Clock3, Download, FileText, History, Search, Shield, Wrench, X } from "lucide-react";
-import { PaypalCreditsDialog } from "@/components/billing/paypal-credits-dialog";
+import { PaypalScansDialog } from "@/components/billing/paypal-scans-dialog";
 import { FindingCard } from "@/components/results/finding-card";
 import { useAuth } from "@/components/providers/auth-provider";
 import { dispatchQuotaRefresh } from "@/lib/quota-events";
@@ -2996,7 +2996,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
         </main>
       </div>
 
-      <PaypalCreditsDialog
+      <PaypalScansDialog
         open={paypalOpen}
         quota={quota}
         onClose={() => setPaypalOpen(false)}

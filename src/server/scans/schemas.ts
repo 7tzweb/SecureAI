@@ -1,6 +1,6 @@
 import { z } from "zod";
+import { isScanPackSize } from "@/lib/scan-packs";
 import { categoryKeys } from "@/lib/types";
-import { SCAN_CREDIT_PACK_SIZE } from "@/server/scans/service";
 
 export const createScanSchema = z.object({
   target: z.string().trim().min(1).max(255),
@@ -40,7 +40,9 @@ export const paypalCaptureSchema = z.object({
 });
 
 export const paypalOrderSchema = z.object({
-  credits: z.coerce.number().int().min(SCAN_CREDIT_PACK_SIZE).max(10_000),
+  scans: z.coerce.number().int().refine(isScanPackSize, {
+    message: "Select a valid scan pack.",
+  }),
 });
 
 export const sessionSchema = z.object({

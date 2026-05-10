@@ -40,8 +40,8 @@ export interface Repository {
     entitlementLevel: EntitlementLevel,
     stripeCustomerId?: string | null,
   ): Promise<UserRecord>;
-  addUserScanCredits(uid: string, credits: number, userEmail?: string | null): Promise<UserRecord>;
+  addUserScans(uid: string, scans: number, userEmail?: string | null): Promise<UserRecord>;
   upsertPayment(payment: PaymentRecord): Promise<PaymentRecord>;
-  completeScanCreditPayment(payment: PaymentRecord): Promise<PaymentRecord>;
+  completeScanPayment(payment: PaymentRecord): Promise<PaymentRecord>;
   getPaymentByCheckoutSessionId(checkoutSessionId: string): Promise<PaymentRecord | null>;
 }

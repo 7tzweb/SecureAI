@@ -11,8 +11,8 @@ This file should stay short and focus on the current product baseline plus the m
 - Next.js + TypeScript application for live website audits across Security, SEO, and Performance
 - Anonymous users can start scans and view the main report
 - Google sign-in is required to unlock fix guidance and link scans into account history
-- Signed-in users receive 3 free scans
-- Additional usage is sold as a PayPal credit pack: 30 scans for $4.90
+- Signed-in users receive 2 free scans
+- Additional usage is sold as PayPal scan packs: 20 scans for $4.99, 50 scans for $9.99, or 120 scans for $19.90
 - Shared header, report workspace, and history screens are live
 - Firestore is the primary production store when configured
 - `.cyberaudit/runtime-store.json` is the local file-backed fallback store

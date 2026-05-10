@@ -1,16 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { getScanPack, scanPacks } from "@/lib/scan-packs";
 import { badRequest, serviceUnavailable } from "@/server/api/errors";
 import { hasPayPalConfig, serverConfig } from "@/server/config";
 import { getRepository } from "@/server/repository";
-import {
-  getScanQuotaSummary,
-  SCAN_CREDIT_PACK_PRICE_USD,
-  SCAN_CREDIT_PACK_SIZE,
-} from "@/server/scans/service";
+import { getScanQuotaSummary, SCAN_PACK_SIZE } from "@/server/scans/service";
 
-export const SCAN_CREDIT_PACK_PRODUCT_KEY = "scan-credit-purchase";
+export const SCAN_PACK_PRODUCT_KEY = "scan-purchase";
 const PAYPAL_SANDBOX_TEST_EMAIL = "xsever77@gmail.com";
-const SCAN_CREDIT_UNIT_PRICE_USD = SCAN_CREDIT_PACK_PRICE_USD / SCAN_CREDIT_PACK_SIZE;
 
 type PayPalEnvironment = "live" | "sandbox";
 type PayPalProfile = {
@@ -124,41 +120,33 @@ export function getPayPalCheckoutConfig(userEmail: string | null | undefined) {
   };
 }
 
-function normalizeCreditsPurchase(credits: number) {
-  if (!Number.isFinite(credits) || !Number.isInteger(credits)) {
-    throw badRequest("Credits must be a whole number.", "PAYPAL_CREDITS_INVALID");
+function normalizeScanPurchase(scans: number) {
+  if (!Number.isFinite(scans) || !Number.isInteger(scans)) {
+    throw badRequest("Scans must be a whole number.", "PAYPAL_SCANS_INVALID");
   }
 
-  if (credits < SCAN_CREDIT_PACK_SIZE) {
+  const pack = getScanPack(scans);
+  if (!pack) {
     throw badRequest(
-      `Credits must start at ${SCAN_CREDIT_PACK_SIZE}.`,
-      "PAYPAL_CREDITS_BELOW_MINIMUM",
+      `Scans must be one of: ${scanPacks.map((option) => option.scans).join(", ")}.`,
+      scans < SCAN_PACK_SIZE ? "PAYPAL_SCANS_BELOW_MINIMUM" : "PAYPAL_SCANS_INVALID",
     );
   }
 
-  if (credits > 10_000) {
-    throw badRequest("Credits request is too large.", "PAYPAL_CREDITS_TOO_LARGE");
-  }
-
-  return credits;
+  return pack;
 }
 
-function calculateCreditsAmountUsd(credits: number) {
-  return Number((credits * SCAN_CREDIT_UNIT_PRICE_USD).toFixed(2));
+function calculateScanAmountUsd(scans: number) {
+  return getScanPack(scans)?.priceUsd ?? null;
 }
 
-function inferCreditsFromAmount(value: string | undefined) {
+function inferScansFromAmount(value: string | undefined) {
   const amountUsd = Number(value);
   if (!Number.isFinite(amountUsd)) {
     return null;
   }
 
-  const credits = amountUsd / SCAN_CREDIT_UNIT_PRICE_USD;
-  if (!Number.isInteger(credits) || credits < SCAN_CREDIT_PACK_SIZE) {
-    return null;
-  }
-
-  return credits;
+  return scanPacks.find((pack) => Math.abs(amountUsd - pack.priceUsd) <= 0.001)?.scans ?? null;
 }
 
 function resolvePayPalErrorMessage(payload: PayPalErrorResponse | null) {
@@ -215,15 +203,16 @@ async function getPayPalAccessToken(profile: PayPalProfile) {
   return payload.access_token;
 }
 
-export async function createPayPalScanCreditOrder(
+export async function createPayPalScanOrder(
   userId: string,
-  credits: number,
+  scans: number,
   userEmail: string | null | undefined,
 ) {
-  const requestedCredits = normalizeCreditsPurchase(credits);
+  const scanPack = normalizeScanPurchase(scans);
+  const requestedScans = scanPack.scans;
   const profile = getPayPalProfile(userEmail);
   const accessToken = await getPayPalAccessToken(profile);
-  const amountUsd = calculateCreditsAmountUsd(requestedCredits);
+  const amountUsd = scanPack.priceUsd;
   const price = amountUsd.toFixed(2);
 
   const order = await paypalFetch<PayPalOrderResponse>(profile, "/v2/checkout/orders", {
@@ -238,7 +227,7 @@ export async function createPayPalScanCreditOrder(
       purchase_units: [
         {
           custom_id: userId,
-          description: `${requestedCredits} fixnx scan credits`,
+          description: `${requestedScans} fixnx scans`,
           amount: {
             currency_code: "USD",
             value: price,
@@ -251,11 +240,11 @@ export async function createPayPalScanCreditOrder(
           },
           items: [
             {
-              name: "fixnx scan credit",
-              quantity: String(requestedCredits),
+              name: `${requestedScans} fixnx scans`,
+              quantity: "1",
               unit_amount: {
                 currency_code: "USD",
-                value: SCAN_CREDIT_UNIT_PRICE_USD.toFixed(2),
+                value: price,
               },
             },
           ],
@@ -272,14 +261,14 @@ export async function createPayPalScanCreditOrder(
     id: randomUUID(),
     userId,
     userEmail: userEmail ?? null,
-    scanId: `credits:${userId}`,
+    scanId: `scans:${userId}`,
     stripeCustomerId: null,
     checkoutSessionId: order.id,
     paymentStatus: "pending",
-    productKey: SCAN_CREDIT_PACK_PRODUCT_KEY,
+    productKey: SCAN_PACK_PRODUCT_KEY,
     paymentProvider: "paypal",
     paypalOrderId: order.id,
-    creditsPurchased: requestedCredits,
+    scansPurchased: requestedScans,
     amountUsd,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -288,7 +277,7 @@ export async function createPayPalScanCreditOrder(
   return order.id;
 }
 
-export async function capturePayPalScanCreditOrder(
+export async function capturePayPalScanOrder(
   orderId: string,
   userId: string,
   userEmail: string | null | undefined,
@@ -322,8 +311,10 @@ export async function capturePayPalScanCreditOrder(
   const purchaseUnit = order.purchase_units?.[0];
   const capture = purchaseUnit?.payments?.captures?.[0];
   const amount = capture?.amount ?? purchaseUnit?.amount;
-  const expectedCredits = existingPayment?.creditsPurchased ?? inferCreditsFromAmount(amount?.value);
-  const expectedAmountUsd = existingPayment?.amountUsd ?? calculateCreditsAmountUsd(expectedCredits ?? 0);
+  const expectedScans =
+    existingPayment?.scansPurchased ?? existingPayment?.creditsPurchased ?? inferScansFromAmount(amount?.value);
+  const expectedAmountUsd =
+    existingPayment?.amountUsd ?? (expectedScans ? calculateScanAmountUsd(expectedScans) : null);
   const capturedAmountUsd = Number(amount?.value);
 
   if (order.status !== "COMPLETED" || capture?.status !== "COMPLETED") {
@@ -334,12 +325,13 @@ export async function capturePayPalScanCreditOrder(
     throw badRequest("This PayPal order belongs to another account.", "PAYPAL_ACCOUNT_MISMATCH");
   }
 
-  if (!expectedCredits) {
-    throw badRequest("PayPal payment credits are invalid.", "PAYPAL_CREDITS_INVALID", order);
+  if (!expectedScans) {
+    throw badRequest("PayPal payment scans are invalid.", "PAYPAL_SCANS_INVALID", order);
   }
 
   if (
     amount?.currency_code !== "USD" ||
+    expectedAmountUsd === null ||
     !Number.isFinite(capturedAmountUsd) ||
     Math.abs(capturedAmountUsd - expectedAmountUsd) > 0.001
   ) {
@@ -347,23 +339,23 @@ export async function capturePayPalScanCreditOrder(
   }
 
   const now = new Date().toISOString();
-  await repository.completeScanCreditPayment({
+  await repository.completeScanPayment({
     ...(existingPayment ?? {
       id: randomUUID(),
       createdAt: now,
     }),
     userId,
     userEmail: userEmail ?? existingPayment?.userEmail ?? null,
-    scanId: `credits:${userId}`,
+    scanId: existingPayment?.scanId ?? `scans:${userId}`,
     stripeCustomerId: null,
     checkoutSessionId: orderId,
     paymentStatus: "paid",
-    productKey: SCAN_CREDIT_PACK_PRODUCT_KEY,
+    productKey: existingPayment?.productKey ?? SCAN_PACK_PRODUCT_KEY,
     paymentProvider: "paypal",
     paypalOrderId: orderId,
-    creditsPurchased: expectedCredits,
+    scansPurchased: expectedScans,
     amountUsd: expectedAmountUsd,
-    creditedAt: now,
+    addedToAccountAt: now,
     updatedAt: now,
   });
 

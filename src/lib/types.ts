@@ -237,6 +237,7 @@ export interface UserRecord {
   subscriptionStatus: SubscriptionStatus;
   stripeCustomerId: string | null;
   entitlementLevel: EntitlementLevel;
+  purchasedScans?: number;
   purchasedScanCredits?: number;
 }
 
@@ -251,7 +252,9 @@ export interface PaymentRecord {
   productKey: string;
   paymentProvider?: "stripe" | "paypal";
   paypalOrderId?: string | null;
+  scansPurchased?: number;
   creditsPurchased?: number;
+  addedToAccountAt?: string | null;
   amountUsd?: number;
   creditedAt?: string | null;
   createdAt: string;
@@ -270,14 +273,14 @@ export interface SessionUser {
 export interface ScanQuotaSummary {
   usedScans: number;
   freeLimit: number;
-  purchasedScanCredits: number;
+  purchasedScans: number;
   totalScanAllowance: number;
   remainingScans: number;
   requiresUpgrade: boolean;
   hasUnlimitedPlan: boolean;
   canCreateScans: boolean;
   upgradePriceUsd: number;
-  upgradeScanCredits: number;
+  upgradeScans: number;
 }
 
 export interface ScanSummaryResponse {

@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useState, useTransition } from "react";
 import { ArrowRight, ExternalLink, Globe, KeyRound, Loader2 } from "lucide-react";
-import { PaypalCreditsDialog } from "@/components/billing/paypal-credits-dialog";
+import { PaypalScansDialog } from "@/components/billing/paypal-scans-dialog";
 import { useAuth } from "@/components/providers/auth-provider";
 import { dispatchQuotaRefresh, subscribeQuotaRefresh } from "@/lib/quota-events";
 import { type ScanQuotaSummary } from "@/lib/types";
@@ -405,7 +405,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
                     </>
                   ) : (
                     <>
-                      Buy {quota.upgradeScanCredits} credits for ${quota.upgradePriceUsd.toFixed(2)}
+                      Buy {quota.upgradeScans} scans for ${quota.upgradePriceUsd.toFixed(2)}
                       <ExternalLink className="h-4 w-4" />
                     </>
                   )}
@@ -477,7 +477,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
                 </>
               ) : (
                 <>
-                  Buy {quota?.upgradeScanCredits ?? 20} credits for ${(quota?.upgradePriceUsd ?? 10).toFixed(2)}
+                  Buy {quota?.upgradeScans ?? 20} scans for ${(quota?.upgradePriceUsd ?? 4.99).toFixed(2)}
                   <ExternalLink className="h-4 w-4" />
                 </>
               )}
@@ -485,7 +485,7 @@ export function StartAuditForm({ variant = "hero", className }: StartAuditFormPr
           ) : null}
         </div>
       )}
-      <PaypalCreditsDialog
+      <PaypalScansDialog
         open={paypalOpen}
         quota={quota}
         onClose={() => setPaypalOpen(false)}

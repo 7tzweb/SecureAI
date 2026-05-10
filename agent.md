@@ -23,8 +23,8 @@ fixnx is a Next.js web app that scans a public website and shows a live audit ac
 4. Anonymous users can view the report summary and findings.
 5. Exact remediation details and fix guidance require Google sign-in.
 6. When a user signs in from a report, the scan is claimed into that account when allowed.
-7. Signed-in users get 3 free scans.
-8. Additional scans are sold as a PayPal credit pack: 30 scans for $4.90.
+7. Signed-in users get 2 free scans.
+8. Additional scans are sold as PayPal scan packs: 20 scans for $4.99, 50 scans for $9.99, or 120 scans for $19.90.
 
 ## Core Stack
 
@@ -42,7 +42,7 @@ fixnx is a Next.js web app that scans a public website and shows a live audit ac
 2. Keep scans asynchronous; do not move long-running work into request/response handlers.
 3. Prefer passive, low-risk checks. Do not add destructive or aggressive scanning behavior.
 4. Keep Google sign-in gating only around saved history, account linkage, and fix guidance.
-5. Keep billing aligned with the current PayPal credit model unless explicitly asked to change it.
+5. Keep billing aligned with the current PayPal scan pack model unless explicitly asked to change it.
 6. Split new work into focused modules instead of growing already-large files.
 7. Keep docs short and current. Long archives should stay outside the active working context.
 

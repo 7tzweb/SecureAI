@@ -1,6 +1,6 @@
 # fixnx
 
-fixnx is a production-oriented Next.js application for website auditing across security, SEO, and performance. It creates scans immediately, processes categories asynchronously, streams partial results to the report page, keeps fix details behind Google sign-in, and enforces 3 free scans per signed-in account with optional 30-scan PayPal credit packs.
+fixnx is a production-oriented Next.js application for website auditing across security, SEO, and performance. It creates scans immediately, processes categories asynchronously, streams partial results to the report page, keeps fix details behind Google sign-in, and enforces 2 free scans per signed-in account with optional PayPal scan packs.
 
 ## Stack
 
@@ -46,7 +46,7 @@ The app is built to run locally even before external services are configured.
 - Without Redis, scan jobs run through an in-process async queue.
 - Without Firebase client credentials, Google login buttons remain disabled.
 - Without Firebase Admin credentials, Google sessions still work through Firebase token verification, but Firestore stays disabled and local development uses the file-backed store.
-- Without PayPal configuration, scan credit purchases remain disabled.
+- Without PayPal configuration, scan purchases remain disabled.
 
 These fallbacks are for development convenience only. Production deployment should use Firestore, Redis/BullMQ, Firebase Auth, and PayPal.
 

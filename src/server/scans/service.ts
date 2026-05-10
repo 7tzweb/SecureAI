@@ -9,6 +9,7 @@ import {
   type ScanSummaryResponse,
   type UserRecord,
 } from "@/lib/types";
+import { defaultScanPack } from "@/lib/scan-packs";
 import { emptyCategoryState } from "@/lib/utils";
 import { badRequest, notFound, paymentRequired } from "@/server/api/errors";
 import { getQueueDriver } from "@/server/queue";
@@ -21,10 +22,10 @@ import {
   type AccountIdentity,
 } from "@/server/users/account";
 
-export const FREE_SCAN_LIMIT = 3;
-export const ANONYMOUS_SCAN_LIMIT = 3;
-export const SCAN_CREDIT_PACK_SIZE = 20;
-export const SCAN_CREDIT_PACK_PRICE_USD = 10;
+export const FREE_SCAN_LIMIT = 2;
+export const ANONYMOUS_SCAN_LIMIT = 2;
+export const SCAN_PACK_SIZE = defaultScanPack.scans;
+export const SCAN_PACK_PRICE_USD = defaultScanPack.priceUsd;
 const PRIVILEGED_SCAN_EMAIL = "7tzweb@gmail.com";
 const PRIVILEGED_SCAN_LIMIT = 999_999;
 
@@ -139,25 +140,28 @@ export async function getScanQuotaSummary(
     hasPrivilegedScanAllowance(user?.email) || hasPrivilegedScanAllowance(normalizedEmail);
   const hasUnlimitedPlan = privilegedAllowance;
   const freeLimit = privilegedAllowance ? PRIVILEGED_SCAN_LIMIT : FREE_SCAN_LIMIT;
-  const purchasedScanCredits = privilegedAllowance
+  const purchasedScans = privilegedAllowance
     ? 0
-    : accountUsers.reduce((sum, accountUser) => sum + (accountUser.purchasedScanCredits ?? 0), 0);
+    : accountUsers.reduce(
+        (sum, accountUser) => sum + (accountUser.purchasedScans ?? accountUser.purchasedScanCredits ?? 0),
+        0,
+      );
   const totalScanAllowance = hasUnlimitedPlan
     ? PRIVILEGED_SCAN_LIMIT
-    : freeLimit + purchasedScanCredits;
+    : freeLimit + purchasedScans;
   const remainingScans = Math.max(0, totalScanAllowance - usedScans);
 
   return {
     usedScans,
     freeLimit,
-    purchasedScanCredits,
+    purchasedScans,
     totalScanAllowance,
     remainingScans,
     requiresUpgrade: !hasUnlimitedPlan && usedScans >= totalScanAllowance,
     hasUnlimitedPlan,
     canCreateScans: hasUnlimitedPlan || usedScans < totalScanAllowance,
-    upgradePriceUsd: SCAN_CREDIT_PACK_PRICE_USD,
-    upgradeScanCredits: SCAN_CREDIT_PACK_SIZE,
+    upgradePriceUsd: SCAN_PACK_PRICE_USD,
+    upgradeScans: SCAN_PACK_SIZE,
   };
 }
 
@@ -165,7 +169,7 @@ async function assertCanCreateScan(userId: string, userEmail?: string | null) {
   const quota = await getScanQuotaSummary(userId, userEmail);
   if (!quota.canCreateScans) {
     throw paymentRequired(
-      `You reached your ${quota.freeLimit} free scans. Buy ${quota.upgradeScanCredits} more scan credits for $${quota.upgradePriceUsd.toFixed(2)} to continue.`,
+      `You reached your ${quota.freeLimit} free scans. Buy ${quota.upgradeScans} more scans for $${quota.upgradePriceUsd.toFixed(2)} to continue.`,
       "SCAN_QUOTA_EXCEEDED",
       quota,
     );

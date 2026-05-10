@@ -6,7 +6,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Clock3, ExternalLink, Loader2, LogOut, Plus, UserCircle2, X } from "lucide-react";
 import logoImage from "../../../logomain.png";
-import { PaypalCreditsDialog } from "@/components/billing/paypal-credits-dialog";
+import { PaypalScansDialog } from "@/components/billing/paypal-scans-dialog";
 import { StartAuditForm } from "@/components/landing/start-audit-form";
 import { useAuth } from "@/components/providers/auth-provider";
 import { Button } from "@/components/ui/button";
@@ -137,7 +137,7 @@ export function SiteHeader() {
         const payload = await fetchJson<{ quota: ScanQuotaSummary }>("/api/me/usage");
         if (!cancelled) {
           setQuota(payload.quota);
-          setBanner("Scan credits are now active on your account.");
+          setBanner("Additional scans are now active on your account.");
         }
       } catch (error) {
         if (!cancelled) {
@@ -293,7 +293,7 @@ export function SiteHeader() {
                 status === "signed-in" ? "pl-2 pr-3" : "w-10 justify-center",
               )}
               aria-expanded={accountOpen}
-              aria-label={status === "signed-in" ? "Open account and scan credits" : "Open account menu"}
+              aria-label={status === "signed-in" ? "Open account and purchased scans" : "Open account menu"}
             >
               <UserCircle2 className="h-5 w-5 shrink-0 text-slate-600" />
               {status === "signed-in" ? (
@@ -343,7 +343,7 @@ export function SiteHeader() {
 
                     <div className="mt-4 rounded-[1.25rem] bg-slate-50 p-4">
                       <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-slate-400">
-                        Scan credits
+                        Scans
                       </p>
                       <p className="mt-2 text-sm text-slate-900">
                         {quota?.hasUnlimitedPlan
@@ -355,7 +355,7 @@ export function SiteHeader() {
                       <p className="mt-1 text-xs text-slate-500">
                         {quota?.hasUnlimitedPlan
                           ? "Your account can keep launching scans without the standard cap."
-                          : `3 free scans are included. Add ${quota?.upgradeScanCredits ?? 20} more credits for $${(quota?.upgradePriceUsd ?? 10).toFixed(2)}.`}
+                          : `${quota?.freeLimit ?? 2} free scans are included. Add ${quota?.upgradeScans ?? 20} more scans for $${(quota?.upgradePriceUsd ?? 4.99).toFixed(2)}.`}
                       </p>
                     </div>
 
@@ -374,7 +374,7 @@ export function SiteHeader() {
                           </>
                         ) : (
                           <>
-                            Buy {quota?.upgradeScanCredits ?? 20} credits for ${(quota?.upgradePriceUsd ?? 10).toFixed(2)}
+                            Buy {quota?.upgradeScans ?? 20} scans for ${(quota?.upgradePriceUsd ?? 4.99).toFixed(2)}
                             <ExternalLink className="ml-2 h-4 w-4" />
                           </>
                         )}
@@ -385,7 +385,7 @@ export function SiteHeader() {
                   <div className="space-y-3">
                     <p className="text-sm font-semibold text-slate-900">Google account required</p>
                     <p className="text-sm leading-6 text-slate-500">
-                      Sign in to save history, unlock fixes, and keep scan credits tied to your email.
+                      Sign in to save history, unlock fixes, and keep purchased scans tied to your email.
                     </p>
                     <Button
                       size="sm"
@@ -461,7 +461,7 @@ export function SiteHeader() {
           </div>
         </div>
       ) : null}
-      <PaypalCreditsDialog
+      <PaypalScansDialog
         open={paypalOpen}
         quota={quota}
         onClose={() => setPaypalOpen(false)}
@@ -469,7 +469,7 @@ export function SiteHeader() {
           setQuota(nextQuota);
           setPaypalOpen(false);
           dispatchQuotaRefresh();
-          setBanner("Credits were added to your account.");
+          setBanner("Scans were added to your account.");
         }}
       />
     </header>
