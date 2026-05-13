@@ -2520,8 +2520,8 @@ export function ResultsClient({ scanId }: { scanId: string }) {
   }
 
   return (
-    <div className="workspace-gradient min-h-screen text-[var(--ink)]">
-      <div className="mx-auto flex max-w-[1440px] pt-16">
+    <div className="workspace-gradient min-h-screen overflow-x-hidden text-[var(--ink)]">
+      <div className="mx-auto flex w-full min-w-0 max-w-[1440px] pt-16">
         <aside className="soft-scrollbar sticky top-16 hidden h-[calc(100vh-64px)] w-72 shrink-0 flex-col overflow-y-auto border-r border-white/20 bg-white/40 px-6 py-8 shadow-[10px_0_40px_rgba(0,0,0,0.02)] backdrop-blur-[30px] lg:flex">
           <div className="mb-8">
             <h3 className="text-lg font-black text-blue-600">fixnx</h3>
@@ -2611,17 +2611,17 @@ export function ResultsClient({ scanId }: { scanId: string }) {
         </aside>
 
         <main className="min-w-0 flex-1 px-5 py-8 md:px-10 md:py-12">
-          <div className="glass-panel rounded-[2rem] p-6 shadow-[0_8px_32px_rgba(0,0,0,0.03)] md:p-8">
-            <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_240px]">
-              <div>
-                <div className="mb-4 flex flex-wrap items-center gap-3">
-                  <span className="rounded-full bg-blue-50 px-3 py-1 text-[11px] font-bold uppercase tracking-[0.18em] text-blue-600">
+          <div className="glass-panel min-w-0 overflow-hidden rounded-[2rem] p-6 shadow-[0_8px_32px_rgba(0,0,0,0.03)] md:p-8">
+            <div className="grid min-w-0 gap-8 lg:grid-cols-[minmax(0,1fr)_240px]">
+              <div className="min-w-0">
+                <div className="mb-4 flex min-w-0 flex-wrap items-center gap-3">
+                  <span className="shrink-0 rounded-full bg-blue-50 px-3 py-1 text-[11px] font-bold uppercase tracking-[0.18em] text-blue-600">
                     Live Analysis
                   </span>
-                  <span className="scan-phase-pill inline-flex max-w-full items-center gap-2 rounded-full bg-white/75 px-3 py-1 text-sm text-slate-500 shadow-sm">
+                  <span className="scan-phase-pill inline-flex w-full min-w-0 max-w-full items-center gap-2 overflow-hidden rounded-full bg-white/75 px-3 py-1 text-sm text-slate-500 shadow-sm sm:w-auto">
                     <span
                       className={cn(
-                        "loader-dot inline-flex",
+                        "loader-dot inline-flex shrink-0",
                         scan.status === "completed"
                           ? "text-[var(--success)]"
                           : scan.status === "failed"
@@ -2629,7 +2629,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                             : "text-[var(--primary)]",
                       )}
                     />
-                    <span className="min-w-0 truncate">{currentProgressMessage}</span>
+                    <span className="min-w-0 flex-1 truncate">{currentProgressMessage}</span>
                     {progressStepCounter ? (
                       <span className="hidden shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.12em] text-slate-500 sm:inline-flex">
                         Step {progressStepCounter}
@@ -2637,13 +2637,13 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                     ) : null}
                   </span>
                 </div>
-                <h1 className="text-4xl font-semibold tracking-[-0.03em] text-slate-900 md:text-5xl">
+                <h1 className="break-words text-4xl font-semibold tracking-[-0.03em] text-slate-900 md:text-5xl">
                   {scan.targetHostname}
                 </h1>
-                <div className="mt-6 flex items-end justify-between gap-4">
-                  <div>
+                <div className="mt-6 flex min-w-0 items-end justify-between gap-4">
+                  <div className="min-w-0">
                     <p className="text-sm font-medium text-slate-500">Overall progress</p>
-                    <p className="mt-1 text-xs uppercase tracking-[0.2em] text-slate-400">
+                    <p className="mt-1 break-words text-xs uppercase tracking-[0.2em] text-slate-400">
                       {scan.status}
                     </p>
                   </div>
@@ -2673,13 +2673,13 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                     style={{ width: `${visibleProgress}%` }}
                   />
                 </div>
-                <p className="mt-4 text-sm text-slate-500">{progressNarrative}</p>
-                <div className="mt-4 flex flex-wrap gap-2">
+                <p className="mt-4 break-words text-sm text-slate-500">{progressNarrative}</p>
+                <div className="mt-4 flex min-w-0 max-w-full flex-wrap gap-2">
                   {progressSteps.map((step) => (
                     <span
                       key={step.label}
                       className={cn(
-                        "inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] font-semibold shadow-sm transition-colors",
+                        "inline-flex min-w-0 max-w-full items-center gap-2 overflow-hidden rounded-full border px-3 py-1.5 text-[11px] font-semibold shadow-sm transition-colors",
                         step.status === "completed" &&
                           "border-emerald-100 bg-emerald-50 text-emerald-700",
                         step.status === "running" &&
@@ -2691,29 +2691,29 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                     >
                       <span
                         className={cn(
-                          "h-2 w-2 rounded-full",
+                          "h-2 w-2 shrink-0 rounded-full",
                           step.status === "completed" && "bg-emerald-500",
                           step.status === "running" && "bg-blue-500",
                           step.status === "failed" && "bg-rose-500",
                           step.status === "queued" && "bg-slate-300",
                         )}
                       />
-                      <span>{step.label}</span>
-                      <span className="text-[10px] uppercase tracking-[0.12em] opacity-70">
+                      <span className="min-w-0 truncate">{step.label}</span>
+                      <span className="shrink-0 text-[10px] uppercase tracking-[0.12em] opacity-70">
                         {formatProgressStatus(step.status)}
                       </span>
                     </span>
                   ))}
                 </div>
                 {scan.status === "partial-results" ? (
-                  <div className="mt-4 rounded-[1.25rem] border border-emerald-100 bg-emerald-50/80 px-4 py-3 text-sm leading-6 text-emerald-800">
+                  <div className="mt-4 break-words rounded-[1.25rem] border border-emerald-100 bg-emerald-50/80 px-4 py-3 text-sm leading-6 text-emerald-800">
                     <span className="font-semibold">Initial results are ready.</span>{" "}
                     You can review the findings now while deeper checks continue in the background.
                   </div>
                 ) : null}
                 <div className="mt-6 grid gap-3 md:grid-cols-3">
                   {categoryCards.map((item) => (
-                    <div key={item.category} className="rounded-[1.3rem] bg-white/55 p-4">
+                    <div key={item.category} className="min-w-0 rounded-[1.3rem] bg-white/55 p-4">
                       <div className="flex items-center justify-between gap-3">
                         <div className="min-w-0">
                           <p className="text-xs font-bold uppercase text-slate-500">
@@ -2753,7 +2753,7 @@ export function ResultsClient({ scanId }: { scanId: string }) {
                 </div>
               </div>
 
-              <div className="glass-panel flex flex-col items-center justify-center rounded-[2rem] bg-white/70 p-5 sm:p-6">
+              <div className="glass-panel min-w-0 flex flex-col items-center justify-center rounded-[2rem] bg-white/70 p-5 sm:p-6">
                 <div
                   className="score-ring-modern h-36 w-36 sm:h-40 sm:w-40"
                   style={
